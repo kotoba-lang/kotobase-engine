@@ -190,6 +190,20 @@
         rows      (cond->> rows limit (take limit))]
     (vec rows)))
 
+(defn hydrate-db
+  "Rebuild the full hot 4-index `db` from a persisted snapshot — the write path's
+  counterpart to `cold-datoms`. Reads ONE index tree (spo) in full and re-asserts
+  every quad, so the reconstructed db is ~1× graph size (vs the wasm worker's
+  10-30× amplified rehydrate). Used by a transact: `hydrate-db` → `assert-quad`s
+  → `commit!`. get-fn: `(get-fn cid) -> bytes`; nil snapshot → empty db."
+  [get-fn snapshot-cid]
+  (if (nil? snapshot-cid)
+    (qs/empty-db)
+    (reduce (fn [db {:keys [e a v_edn]}]
+              (qs/assert-quad db {:s e :p a :o (edn/read-string v_edn)}))
+            (qs/empty-db)
+            (cold-datoms get-fn snapshot-cid {:index :eavt}))))
+
 (defn verify-chain
   "True iff the commit-dag chain rooted at `chain-cid` is untampered and its
    `:seq` values are gapless from 0. Does NOT verify the prolly-tree

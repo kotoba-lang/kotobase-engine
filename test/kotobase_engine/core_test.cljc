@@ -90,6 +90,27 @@
       (is (= [] (eng/cold-datoms get-fn snap {:index :avet
                                               :components [":aozora.keyBackup/did" "did:key:zNope"]}))))))
 
+(deftest hydrate-db-roundtrips-the-whole-db
+  ;; write path: persist → hydrate → the reconstructed db equals the original,
+  ;; and a follow-on transact+commit chains cleanly (#14 worker's transact uses this).
+  (let [{:keys [put! get-fn]} (mem-store)
+        db0 (eng/transact (eng/empty-db)
+                          [["alice" "role" "admin"] ["alice" "name" "Alice"]
+                           ["bob" "role" "user"]])
+        c0  (eng/commit! put! get-fn db0 nil)
+        s0  (eng/latest-snapshot-cid get-fn c0)
+        db1 (eng/hydrate-db get-fn s0)]
+    (is (= (set (eng/datoms db0)) (set (eng/datoms db1))) "hydrated db == original")
+    (testing "hydrate → assert → commit is a clean incremental write"
+      (let [db2 (eng/transact db1 [["carol" "role" "guest"]])
+            c1  (eng/commit! put! get-fn db2 c0)
+            s1  (eng/latest-snapshot-cid get-fn c1)]
+        (is (= 3 (count (eng/cold-datoms get-fn s1 {:index :aevt :components ["role"]}))))
+        (is (= [{:e "carol" :a "role" :v_edn "\"guest\"" :added true}]
+               (eng/cold-datoms get-fn s1 {:index :avet :components ["role" "guest"]})))))
+    (testing "nil snapshot → empty db"
+      (is (= [] (eng/datoms (eng/hydrate-db get-fn nil)))))))
+
 (deftest q-routes-through-kqe
   (let [db (eng/transact (eng/empty-db)
                           [{:s "alice" :p "role" :o "admin"}
