@@ -59,6 +59,37 @@
       (is (= [] (eng/datoms db {:index :eavt :components ["keybackup/nope"]})))
       (is (= [] (eng/datoms db {:index :avet :components [":aozora.keyBackup/did" "did:key:zNope"]}))))))
 
+(deftest cold-datoms-reads-filtered-from-snapshot
+  ;; The scale fix: read a filtered set DIRECTLY from a persisted snapshot,
+  ;; never rehydrating the whole db (ADR-2607022330 addendum 2, #13).
+  (let [{:keys [put! get-fn]} (mem-store)
+        db (eng/transact (eng/empty-db)
+                          [["keybackup/zAlice" ":aozora.keyBackup/did" "did:key:zAlice"]
+                           ["keybackup/zAlice" ":aozora.keyBackup/blob" "{blobA}"]
+                           ["keybackup/zBob"   ":aozora.keyBackup/did" "did:key:zBob"]
+                           ["acct/alice" ":atproto.account/handle" "alice.aozora.app"]])
+        chain-cid (eng/commit! put! get-fn db nil)
+        snap      (eng/latest-snapshot-cid get-fn chain-cid)]
+    (testing "cold :eavt [e] equals the hot filter (the getBackup query)"
+      (is (= (set (eng/datoms db {:index :eavt :components ["keybackup/zAlice"]}))
+             (set (eng/cold-datoms get-fn snap {:index :eavt :components ["keybackup/zAlice"]}))))
+      (is (= 2 (count (eng/cold-datoms get-fn snap {:index :eavt :components ["keybackup/zAlice"]})))))
+    (testing "cold :avet [attr value] point lookup returns one datom"
+      (is (= [{:e "keybackup/zBob" :a ":aozora.keyBackup/did"
+               :v_edn "\"did:key:zBob\"" :added true}]
+             (eng/cold-datoms get-fn snap {:index :avet
+                                           :components [":aozora.keyBackup/did" "did:key:zBob"]}))))
+    (testing "cold :avet [attr] returns all subjects for the attribute"
+      (is (= 2 (count (eng/cold-datoms get-fn snap {:index :avet
+                                                    :components [":aozora.keyBackup/did"]})))))
+    (testing ":limit caps cold rows"
+      (is (= 1 (count (eng/cold-datoms get-fn snap {:index :avet
+                                                    :components [":aozora.keyBackup/did"] :limit 1})))))
+    (testing "missing entity/value → empty"
+      (is (= [] (eng/cold-datoms get-fn snap {:index :eavt :components ["keybackup/nope"]})))
+      (is (= [] (eng/cold-datoms get-fn snap {:index :avet
+                                              :components [":aozora.keyBackup/did" "did:key:zNope"]}))))))
+
 (deftest q-routes-through-kqe
   (let [db (eng/transact (eng/empty-db)
                           [{:s "alice" :p "role" :o "admin"}

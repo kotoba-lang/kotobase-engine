@@ -16,7 +16,10 @@
 ;; that snapshot CID as its opaque `state`. Neither library is modified; this
 ;; namespace is the seam between them.
 (ns kotobase-engine.core
-  (:require [ipld.core :as ipld]
+  (:require #?(:clj  [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
+            [ipld.core :as ipld]
+            [prolly-tree.core :as pt]
             [quad-store.core :as qs]
             [kqe.core :as kqe]
             [commit-dag.core :as cd]))
@@ -142,6 +145,50 @@
    chain rooted at `chain-cid`, or nil if the chain is empty."
   [get-fn chain-cid]
   (some-> (head get-fn chain-cid) :state ipld/link-cid))
+
+;; ── cold read: filtered datoms straight from a persisted snapshot ───────────
+;; Closes the "nothing rehydrates a db from a snapshot CID" gap for the ONE case
+;; that matters for scale: a FILTERED read. Instead of rebuilding the whole 4-index
+;; db (the wasm worker's full-graph rehydrate that OOMs at 128MB), decode the
+;; snapshot's index-roots, pick the ONE index tree the query needs, and prefix-seek
+;; it by the components. quad-store persists each index as `(pr-str [k1 k2 v]) → true`
+;; leaves (index-root), so a components prefix is a string prefix on that tree.
+
+;; index → snapshot key + how its [k1 k2 v] maps back to a datom {:e :a :v}
+(def ^:private index-spec
+  {:eavt {:root "spo" :->eav (fn [[s p o]] [s p o])}   ; spo: [s p o]
+   :aevt {:root "pso" :->eav (fn [[p s o]] [s p o])}   ; pso: [p s o]
+   :avet {:root "pos" :->eav (fn [[p o s]] [s p o])}}) ; pos: [p o s]
+
+(defn- components-prefix
+  "String prefix into a `(pr-str [k1 k2 v])` leaf key for an ordered component
+  vector. `[\"a\" \"b\"]` → `[\"a\" \"b\" ` (up to the space before the next
+  slot), so it matches every key whose first components are exactly those."
+  [components]
+  (when (seq components)
+    (let [s (pr-str (vec components))]            ; e.g. ["a" "b"]
+      (str (subs s 0 (dec (count s))) " "))))     ; drop ] , add the slot separator
+
+(defn cold-datoms
+  "`datomic.datoms`-shaped rows read DIRECTLY from a persisted snapshot without
+  rehydrating the whole db. `snapshot-cid` is a quad-store commit CID
+  (`latest-snapshot-cid`). opts = `{:index :components :limit}` as in `datoms`.
+  Touches only the chosen index tree's blocks along the components prefix path
+  (v1: prolly-tree.scan-prefix, whole-tree walk; range-pruning is a follow-up),
+  never the other three indexes — so a keyed read stays small regardless of graph
+  size. get-fn: `(get-fn cid) -> bytes`."
+  [get-fn snapshot-cid {:keys [index components limit]}]
+  (let [{:keys [root ->eav]} (index-spec (or index :eavt))
+        snap      (ipld/decode (get-fn snapshot-cid))
+        root-cid  (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
+        entries   (if (nil? root-cid)
+                    []
+                    (pt/scan-prefix get-fn root-cid (or (components-prefix components) "")))
+        rows      (for [[k _] entries
+                        :let [[e a v] (->eav (edn/read-string k))]]
+                    {:e e :a a :v_edn (v->edn v) :added true})
+        rows      (cond->> rows limit (take limit))]
+    (vec rows)))
 
 (defn verify-chain
   "True iff the commit-dag chain rooted at `chain-cid` is untampered and its
