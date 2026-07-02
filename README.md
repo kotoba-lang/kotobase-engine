@@ -1,12 +1,27 @@
 # kotobase-engine
 
-**The kotobase XRPC-surface engine, in CLJC.** Composes the already-landed
-Wave 1–3 primitives (`prolly-tree`, `quad-store`, `kqe`, `commit-dag`) into
-`transact`/`datoms`/`q`/`pull`, persisted as a content-addressed, verifiable
-commit chain — the piece that was still missing before production
-`kotobase.net` traffic can move off the wasm build of the deleted Rust
-engine (`kotobase.aozora.app`). See
-[ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
+**The kotobase XRPC-surface engine, in real CLJC — verified on both JVM and
+ClojureScript.** Composes the already-landed Wave 1–3 primitives
+(`prolly-tree`, `quad-store`, `kqe`, `commit-dag`) into `transact`/`datoms`/
+`q`/`pull`, persisted as a content-addressed, verifiable commit chain — the
+piece that was still missing before production `kotobase.net` traffic can
+move off the wasm build of the deleted Rust engine (`kotobase.aozora.app`).
+See [ADR-2607022600](https://github.com/com-junkawasaki/root/blob/main/90-docs/adr/2607022600-kotoba-database-crates-cljc-migration-roadmap.md).
+
+**Portability**: `multiformats` and `dag-cbor` — the two foundational
+primitives every layer of this stack sits on — used to be JVM-only despite
+living in `.cljc`-named files (a documented, known gap every repo in this
+chain carried). Both now have real `:cljs` branches (SHA-256 via
+`@noble/hashes`, portable CBOR byte buffers), `prolly-tree` had its own
+small hidden JVM-only call (`utf8-bytes`) fixed, and this repo's own source
+(`commit-dag`, `kotobase-engine`) was `.clj`, not `.cljc` — also fixed. The
+whole chain — `multiformats` → `dag-cbor` → `prolly-tree` → `quad-store` →
+`kqe` → `commit-dag` → `kotobase-engine` — is now verified end to end under
+real ClojureScript (via `nbb`, not just reasoned about), and JVM/cljs
+produce **byte-identical CIDs** for the same content at every layer. This
+matters specifically because content-addressing is only meaningful if two
+platforms computing "the same" data agree on its address — that's now
+empirically checked, not assumed.
 
 ## Not `kotoba-lang/kotobase`, not `kotoba-lang/atproto`
 
