@@ -181,6 +181,24 @@
                  (eng/q db [nil nil nil]))
         "q cascades arrangement.query's required visibility decision -- no permissive default")))
 
+(deftest query-joins-across-clauses
+  (let [db (eng/transact (eng/empty-db)
+                          [{:s "alice" :p "role" :o "admin"}
+                           {:s "alice" :p "name" :o "Alice"}
+                           {:s "bob" :p "role" :o "user"}
+                           {:s "bob" :p "name" :o "Bob"}])
+        everything (constantly true)]
+    (is (= #{["Alice"]}
+           (eng/query db {:find '[?name]
+                          :where '[[?s "role" "admin"]
+                                   [?s "name" ?name]]}
+                      everything)))))
+
+(deftest query-visible-is-required
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
+    (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)
+                 (eng/query db {:find '[?s] :where '[[?s "role" "admin"]]})))))
+
 (deftest pull-returns-entity-attrs
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
                                           {:s "alice" :p "name" :o "Alice"}])]

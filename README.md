@@ -149,11 +149,19 @@ snapshot CID (inside the D1 `{indexed novelty}` state map) as chain's
 opaque `state`, so chain history, `:seq`, and tamper/gap verification are
 entirely chain's job. Neither library needed to change.
 
+## Query
+
+- `q` — single `[s p o]` triple pattern, routed via `arrangement.query`.
+- `query` — Datomic-shaped `{:find [?var ...] :where [[e a v] ...]}`
+  conjunctive multi-clause join, via `arrangement.datalog/q`
+  (ADR-2607061200, stage 1 of a staged Datalog roadmap).
+
 ## What is NOT in this landing
 
-- **Multi-clause Datalog join / recursive-rule fixpoint / SPARQL BGP** —
-  `arrangement.query`'s own documented scope is triple-pattern only;
-  unchanged here.
+- **Negation / aggregation / recursive-rule fixpoint / SPARQL BGP** —
+  `query`'s conjunctive join (above) does not yet support `not` clauses,
+  `:with`/aggregate functions in `:find`, or `:rules`; staged as tracked
+  follow-ups (ADR-2607061200), not implemented here.
 - **CACAO / capability auth** — a Worker embedding this peer library still
   needs to verify CACAO and check write capability itself
   (`kotoba-lang/cacao`) before calling `commit!`; this repo has no auth

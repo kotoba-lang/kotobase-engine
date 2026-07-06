@@ -42,6 +42,7 @@
             [prolly-tree.core :as pt]
             [arrangement.core :as qs]
             [arrangement.query :as kqe]
+            [arrangement.datalog :as datalog]
             [chain.core :as cd]
             [datom.core :as dc]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
@@ -181,9 +182,8 @@
 (defn q
   "`datomic.q`-equivalent: `pattern` is `[s p o]` (nil = wildcard), routed to
    the matching index via `arrangement.query`. Returns a set of `{:s :p :o}`
-   quads. NOTE: triple-pattern only — multi-clause join / recursive-rule
-   fixpoint is not implemented (`arrangement.query`'s own documented scope),
-   see README.
+   quads. NOTE: triple-pattern only, no join across clauses -- see `query`
+   below for that.
 
    `visible?` is REQUIRED, cascaded straight from `arrangement.query/query`
    (ADR-2607050500: Query is a first-class effect all the way up this
@@ -191,6 +191,16 @@
    see everything, as an explicit choice."
   [db pattern visible?]
   (kqe/query db pattern visible?))
+
+(defn query
+  "`datomic.api/q`-equivalent: `{:find [?var ...] :where [[e a v] ...]}`
+   conjunctive multi-clause join over `arrangement.datalog/q`
+   (ADR-2607061200, stage 1 of the staged Datalog roadmap -- negation,
+   aggregation, and recursive rules are tracked follow-ups, not here).
+   Returns a set of `:find`-ordered vectors. `visible?` is REQUIRED, same
+   convention as `q` above."
+  [db find+where visible?]
+  (datalog/q db find+where visible?))
 
 (defn pull
   "`datomic.pull`-equivalent for entity `s`: `{p #{o...}}` (arrangement has no
