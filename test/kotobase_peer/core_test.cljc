@@ -1613,3 +1613,125 @@
            c1 (eng/commit! put! get-fn [["e" ":a/x" "v"]] nil test-encrypt-fn)
            rows (eng/hot-datoms get-fn c1 everything test-blind-fn test-decrypt-fn)]
        (is (= [{:e "e" :a ":a/x" :v_edn "\"v\"" :added true}] (vec rows))))))
+
+;; ── ADR-2607071610 Phase 2: as-of / :added false surfacing ──────────────────
+;; `history` (the pre-existing hot-db-returning fn, `commit-serialized!`'s
+;; neighbor above) documented "a datom retracted later still appears here"
+;; from the start, but that was NOT actually true until this pass -- fixed
+;; below (see `kotobase-peer.core/audit-replay`'s docstring for the confirmed
+;; bug). `history-datoms` is new: the Datomic-`d/datoms`-shaped `:added`
+;; EVENT LOG `history`'s own docstring named as "Phase 2 of that ADR."
+
+#?(:clj
+   (deftest history-now-actually-preserves-a-retracted-fact
+     ;; The confirmed bug this pass fixes: before, `(eng/pull (eng/history ...)
+     ;; "post/1")` returned `{}` for a fact that was asserted then retracted --
+     ;; contradicting `history`'s own docstring. Now it doesn't.
+     (let [{:keys [put! get-fn]} (mem-store)
+           c1 (eng/commit! put! get-fn [["post/1" ":yoro.post/text" "hello"]] nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [[:db/retract "post/1" ":yoro.post/text" "hello"]]
+                           c1 test-encrypt-fn)
+           h (eng/history get-fn c2 test-blind-fn test-decrypt-fn)]
+       (is (= #{"hello"} (get (eng/pull h "post/1") ":yoro.post/text"))
+           "the retracted fact is STILL visible in the audit db"))))
+
+#?(:clj
+   (deftest history-datoms-shows-both-the-assert-and-the-retract
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c1 (eng/commit! put! get-fn [["post/1" ":yoro.post/text" "hello"]] nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [[:db/retract "post/1" ":yoro.post/text" "hello"]]
+                           c1 test-encrypt-fn)
+           rows (eng/history-datoms get-fn c2 everything test-decrypt-fn)]
+       (testing "current-state hot-datoms drops the retracted fact entirely (Phase 1 behavior, unchanged)"
+         (is (empty? (eng/hot-datoms get-fn c2 everything test-blind-fn test-decrypt-fn))))
+       (testing "history-datoms shows BOTH the original assert and the later retract, in order"
+         (is (= [{:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added true}
+                 {:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added false}]
+                (vec rows)))))))
+
+#?(:clj
+   (deftest history-datoms-survives-a-fold-even-though-hot-datoms-does-not
+     ;; The whole point of Phase 2: fold! physically removes a retracted fact
+     ;; from the indexed snapshot (real GC, Phase 1) -- but the ORIGINAL tx
+     ;; block recording the assert, and the one recording the retract, are
+     ;; never deleted (content-addressed). history-datoms must still see
+     ;; both after folding, by replaying every commit's own novelty from
+     ;; genesis.
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c1 (eng/commit! put! get-fn [["post/1" ":yoro.post/text" "hello"]] nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [[:db/retract "post/1" ":yoro.post/text" "hello"]]
+                           c1 test-encrypt-fn)
+           c3 (eng/fold! put! get-fn c2 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+       (testing "post-fold hot-datoms shows nothing for post/1 (Phase 1 GC)"
+         (is (empty? (eng/hot-datoms get-fn c3 everything test-blind-fn test-decrypt-fn))))
+       (testing "post-fold history-datoms STILL shows both events"
+         (is (= [{:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added true}
+                 {:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added false}]
+                (vec (eng/history-datoms get-fn c3 everything test-decrypt-fn))))))))
+
+#?(:clj
+   (deftest history-datoms-retract-entity-expands-into-one-row-per-attribute
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c1 (eng/commit! put! get-fn
+                           [["post/1" ":yoro.post/text" "hello"]
+                            ["post/1" ":yoro.post/author" "did:key:zA"]]
+                           nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [[:db/retractEntity "post/1"]] c1 test-encrypt-fn)
+           rows (eng/history-datoms get-fn c2 everything test-decrypt-fn)]
+       (is (= #{{:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added true}
+                {:e "post/1" :a ":yoro.post/author" :v_edn "\"did:key:zA\"" :added true}
+                {:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added false}
+                {:e "post/1" :a ":yoro.post/author" :v_edn "\"did:key:zA\"" :added false}}
+              (set rows))))))
+
+#?(:clj
+   (deftest history-datoms-entity-filter-narrows-rows-but-not-correctness
+     ;; retract-entity on post/1 must correctly consume post/1's OWN prior
+     ;; state regardless of whether post/2's rows are being filtered out --
+     ;; this proves the full replay runs unconditionally and only the
+     ;; EMITTED rows are narrowed by the entity filter.
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c1 (eng/commit! put! get-fn
+                           [["post/1" ":yoro.post/text" "hello"]
+                            ["post/2" ":yoro.post/text" "keep"]]
+                           nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [[:db/retractEntity "post/1"]] c1 test-encrypt-fn)]
+       (is (= #{{:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added true}
+                {:e "post/1" :a ":yoro.post/text" :v_edn "\"hello\"" :added false}}
+              (set (eng/history-datoms get-fn c2 "post/1" everything test-decrypt-fn))))
+       (is (= [{:e "post/2" :a ":yoro.post/text" :v_edn "\"keep\"" :added true}]
+              (vec (eng/history-datoms get-fn c2 "post/2" everything test-decrypt-fn)))
+           "post/2 was only ever asserted, never retracted -- its own single event, correctly narrowed"))))
+
+#?(:clj
+   (deftest history-datoms-across-multiple-folds-neither-duplicates-nor-drops-events
+     ;; A commit's own state["novelty"] is the CUMULATIVE not-yet-folded list,
+     ;; not a per-commit delta -- newly-added-tx-cids already walks the delta
+     ;; (new tx-cids since the previous commit), so history-datoms must not
+     ;; re-replay the same tx block once per intervening commit before a fold.
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c1 (eng/commit! put! get-fn [["e" ":a/x" "v1"]] nil test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [["e" ":a/y" "v2"]] c1 test-encrypt-fn)
+           cf (eng/fold! put! get-fn c2 test-blind-fn test-encrypt-fn test-decrypt-fn)
+           c3 (eng/commit! put! get-fn [[:db/retract "e" ":a/x" "v1"]] cf test-encrypt-fn)
+           c4 (eng/commit! put! get-fn [["e" ":a/z" "v3"]] c3 test-encrypt-fn)
+           cf2 (eng/fold! put! get-fn c4 test-blind-fn test-encrypt-fn test-decrypt-fn)
+           rows (eng/history-datoms get-fn cf2 everything test-decrypt-fn)]
+       (is (= [{:e "e" :a ":a/x" :v_edn "\"v1\"" :added true}
+               {:e "e" :a ":a/y" :v_edn "\"v2\"" :added true}
+               {:e "e" :a ":a/x" :v_edn "\"v1\"" :added false}
+               {:e "e" :a ":a/z" :v_edn "\"v3\"" :added true}]
+              (vec rows))
+           "every event exactly once, in commit order, across both folds")
+       (testing "current-state hot-datoms agrees with history-datoms' net effect"
+         (is (= #{["e" ":a/y"] ["e" ":a/z"]}
+                (set (map (juxt :e :a) (eng/hot-datoms get-fn cf2 everything test-blind-fn test-decrypt-fn)))))))))
+
+#?(:clj
+   (deftest history-datoms-nil-chain-cid-is-empty
+     (is (= [] (eng/history-datoms nil nil (constantly true) test-decrypt-fn)))))
