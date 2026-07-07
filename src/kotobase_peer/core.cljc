@@ -1196,47 +1196,166 @@
 (defn- spo->quads [db]
   (for [[e attrs] (:spo db), [a vs] attrs, v vs] {:s e :p a :o v}))
 
+;; ── ADR-2607071610 Phase 2: history actually preserves retracted facts ──────
+;; `history` (below) has ALWAYS documented "a datom retracted later still
+;; appears here (that is the point of an audit view)" — but until this pass
+;; that was aspirational, not true: composing it from `since -1` reused
+;; `since`'s own `apply-quad`-based reduce, which CANCELS a retracted fact
+;; within that db before `history` ever saw it (confirmed by direct testing:
+;; commit an assert then `[:db/retract ...]` of the same value, and the
+;; pre-Phase-2 `history` returned `{}` for that entity, not the retracted
+;; fact). `since` itself is unchanged (its OWN contract -- "what changed
+;; after a point," Datomic-`since`-shaped -- is correctly cancelling; the
+;; bug was `history` reusing it for a job that needs the opposite). This
+;; replay is the actual fix: unlike `since`/`hot-datoms`, it NEVER retracts
+;; from the returned db -- a `:retract`/`:retract-entity` op's own (e,a,v)
+;; still gets `assert-quad`'d into the audit db, using a SEPARATE, real
+;; current-state replay only to know what a `:retract-entity` (which
+;; carries no attrs of its own) actually held at that moment -- the same
+;; information `retract-entity*` needs to apply the retraction for real
+;; elsewhere in this file.
+(defn- audit-replay
+  "[current-db audit-db] after replaying every quad in `quads` (in order).
+   `current-db` applies ops normally (assert/retract/retract-entity, same
+   as `apply-quad` -- used ONLY to know a `:retract-entity`'s prior attrs
+   when it's hit, never returned to callers). `audit-db` never retracts:
+   every (e,a,v) any op ever named is `assert-quad`'d in and stays."
+  [quads ref?]
+  (reduce
+   (fn [[cur audit] {:keys [s p o op] :as q}]
+     (case (or op :assert)
+       :assert
+       [(qs/assert-quad cur q ref?) (qs/assert-quad audit q ref?)]
+       :retract
+       [(qs/retract-quad cur q ref?) (qs/assert-quad audit q ref?)]
+       :retract-entity
+       (let [prior (get-in cur [:spo s] {})
+             audit' (reduce (fn [a [p vs]]
+                              (reduce (fn [a v] (qs/assert-quad a {:s s :p p :o v} ref?)) a vs))
+                            audit prior)]
+         [(retract-entity* cur s ref?) audit'])))
+   [(qs/empty-db) (qs/empty-db)] quads))
+
 (defn history
   "A hot db containing every quad EVER asserted via any commit rooted at
    `chain-cid`, across its WHOLE history from genesis to tip -- Datomic's
    `history`: every assertion that ever reached the chain, union'd across
-   fold compactions. NOTE (ADR-2607071610): novelty blocks now MAY carry
-   explicit retraction ops (`[:db/retract e a v]`/`[:db/retractEntity e]`
-   through `commit!`); the CURRENT view (`hot-datoms`/`hydrate-chain`/
-   `fold!`) applies them, while `history` remains the assertion-audit —
-   a datom retracted later still appears here (that is the point of an
-   audit view). Datomic-style `:added false` row surfacing is Phase 2 of
-   that ADR. Separately, two `commit!` calls asserting different values
-   for the same `(s, p)` pair both remain visible (`arrangement.core`
-   has no cardinality tracking of its own, ADR-2607061200 pillar note;
+   fold compactions, INCLUDING facts later retracted (ADR-2607071610 Phase
+   2 -- see `audit-replay`'s docstring for the confirmed bug this fixes in
+   how this fn used to be composed; the promise below is now actually true).
+   Separately, two `commit!` calls asserting different values for the
+   same `(s, p)` pair both remain visible (`arrangement.core` has no
+   cardinality tracking of its own, ADR-2607061200 pillar note;
    `transact-with-schema`'s cardinality `:one` retraction happens on hot
    db values). What `history` gives: a complete, literal audit trail
    across `fold!` compactions -- data folded away from `hot-datoms`'
    novelty view remains fully reconstructable here.
 
-   Built from `(since get-fn chain-cid -1 decrypt-fn)` (every novelty
-   tx-block ever appended, across the whole chain -- `-1` because every
-   real commit's `:seq` is >= 0) UNION the tip's `indexed` snapshot
-   (`hydrate-db`, which already subsumes everything folded before it).
-   Overlap between the two (a commit whose novelty was later folded
-   appears in both) is harmless: `arrangement.core`'s indices are sets,
-   re-asserting an identical fact is a no-op.
+   Built from replaying `(newly-added-tx-cids get-fn chain-cid -1)` (every
+   novelty tx-block ever appended, across the whole chain -- `-1` because
+   every real commit's `:seq` is >= 0) via `audit-replay`, UNION the tip's
+   `indexed` snapshot (`hydrate-db`, which already subsumes everything
+   folded before it -- also the only source of any content a `snapshot!`-
+   seeded genesis contributed, see the HONEST LIMITATION below). Overlap
+   between the two (a commit whose novelty was later folded appears in
+   both) is harmless: `arrangement.core`'s indices are sets, re-asserting
+   an identical fact is a no-op.
+
+   HONEST LIMITATION: content seeded via `snapshot!` (the cold-start/
+   migration entry point, NOT the novelty-log `commit!` path) has no
+   individual assert history -- it was never transacted through the
+   novelty log, so there's no tx block recording how it came to exist.
+   The union with the tip snapshot means CURRENTLY-live seeded facts still
+   appear here, but a seeded fact that was LATER retracted would not (no
+   audit event for it ever existed) -- an honest gap from import-without-
+   a-log, not something this fn can paper over.
 
    `blind-fn`/`decrypt-fn` (ADR-2607051000) REQUIRED, same contract as
    `hydrate-db`/`since`. Synchronous on JVM; a `js/Promise` of the db on
    cljs."
   [get-fn chain-cid blind-fn decrypt-fn]
   #?(:clj
-     (let [novelty-db (since get-fn chain-cid -1 decrypt-fn)
+     (let [tx-cids (newly-added-tx-cids get-fn chain-cid -1)
+           quads (mapcat #(read-tx-block get-fn % decrypt-fn) tx-cids)
+           [_ audit-db] (audit-replay quads ipld/link?)
            snap-db (hydrate-db get-fn (latest-snapshot-cid get-fn chain-cid) blind-fn decrypt-fn)]
-       (reduce qs/assert-quad snap-db (spo->quads novelty-db)))
+       (reduce qs/assert-quad snap-db (spo->quads audit-db)))
      :cljs
-     (-> (js/Promise.all
-          #js [(since get-fn chain-cid -1 decrypt-fn)
-               (hydrate-db get-fn (latest-snapshot-cid get-fn chain-cid) blind-fn decrypt-fn)])
-         (.then (fn [results]
-                  (let [[novelty-db snap-db] (vec results)]
-                    (reduce qs/assert-quad snap-db (spo->quads novelty-db))))))))
+     (let [tx-cids (newly-added-tx-cids get-fn chain-cid -1)]
+       (-> (js/Promise.all
+            #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) tx-cids)
+                 (hydrate-db get-fn (latest-snapshot-cid get-fn chain-cid) blind-fn decrypt-fn)])
+           (.then (fn [results]
+                    (let [[quads-per-cid snap-db] (vec results)
+                          quads (apply concat quads-per-cid)
+                          [_ audit-db] (audit-replay quads ipld/link?)]
+                      (reduce qs/assert-quad snap-db (spo->quads audit-db)))))))))
+
+(defn history-datoms
+  "Datomic `(d/datoms (d/history db) ...)`-shaped rows `{:e :a :v_edn
+   :added}` (ADR-2607071610 Phase 2's other half -- `history` above gives
+   a queryable hot-db VALUE with retracted facts folded back in
+   indistinguishably from live ones; this gives the actual EVENT LOG,
+   distinguishing an assert from a retract via `:added`).
+
+   Replays the same whole-chain walk `history` does (`audit-replay`, see
+   its docstring for the confirmed bug it fixes), but returns the ORDERED
+   ROW SEQUENCE instead of a db value: `:added true` for an assert,
+   `:added false` for a retract or (one row per attribute the entity held
+   at that moment) a `:retract-entity` -- the op itself carries no attrs,
+   so this asks the SAME running current-state the replay already tracks
+   internally to know what they were.
+
+   `entity` (optional, a `:db/id` string): when given, only that entity's
+   rows are emitted -- the single most common `(d/history db)` ask (\"what
+   happened to THIS entity\"). The full replay always runs regardless (an
+   unrelated entity's `:retract-entity` still needs correct running
+   state); only the emitted rows are narrowed. `nil` = whole-graph history
+   -- correct but O(all history) with no narrowing; prefer passing
+   `entity` on any graph with real write volume.
+
+   Does NOT union the tip's indexed snapshot the way `history` does: a
+   `snapshot!`-seeded fact has no assert EVENT to show (see `history`'s
+   own HONEST LIMITATION note) -- this fn stays honest about that instead
+   of synthesizing a fake `:added true` row with no real event behind it.
+
+   `visible?`/`decrypt-fn` REQUIRED, same convention as every other read
+   fn here. Synchronous on JVM; a `js/Promise` of the rows on cljs."
+  ([get-fn chain-cid visible? decrypt-fn]
+   (history-datoms get-fn chain-cid nil visible? decrypt-fn))
+  ([get-fn chain-cid entity visible? decrypt-fn]
+   (let [row (fn [s p v added] {:e s :a p :v_edn (v->edn v) :added added})
+         want? (fn [s] (or (nil? entity) (= entity s)))
+         step (fn [[cur rows] {:keys [s p o op] :as q}]
+                (case (or op :assert)
+                  :assert
+                  [(qs/assert-quad cur q ipld/link?)
+                   (cond-> rows (want? s) (conj (row s p o true)))]
+                  :retract
+                  [(qs/retract-quad cur q ipld/link?)
+                   (cond-> rows (want? s) (conj (row s p o false)))]
+                  :retract-entity
+                  (let [prior (get-in cur [:spo s] {})
+                        new-rows (when (want? s)
+                                   (for [[p vs] prior v vs] (row s p v false)))]
+                    [(retract-entity* cur s ipld/link?)
+                     (into rows new-rows)])))]
+     #?(:clj
+        (if (nil? chain-cid)
+          []
+          (let [tx-cids (newly-added-tx-cids get-fn chain-cid -1)
+                quads (mapcat #(read-tx-block get-fn % decrypt-fn) tx-cids)
+                [_ rows] (reduce step [(qs/empty-db) []] quads)]
+            (vec (filter visible? rows))))
+        :cljs
+        (if (nil? chain-cid)
+          (js/Promise.resolve [])
+          (let [tx-cids (newly-added-tx-cids get-fn chain-cid -1)]
+            (-> (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) tx-cids)
+                (.then (fn [quads-per-cid]
+                         (let [quads (apply concat quads-per-cid)
+                               [_ rows] (reduce step [(qs/empty-db) []] quads)]
+                           (vec (filter visible? rows))))))))))))
 
 (defn hot-datoms
   "THE scale-safe read path (ADR-2607032430 D1): `datoms`-shaped rows as of
