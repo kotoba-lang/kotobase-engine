@@ -384,12 +384,151 @@
                                           {:s "alice" :p "name" :o "Alice"}])]
     (is (= {"role" #{"admin"} "name" #{"Alice"}} (eng/pull db "alice")))))
 
+;; ── pull patterns (ADR-2607061200 "3 pillars" landing) ──────────────────────
+
+(deftest pull-pattern-plain-attrs
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
+                                          {:s "alice" :p "name" :o "Alice"}
+                                          {:s "alice" :p "age" :o "30"}])]
+    (is (= {"role" #{"admin"} "name" #{"Alice"}}
+           (eng/pull db "alice" ["role" "name"])))))
+
+(deftest pull-pattern-wildcard-matches-2-arg-form
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}
+                                          {:s "alice" :p "name" :o "Alice"}])]
+    (is (= (eng/pull db "alice") (eng/pull db "alice" '[*])))))
+
+(deftest pull-pattern-nested-ref-forward
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "name" :o "Alice"}
+                                          {:s "bob" :p "manager" :o "alice"}
+                                          {:s "bob" :p "name" :o "Bob"}])]
+    (is (= {"manager" #{{"name" #{"Alice"}}}}
+           (eng/pull db "bob" [{"manager" ["name"]}])))))
+
+(deftest pull-pattern-reverse-ref-needs-link-valued-refs
+  ;; refs-to (VAET-style) only tracks Link-valued references (ref?'s
+  ;; default is ipld/link?) -- same convention `refs` already documents.
+  (let [alice-link (ipld/link "bafyreiaakutsdtndrl7e7emcmkp5hjsaaq2vu6prfelbgaglprvtdon63m")
+        db (eng/transact (eng/empty-db) [{:s "alice" :p "name" :o "Alice"}
+                                          {:s "bob" :p "manager" :o alice-link}
+                                          {:s "bob" :p "name" :o "Bob"}
+                                          {:s "carol" :p "manager" :o alice-link}
+                                          {:s "carol" :p "name" :o "Carol"}])]
+    (testing "flat reverse ref"
+      (is (= #{"bob" "carol"} (get (eng/pull db alice-link ["_manager"]) "_manager"))))
+    (testing "nested reverse ref"
+      (is (= #{{"name" #{"Bob"}} {"name" #{"Carol"}}}
+             (get (eng/pull db alice-link [{"_manager" ["name"]}]) "_manager"))))))
+
+(deftest pull-pattern-recursion-depth-limit
+  (let [db (eng/transact (eng/empty-db)
+                         [{:s "a" :p "name" :o "A"} {:s "a" :p "friend" :o "b"}
+                          {:s "b" :p "name" :o "B"} {:s "b" :p "friend" :o "c"}
+                          {:s "c" :p "name" :o "C"} {:s "c" :p "friend" :o "a"}]
+                         (constantly false))]
+    (is (= {"friend" #{{"name" #{"B"} "friend" #{{"name" #{"C"} "friend" #{"a"}}}}}}
+           (eng/pull db "a" [{"friend" 2}]))
+        "depth 2: expands friend twice (a->b->c), then leaves c's own friend value bare (a, unexpanded)")))
+
+(deftest pull-pattern-unlimited-recursion-is-cycle-safe
+  (let [db (eng/transact (eng/empty-db)
+                         [{:s "a" :p "friend" :o "b"}
+                          {:s "b" :p "friend" :o "c"}
+                          {:s "c" :p "friend" :o "a"}]
+                         (constantly false))]
+    (testing "a->b->c->a is a cycle -- '... must terminate, not hang, and treat the closed loop as {}"
+      (is (= {"friend" #{{"friend" #{{"friend" #{{}}}}}}}
+             (eng/pull db "a" [{"friend" '...}]))))))
+
 (deftest transact-is-immutable
   (let [db0 (eng/empty-db)
         db1 (eng/transact db0 [{:s "alice" :p "role" :o "admin"}])
         everything (constantly true)]
     (is (= 0 (count (eng/datoms db0 everything))))
     (is (= 1 (count (eng/datoms db1 everything))))))
+
+;; ── schema: Datomic-style "schema is just datoms too" (ADR-2607061200) ──────
+
+(deftest schema-is-derived-from-installed-datoms
+  (let [db (eng/install-schema (eng/empty-db)
+                                {"role" {:db/valueType :string :db/cardinality :one}
+                                 "age"  {:db/valueType :long}
+                                 "email" {:db/valueType :string :db/unique :identity}})]
+    (is (= {"role" {:value-type "string" :cardinality "one" :unique nil}
+            "age" {:value-type "long" :cardinality "many" :unique nil}
+            "email" {:value-type "string" :cardinality "many" :unique "identity"}}
+           (eng/schema-of db)))))
+
+(deftest plain-transact-is-unaffected-by-schema-no-migration-needed
+  ;; every existing caller of plain `transact` keeps working exactly as
+  ;; before -- schema enforcement is opt-in via transact-with-schema only.
+  (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "totally-unknown-attr" :o "anything"}])]
+    (is (= #{"anything"} (get (eng/pull db "alice") "totally-unknown-attr")))))
+
+(deftest transact-with-schema-rejects-unknown-attribute
+  (let [db (eng/install-schema (eng/empty-db) {"role" {:db/valueType :string}})]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                           #"unknown attribute"
+                           (eng/transact-with-schema db [{:s "alice" :p "nickname" :o "Al"}] {})))))
+
+(deftest transact-with-schema-can-declare-new-attributes-inline
+  (let [db (eng/transact-with-schema (eng/empty-db)
+                                      [{:s "alice" :p "role" :o "admin"}]
+                                      {"role" {:db/valueType :string}})]
+    (is (= #{"admin"} (get (eng/pull db "alice") "role")))))
+
+(deftest transact-with-schema-rejects-value-type-mismatch
+  (let [db (eng/install-schema (eng/empty-db) {"age" {:db/valueType :long}})]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                           #"schema violation"
+                           (eng/transact-with-schema db [{:s "bob" :p "age" :o "not-a-number"}] {})))
+    (testing "a real long passes validation (storage still stringifies, matching the rest of this codebase's convention -- schema validates the ORIGINAL value's type, it doesn't change on-disk representation)"
+      (is (= #{"42"} (get (eng/pull (eng/transact-with-schema db [{:s "bob" :p "age" :o 42}] {}) "bob") "age"))))))
+
+(deftest transact-with-schema-cardinality-one-replaces-not-accumulates
+  (let [db0 (eng/install-schema (eng/empty-db) {"role" {:db/valueType :string :db/cardinality :one}})
+        db1 (eng/transact-with-schema db0 [{:s "alice" :p "role" :o "admin"}] {})
+        db2 (eng/transact-with-schema db1 [{:s "alice" :p "role" :o "superadmin"}] {})]
+    (is (= #{"admin"} (get (eng/pull db1 "alice") "role")))
+    (is (= #{"superadmin"} (get (eng/pull db2 "alice") "role"))
+        "cardinality :one retracts the prior value instead of accumulating -- unlike arrangement's own native cardinality-many default")))
+
+(deftest transact-with-schema-cardinality-many-still-accumulates
+  (let [db0 (eng/install-schema (eng/empty-db) {"tag" {:db/valueType :string}})
+        db1 (eng/transact-with-schema db0 [{:s "alice" :p "tag" :o "a"}] {})
+        db2 (eng/transact-with-schema db1 [{:s "alice" :p "tag" :o "b"}] {})]
+    (is (= #{"a" "b"} (get (eng/pull db2 "alice") "tag")))))
+
+(deftest transact-with-schema-unique-identity-rejects-cross-entity-collision
+  (let [db0 (eng/install-schema (eng/empty-db) {"email" {:db/valueType :string :db/unique :identity}})
+        db1 (eng/transact-with-schema db0 [{:s "alice" :p "email" :o "a@x.com"}] {})]
+    (is (thrown-with-msg? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                           #"unique attribute violation"
+                           (eng/transact-with-schema db1 [{:s "bob" :p "email" :o "a@x.com"}] {})))
+    (testing "the SAME entity re-asserting its own unique value is not a violation"
+      (is (= #{"a@x.com"}
+             (get (eng/pull (eng/transact-with-schema db1 [{:s "alice" :p "email" :o "a@x.com"}] {}) "alice") "email"))))))
+
+;; ── tx-report / with (ADR-2607061200 "3 pillars" follow-up) ─────────────────
+
+(deftest transact-with-report-shape
+  (let [db0 (eng/empty-db)
+        report (eng/transact-with-report db0 [{:s "alice" :p "role" :o "admin"}])]
+    (is (= #{:db-before :db-after :tx-data} (set (keys report))))
+    (is (= db0 (:db-before report)))
+    (is (= #{"admin"} (get (eng/pull (:db-after report) "alice") "role")))
+    (is (= [{:s "alice" :p "role" :o "admin"}] (:tx-data report)))))
+
+(deftest with-is-transact-with-report-under-datomics-own-name
+  (let [db0 (eng/empty-db)
+        tx-data [{:s "alice" :p "role" :o "admin"}]]
+    (is (= (eng/transact-with-report db0 tx-data) (eng/with db0 tx-data)))))
+
+(deftest with-never-touches-the-original-db-value
+  (let [db0 (eng/empty-db)
+        {:keys [db-after]} (eng/with db0 [{:s "alice" :p "role" :o "admin"}])]
+    (is (= 0 (count (eng/datoms db0 (constantly true)))) "db0 itself is untouched -- with is purely speculative")
+    (is (= 1 (count (eng/datoms db-after (constantly true)))))))
 
 #?(:clj
    (deftest commit-snapshots-are-content-addressed-and-deterministic
@@ -466,6 +605,130 @@
                 {:e "carol" :a "role" :v_edn "\"guest\"" :added true}}
               (set (eng/hot-datoms get-fn c2 (constantly true) test-blind-fn test-decrypt-fn)))
            "no loss/dup across three sequential novelty-append commits"))))
+
+#?(:clj
+   (deftest as-of-finds-the-exact-chain-cid-at-each-seq
+     (let [{:keys [put! get-fn]} (mem-store)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+           c1 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v2"}] c0 test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v3"}] c1 test-encrypt-fn)]
+       (is (= c0 (eng/as-of get-fn c2 0)))
+       (is (= c1 (eng/as-of get-fn c2 1)))
+       (is (= c2 (eng/as-of get-fn c2 2)))
+       (testing "seq beyond the tip clamps to the tip (Datomic's own \"as-of the future = now\")"
+         (is (= c2 (eng/as-of get-fn c2 999))))
+       (testing "nil chain-cid -> nil (no prior commit at all)"
+         (is (nil? (eng/as-of get-fn nil 0)))))))
+
+#?(:clj
+   (deftest hydrate-chain-gives-a-queryable-db-value-as-of-any-point
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+           c1 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v2"}] c0 test-encrypt-fn)
+           _ (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+       (testing "as-of composes directly with hydrate-chain -- true db value at that point"
+         (let [db-at-0 (eng/hydrate-chain get-fn (eng/as-of get-fn c1 0) test-blind-fn test-decrypt-fn)
+               db-at-1 (eng/hydrate-chain get-fn (eng/as-of get-fn c1 1) test-blind-fn test-decrypt-fn)]
+           (is (= #{"v1"} (get (eng/pull db-at-0 "alice") "role")))
+           (is (= #{"v1" "v2"} (get (eng/pull db-at-1 "alice") "role")))))
+       (testing "hydrate-chain is queryable through arrangement.datalog/q too, not just pull"
+         (let [db-at-0 (eng/hydrate-chain get-fn (eng/as-of get-fn c1 0) test-blind-fn test-decrypt-fn)]
+           (is (= #{["v1"]} (eng/query db-at-0 {:find '[?v] :where '[["alice" "role" ?v]]} everything))))))))
+
+#?(:clj
+   (deftest commit-serialized-basic-single-writer-usage
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (let [result (atom nil)]
+                    (swap! heads (fn [m]
+                                   (if (= (get m head-key) expected)
+                                     (do (reset! result new) (assoc m head-key new))
+                                     (do (reset! result (get m head-key)) m))))
+                    @result))
+           c0 (eng/commit-serialized! put! get-fn cas! "actor:alice" nil [{:s "alice" :p "role" :o "v1"}] test-encrypt-fn)
+           c1 (eng/commit-serialized! put! get-fn cas! "actor:alice" c0 [{:s "alice" :p "role" :o "v2"}] test-encrypt-fn)]
+       (is (= c1 (get @heads "actor:alice")) "head-key tracks the latest committed chain-cid")
+       (is (= [0 1] (map :seq (eng/chain get-fn c1)))))))
+
+#?(:clj
+   (deftest commit-serialized-retries-against-the-real-head-on-a-lost-race
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (let [result (atom nil)]
+                    (swap! heads (fn [m]
+                                   (if (= (get m head-key) expected)
+                                     (do (reset! result new) (assoc m head-key new))
+                                     (do (reset! result (get m head-key)) m))))
+                    @result))
+           c0 (eng/commit-serialized! put! get-fn cas! "actor:alice" nil [{:s "alice" :p "role" :o "v1"}] test-encrypt-fn)
+           c1 (eng/commit-serialized! put! get-fn cas! "actor:alice" c0 [{:s "alice" :p "role" :o "v2"}] test-encrypt-fn)
+           ;; a stale caller still believes the head is c0 (a concurrent writer already
+           ;; advanced it to c1) -- commit-serialized! must retry against the REAL head,
+           ;; never fork the chain.
+           c2 (eng/commit-serialized! put! get-fn cas! "actor:alice" c0 [{:s "alice" :p "role" :o "v3-from-stale-caller"}] test-encrypt-fn)]
+       (is (= [0 1 2] (map :seq (eng/chain get-fn c2))) "no fork -- a clean, gapless sequence")
+       (is (= c2 (get @heads "actor:alice")) "the retried commit is the one that actually won"))))
+
+#?(:clj
+   (deftest commit-serialized-throws-on-persistent-contention
+     (let [{:keys [put! get-fn]} (mem-store)
+           always-losing-cas! (fn [head-key expected new] nil)]
+       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"max-cas-retries"
+                             (eng/commit-serialized! put! get-fn always-losing-cas! "actor:bob" nil
+                                                     [{:s "bob" :p "x" :o "y"}] test-encrypt-fn 3))))))
+
+#?(:clj
+   (deftest commit-with-report-bang-shape
+     (let [{:keys [put! get-fn]} (mem-store)
+           report (eng/commit-with-report! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)]
+       (is (= #{:chain-cid-before :chain-cid-after :tx-data} (set (keys report))))
+       (is (nil? (:chain-cid-before report)))
+       (is (some? (:chain-cid-after report)))
+       (is (= [{:s "alice" :p "role" :o "admin"}] (:tx-data report))))))
+
+#?(:clj
+   (deftest commit-serialized-with-report-bang-shape
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (let [result (atom nil)]
+                    (swap! heads (fn [m]
+                                   (if (= (get m head-key) expected)
+                                     (do (reset! result new) (assoc m head-key new))
+                                     (do (reset! result (get m head-key)) m))))
+                    @result))
+           report (eng/commit-serialized-with-report! put! get-fn cas! "actor:alice" nil
+                                                       [{:s "alice" :p "role" :o "admin"}] test-encrypt-fn)]
+       (is (= #{:chain-cid-before :chain-cid-after :tx-data} (set (keys report))))
+       (is (= (:chain-cid-after report) (get @heads "actor:alice"))))))
+
+#?(:clj
+   (deftest since-shows-only-commits-after-a-seq
+     (let [{:keys [put! get-fn]} (mem-store)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+           c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "v2"}] c0 test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [{:s "carol" :p "role" :o "v3"}] c1 test-encrypt-fn)
+           delta (eng/since get-fn c2 0 test-decrypt-fn)]
+       (is (nil? (get (eng/pull delta "alice") "role")) "alice's write was AT seq 0, not after it")
+       (is (= #{"v2"} (get (eng/pull delta "bob") "role")))
+       (is (= #{"v3"} (get (eng/pull delta "carol") "role"))))))
+
+#?(:clj
+   (deftest history-includes-everything-across-a-fold
+     (let [{:keys [put! get-fn]} (mem-store)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+           c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "v2"}] c0 test-encrypt-fn)
+           folded (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+           c2 (eng/commit! put! get-fn [{:s "carol" :p "role" :o "v3"}] folded test-encrypt-fn)
+           full-history (eng/history get-fn c2 test-blind-fn test-decrypt-fn)]
+       (is (= #{"v1"} (get (eng/pull full-history "alice") "role"))
+           "alice's fact was folded into the indexed snapshot -- still visible")
+       (is (= #{"v2"} (get (eng/pull full-history "bob") "role")))
+       (is (= #{"v3"} (get (eng/pull full-history "carol") "role"))
+           "carol's fact is post-fold novelty -- also visible"))))
 
 #?(:clj
    (deftest hot-datoms-merges-indexed-and-novelty
@@ -861,6 +1124,170 @@
                                           (set rows))
                                        "no loss/dup across three sequential novelty-append commits")
                                    (done)))))))))))
+
+#?(:cljs
+   (deftest as-of-finds-the-exact-chain-cid-at-each-seq
+     ;; as-of/chain are synchronous on BOTH platforms -- only the commit!
+     ;; calls building the chain need Promise-chaining here. Each commit!'s
+     ;; own cid is carried forward as an accumulating vector so every
+     ;; earlier cid stays available for the final assertions.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+             (.then (fn [c0] (.then (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v2"}] c0 test-encrypt-fn)
+                                    (fn [c1] [c0 c1]))))
+             (.then (fn [[c0 c1]] (.then (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v3"}] c1 test-encrypt-fn)
+                                         (fn [c2] [c0 c1 c2]))))
+             (.then (fn [[c0 c1 c2]]
+                      (is (= c0 (eng/as-of get-fn c2 0)))
+                      (is (= c1 (eng/as-of get-fn c2 1)))
+                      (is (= c2 (eng/as-of get-fn c2 2)))
+                      (is (= c2 (eng/as-of get-fn c2 999))
+                          "seq beyond the tip clamps to the tip")
+                      (is (nil? (eng/as-of get-fn nil 0)))
+                      (done))))))))
+
+#?(:cljs
+   (deftest hydrate-chain-gives-a-queryable-db-value-as-of-any-point
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             everything (constantly true)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v2"}] c0 test-encrypt-fn)))
+             (.then (fn [c1] (-> (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                 (.then (fn [_] c1)))))
+             (.then (fn [c1]
+                      (-> (js/Promise.all
+                           #js [(eng/hydrate-chain get-fn (eng/as-of get-fn c1 0) test-blind-fn test-decrypt-fn)
+                                (eng/hydrate-chain get-fn (eng/as-of get-fn c1 1) test-blind-fn test-decrypt-fn)])
+                          (.then (fn [results]
+                                   (let [[db-at-0 db-at-1] (vec results)]
+                                     (is (= #{"v1"} (get (eng/pull db-at-0 "alice") "role")))
+                                     (is (= #{"v1" "v2"} (get (eng/pull db-at-1 "alice") "role")))
+                                     (is (= #{["v1"]} (eng/query db-at-0 {:find '[?v] :where '[["alice" "role" ?v]]} everything))
+                                         "hydrate-chain is queryable through arrangement.datalog/q too, not just pull")
+                                     (done))))))))))))
+
+#?(:cljs
+   (deftest commit-serialized-basic-single-writer-usage
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             heads (atom {})
+             cas! (fn [head-key expected new]
+                    (let [result (atom nil)]
+                      (swap! heads (fn [m]
+                                     (if (= (get m head-key) expected)
+                                       (do (reset! result new) (assoc m head-key new))
+                                       (do (reset! result (get m head-key)) m))))
+                      @result))]
+         (-> (eng/commit-serialized! put! get-fn cas! "actor:alice" nil [{:s "alice" :p "role" :o "v1"}] test-encrypt-fn)
+             (.then (fn [c0] (eng/commit-serialized! put! get-fn cas! "actor:alice" c0 [{:s "alice" :p "role" :o "v2"}] test-encrypt-fn)))
+             (.then (fn [c1]
+                      (is (= c1 (get @heads "actor:alice")) "head-key tracks the latest committed chain-cid")
+                      (is (= [0 1] (map :seq (eng/chain get-fn c1))))
+                      (done))))))))
+
+#?(:cljs
+   (deftest commit-serialized-retries-against-the-real-head-on-a-lost-race
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             heads (atom {})
+             cas! (fn [head-key expected new]
+                    (let [result (atom nil)]
+                      (swap! heads (fn [m]
+                                     (if (= (get m head-key) expected)
+                                       (do (reset! result new) (assoc m head-key new))
+                                       (do (reset! result (get m head-key)) m))))
+                      @result))]
+         (-> (eng/commit-serialized! put! get-fn cas! "actor:alice" nil [{:s "alice" :p "role" :o "v1"}] test-encrypt-fn)
+             (.then (fn [c0] (.then (eng/commit-serialized! put! get-fn cas! "actor:alice" c0 [{:s "alice" :p "role" :o "v2"}] test-encrypt-fn)
+                                    (fn [c1] c0))))
+             ;; stale caller still believes head is c0; a concurrent writer already advanced it.
+             (.then (fn [c0]
+                      (.then (eng/commit-serialized! put! get-fn cas! "actor:alice" c0 [{:s "alice" :p "role" :o "v3-from-stale-caller"}] test-encrypt-fn)
+                             (fn [c2]
+                               (is (= [0 1 2] (map :seq (eng/chain get-fn c2))) "no fork -- a clean, gapless sequence")
+                               (is (= c2 (get @heads "actor:alice")))
+                               (done))))))))))
+
+#?(:cljs
+   (deftest commit-serialized-throws-on-persistent-contention
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             always-losing-cas! (fn [head-key expected new] nil)]
+         (-> (eng/commit-serialized! put! get-fn always-losing-cas! "actor:bob" nil
+                                     [{:s "bob" :p "x" :o "y"}] test-encrypt-fn 3)
+             (.then (fn [_] (is false "should have rejected") (done))
+                    (fn [err] (is (re-find #"max-cas-retries" (.-message err))) (done))))))))
+
+#?(:cljs
+   (deftest commit-with-report-bang-shape
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)]
+         (-> (eng/commit-with-report! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             (.then (fn [report]
+                      (is (= #{:chain-cid-before :chain-cid-after :tx-data} (set (keys report))))
+                      (is (nil? (:chain-cid-before report)))
+                      (is (some? (:chain-cid-after report)))
+                      (is (= [{:s "alice" :p "role" :o "admin"}] (:tx-data report)))
+                      (done))))))))
+
+#?(:cljs
+   (deftest commit-serialized-with-report-bang-shape
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             heads (atom {})
+             cas! (fn [head-key expected new]
+                    (let [result (atom nil)]
+                      (swap! heads (fn [m]
+                                     (if (= (get m head-key) expected)
+                                       (do (reset! result new) (assoc m head-key new))
+                                       (do (reset! result (get m head-key)) m))))
+                      @result))]
+         (-> (eng/commit-serialized-with-report! put! get-fn cas! "actor:alice" nil
+                                                 [{:s "alice" :p "role" :o "admin"}] test-encrypt-fn)
+             (.then (fn [report]
+                      (is (= #{:chain-cid-before :chain-cid-after :tx-data} (set (keys report))))
+                      (is (= (:chain-cid-after report) (get @heads "actor:alice")))
+                      (done))))))))
+
+#?(:cljs
+   (deftest since-shows-only-commits-after-a-seq
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+             (.then (fn [c0] (.then (eng/commit! put! get-fn [{:s "bob" :p "role" :o "v2"}] c0 test-encrypt-fn)
+                                    (fn [c1] c1))))
+             (.then (fn [c1] (.then (eng/commit! put! get-fn [{:s "carol" :p "role" :o "v3"}] c1 test-encrypt-fn)
+                                    (fn [c2] c2))))
+             (.then (fn [c2]
+                      (.then (eng/since get-fn c2 0 test-decrypt-fn)
+                             (fn [delta]
+                               (is (nil? (get (eng/pull delta "alice") "role")) "alice's write was AT seq 0, not after it")
+                               (is (= #{"v2"} (get (eng/pull delta "bob") "role")))
+                               (is (= #{"v3"} (get (eng/pull delta "carol") "role")))
+                               (done))))))))))
+
+#?(:cljs
+   (deftest history-includes-everything-across-a-fold
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "v1"}] nil test-encrypt-fn)
+             (.then (fn [c0] (.then (eng/commit! put! get-fn [{:s "bob" :p "role" :o "v2"}] c0 test-encrypt-fn)
+                                    (fn [c1] c1))))
+             (.then (fn [c1] (.then (eng/fold! put! get-fn c1 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                    (fn [folded] folded))))
+             (.then (fn [folded] (.then (eng/commit! put! get-fn [{:s "carol" :p "role" :o "v3"}] folded test-encrypt-fn)
+                                        (fn [c2] c2))))
+             (.then (fn [c2]
+                      (.then (eng/history get-fn c2 test-blind-fn test-decrypt-fn)
+                             (fn [full-history]
+                               (is (= #{"v1"} (get (eng/pull full-history "alice") "role"))
+                                   "alice's fact was folded into the indexed snapshot -- still visible")
+                               (is (= #{"v2"} (get (eng/pull full-history "bob") "role")))
+                               (is (= #{"v3"} (get (eng/pull full-history "carol") "role"))
+                                   "carol's fact is post-fold novelty -- also visible")
+                               (done))))))))))
 
 #?(:cljs
    (deftest hot-datoms-merges-indexed-and-novelty

@@ -38,6 +38,7 @@
 (ns kotobase-peer.core
   (:require #?(:clj  [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])   ; both expose read-string over EDN
+            [clojure.string :as str]
             [ipld.core :as ipld]
             [prolly-tree.core :as pt]
             [arrangement.core :as qs]
@@ -108,6 +109,167 @@
   ([db tx-data ref?]
    (reduce (fn [db item] (qs/assert-quad db (->quad item) ref?))
            db tx-data)))
+
+;; ── schema: Datomic-style "schema is just datoms too" ───────────────────────
+;; (one of the "3 pillars" this landing adds.) An attribute is a normal
+;; entity, using its own NAME as its entity id (Datomic's `:db/ident`
+;; pattern) -- `db/valueType`/`db/cardinality`/`db/unique` facts ABOUT it are
+;; ordinary datoms, queryable like anything else, not a side-channel config
+;; the db doesn't know about. `bootstrap-attrs` is the one fixed exception:
+;; describing an attribute's schema requires asserting `db/valueType`/etc.
+;; facts, which are themselves attributes -- Datomic solves this bootstrap
+;; problem with a small built-in meta-schema those specific attributes are
+;; exempt from needing a schema entry for; this landing does the same.
+
+(def bootstrap-attrs
+  "Meta-schema attributes describing OTHER attributes -- these never need a
+  schema entry of their own. Declaring them about some attribute name IS
+  how that attribute gets its first schema entry; a database with zero
+  schema installed can still bootstrap its first one."
+  #{"db/valueType" "db/cardinality" "db/unique" "db/doc"})
+
+(defn- raw-triple
+  "Like `->quad`, but the `:o`/`v` position is NOT coerced (Link-passthrough
+  or stringified) -- the caller's ORIGINAL value, for `transact-with-
+  schema`'s `:db/valueType` check to inspect before `->quad`'s
+  stringification would erase e.g. an int's actual type. Returns `[s p o]`,
+  not yet a quad map; storage still goes through the normal `->quad`
+  coercion afterward (schema validates the value's type at the API
+  boundary, it does not change the on-disk string-based representation
+  every other value already uses)."
+  [item]
+  (cond
+    (and (map? item) (contains? item :s) (contains? item :p) (contains? item :o))
+    [(str (:s item)) (str (:p item)) (:o item)]
+
+    (and (vector? item) (= 4 (count item)) (= :db/add (first item)))
+    (let [[_ e a v] item] [(str e) (str a) v])
+
+    (and (sequential? item) (= 3 (count item)))
+    (let [[e a v] item] [(str e) (str a) v])
+
+    :else
+    (throw (ex-info "kotobase-peer: unrecognized tx-data item" {:item item}))))
+
+(defn install-schema
+  "Assert schema declarations as ordinary datoms (see the ns section
+  comment above): `schema` is `{attr-name {:db/valueType t :db/cardinality
+  c :db/unique u :db/doc \"...\"}}` (each key optional; values may be
+  keywords -- `:string`, `:one`, `:identity`, etc. -- or plain strings).
+  `db/doc` is purely informational, never validated by `transact-with-
+  schema`."
+  ([db schema] (install-schema db schema ipld/link?))
+  ([db schema ref?]
+   (transact db
+             (for [[attr decl] schema
+                   [k v] decl
+                   :let [k-name (subs (str k) 1)]        ; :db/valueType -> "db/valueType"
+                   :when (contains? bootstrap-attrs k-name)]
+               [attr k-name (if (keyword? v) (name v) (str v))])
+             ref?)))
+
+(defn schema-of
+  "Derive `{attr-name {:value-type _ :cardinality _ :unique _}}` from
+  whatever `db/valueType`/`db/cardinality`/`db/unique` datoms already
+  exist in `db` (see `install-schema`) -- schema is just data the db
+  already has, not a side-channel a caller must separately track.
+  `:cardinality` defaults to `\"many\"` (arrangement's own native
+  cardinality-agnostic behavior, ADR-2607061200 pillar note) when an
+  attribute has SOME schema entry but no explicit `db/cardinality`."
+  [db]
+  (into {}
+        (keep (fn [[ent attrs]]
+                (let [vt (first (get attrs "db/valueType"))
+                      card (first (get attrs "db/cardinality"))
+                      uniq (first (get attrs "db/unique"))]
+                  (when (or vt card uniq)
+                    [ent {:value-type vt :cardinality (or card "many") :unique uniq}]))))
+        (:spo db)))
+
+(defn- validate-value-type! [attr value-type v]
+  (case value-type
+    "string"  (when-not (string? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a string" {:attr attr :value v})))
+    "long"    (when-not (integer? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a long" {:attr attr :value v})))
+    "double"  (when-not (number? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a double" {:attr attr :value v})))
+    "boolean" (when-not (boolean? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a boolean" {:attr attr :value v})))
+    "ref"     (when-not (ipld/link? v)
+                (throw (ex-info "kotobase-peer: schema violation -- expected a ref (ipld/Link)" {:attr attr :value v})))
+    nil))
+
+(defn transact-with-schema
+  "Like `transact`, but OPT-IN schema enforcement (plain `transact` is
+  completely unchanged -- every existing caller keeps working exactly as
+  before): validates every tx-data item against `schema` (merged with
+  whatever `schema-of` already derives from `db`, so a caller can declare
+  brand-new attributes in the very same call that writes their first
+  data, Datomic's own \"schema is just a transaction too\" idiom) BEFORE
+  applying any of them.
+    - an attribute with no schema entry (and not `bootstrap-attrs`, which
+      describe schema itself and need none) throws -- Datomic's own
+      \"attribute must be installed before use\" discipline.
+    - a declared `:value-type` mismatch (checked against the ORIGINAL
+      value, before `->quad`'s string coercion -- see `raw-triple`)
+      throws.
+    - a declared `:cardinality \"one\"` attribute automatically retracts
+      any PRIOR value(s) for that `(s, p)` pair before asserting the new
+      one -- this fn's own job, NOT `arrangement.core/assert-quad`'s
+      (arrangement stays cardinality-agnostic per its own ns docstring;
+      cardinality is a POLICY layered on top here, the same way
+      `visible?`/`blind-fn`/`encrypt-fn` are layered rather than baked
+      into arrangement).
+    - a declared `:unique \"identity\"`/`\"value\"` attribute throws if
+      the `(attr, value)` pair already belongs to a DIFFERENT entity.
+  Applied in tx-data order against the RUNNING db, so a later item can
+  rely on an earlier item's cardinality-one retraction having already
+  happened."
+  ([db tx-data schema] (transact-with-schema db tx-data ipld/link? schema))
+  ([db tx-data ref? schema]
+   (let [effective-schema (merge (schema-of db) schema)]
+     (reduce
+      (fn [db item]
+        (let [[s p o] (raw-triple item)]
+          (when-not (or (contains? bootstrap-attrs p) (contains? effective-schema p))
+            (throw (ex-info "kotobase-peer: unknown attribute -- no schema declared (see install-schema)"
+                            {:attr p})))
+          (when-let [vt (get-in effective-schema [p :value-type])]
+            (validate-value-type! p vt o))
+          (when (= "identity" (get-in effective-schema [p :unique]))
+            (let [quad-o (->quad-value o)
+                  existing (qs/by-predicate-value db p quad-o)]
+              (when (and (seq existing) (not= existing #{s}))
+                (throw (ex-info "kotobase-peer: unique attribute violation -- value already belongs to a different entity"
+                                {:attr p :value quad-o :existing existing})))))
+          (let [db (if (= "one" (get-in effective-schema [p :cardinality] "many"))
+                     (reduce (fn [db old-o] (qs/retract-quad db {:s s :p p :o old-o} ref?))
+                             db
+                             (disj (get (qs/entity-attrs db s) p #{}) (->quad-value o)))
+                     db)]
+            (qs/assert-quad db {:s s :p p :o (->quad-value o)} ref?))))
+      db
+      tx-data))))
+
+(defn transact-with-report
+  "Like `transact`, but returns a Datomic-shaped tx-report --
+   `{:db-before :db-after :tx-data}` -- instead of the bare new db value.
+   No `:tempids` (see `commit-with-report!`'s docstring for why)."
+  ([db tx-data] (transact-with-report db tx-data ipld/link?))
+  ([db tx-data ref?]
+   {:db-before db :db-after (transact db tx-data ref?) :tx-data (mapv ->quad tx-data)}))
+
+(defn with
+  "Datomic's `with`: apply `tx-data` to `db` SPECULATIVELY and return the
+   tx-report -- a pure function, db value in, `{:db-before :db-after
+   :tx-data}` out, nothing persisted anywhere (no `put!`/`chain` touched
+   at all). This substrate's `transact`/`transact-with-report` already
+   ARE exactly this -- a hot db value in, a new hot db value out, no
+   persistence -- so `with` is simply that mechanism under Datomic's own
+   name, for a caller specifically looking for it."
+  ([db tx-data] (transact-with-report db tx-data))
+  ([db tx-data ref?] (transact-with-report db tx-data ref?)))
 
 ;; ── datafication via the canonical datom model (datom-clj) ───────────────────
 ;; kotoba : kotobase = Clojure : Datomic (ADR-2607032500). An entity tx-map is
@@ -228,12 +390,82 @@
   [db find+where visible?]
   (datalog/q db find+where visible?))
 
+;; ── pull: a Datomic-shaped pull-pattern language over entity-attrs/refs-to ──
+;; (one of the "3 pillars" this landing adds -- ADR-2607061200's own note
+;; that pull's flat `{p #{o...}}` was a deliberately minimal Stage-0 landing).
+
+(defn- pull-wildcard? [attr] (= attr '*))
+(defn- pull-map-spec? [attr] (map? attr))
+(defn- reverse-attr? [a] (str/starts-with? a "_"))
+(defn- reverse-attr-name [a] (subs a 1))
+
+(defn- pull1
+  "Pull entity `s` per pull-pattern `pattern` (a vector of pull-attrs, see
+  `pull`'s docstring). `seen` is the set of entity ids already being
+  expanded on this recursion path -- an entity already on the path is
+  returned as `{}` rather than re-expanded, so a cyclic graph can never
+  loop forever, REGARDLESS of whether the caller wrote an explicit `n`/
+  `'...` recursion limit or not (unconditional cycle safety, not just a
+  courtesy for well-behaved callers)."
+  [db s pattern seen]
+  (let [attrs (qs/entity-attrs db s)         ; {p #{o...}}
+        seen' (conj seen s)
+        expand (fn [ref sub-pattern]
+                 (if (contains? seen' ref) {} (pull1 db ref sub-pattern seen')))]
+    (reduce
+     (fn [acc attr]
+       (cond
+         (pull-wildcard? attr) (merge acc attrs)
+
+         (and (string? attr) (reverse-attr? attr))
+         (assoc acc attr (get (qs/refs-to db s) (reverse-attr-name attr) #{}))
+
+         (string? attr)
+         (assoc acc attr (get attrs attr #{}))
+
+         (pull-map-spec? attr)
+         (let [[a spec] (first attr)
+               reverse? (reverse-attr? a)
+               refs (if reverse? (get (qs/refs-to db s) (reverse-attr-name a) #{}) (get attrs a #{}))]
+           (assoc acc a
+                  (cond
+                    (vector? spec)
+                    (into #{} (map #(expand % spec)) refs)
+
+                    (or (integer? spec) (= spec '...))
+                    (if (and (integer? spec) (<= spec 0))
+                      refs
+                      (into #{} (map #(expand % ['* {a (if (integer? spec) (dec spec) '...)}])) refs))
+
+                    :else acc)))
+
+         :else acc))
+     {}
+     pattern)))
+
 (defn pull
-  "`datomic.pull`-equivalent for entity `s`: `{p #{o...}}` (arrangement has no
-   cardinality tracking, so every attribute is multi-valued — a caller
-   expecting single-valued Datomic pull semantics must pick e.g. `first`)."
-  [db s]
-  (qs/entity-attrs db s))
+  "`datomic.pull`-equivalent for entity `s`. 2-arg form is unchanged: flat
+   `{p #{o...}}` (arrangement has no cardinality tracking, so every
+   attribute is multi-valued -- a caller expecting single-valued Datomic
+   pull semantics must pick e.g. `first`).
+
+   3-arg form takes a Datomic-shaped pull PATTERN, a vector of pull-attrs:
+     - a plain attr string        -> that attr's value set, flat (as above)
+     - `'*`                        -> every attr the entity has (wildcard)
+     - `\"_attr\"` (leading `_`)   -> reverse nav: every entity referencing
+                                      THIS one via `attr` (`refs`/VAET-style),
+                                      flat
+     - `{attr [sub-pattern ...]}`  -> nested pull: treat attr's value(s) (or,
+                                      for `\"_attr\"`, its referrers) as
+                                      entity ids and pull each with
+                                      sub-pattern
+     - `{attr n}` / `{attr '...}`  -> recursive wildcard pull through attr,
+                                      `n` levels deep or unlimited -- cycle-
+                                      safe either way (see `pull1`), so a
+                                      graph cycle can't loop forever even
+                                      with `'...`."
+  ([db s] (qs/entity-attrs db s))
+  ([db s pattern] (pull1 db s pattern #{})))
 
 (defn refs
   "`{p #{s...}}`: every entity `s` that references `ref` via predicate `p`
@@ -363,6 +595,135 @@
                     (let [new-state (update state "novelty" (fnil conj []) (ipld/link tx-cid))]
                       (cd/commit! put! get-fn new-state prev-chain-cid))))))))
 
+(defn commit-with-report!
+  "Like `commit!`, but returns a Datomic-shaped tx-report --
+   `{:chain-cid-before prev-chain-cid :chain-cid-after new-chain-cid
+   :tx-data quads}` -- instead of a bare chain-cid. Datomic's own
+   `{:db-before :db-after :tx-data :tempids}`, adapted: this substrate's
+   \"db identity\" for a chain-append write IS the chain-cid (content-
+   addressed), not a hot db value, so `:chain-cid-before`/`-after` take
+   `:db-before`/`-after`'s role. No `:tempids` -- this substrate has no
+   temporary-id resolution step (callers pass real entity ids directly),
+   so it's omitted rather than faked. Synchronous on JVM; a `js/Promise`
+   of the report on cljs."
+  [put! get-fn tx-data prev-chain-cid encrypt-fn]
+  (let [quads (mapv ->quad tx-data)]
+    #?(:clj
+       {:chain-cid-before prev-chain-cid
+        :chain-cid-after (commit! put! get-fn tx-data prev-chain-cid encrypt-fn)
+        :tx-data quads}
+       :cljs
+       (-> (commit! put! get-fn tx-data prev-chain-cid encrypt-fn)
+           (.then (fn [new-cid]
+                    {:chain-cid-before prev-chain-cid :chain-cid-after new-cid :tx-data quads}))))))
+
+;; ── write ACID: commit-serialized! ──────────────────────────────────────────
+;; (one of the "3 pillars" this landing adds.) `chain.core/commit!`'s `:seq`
+;; computation is a plain read-then-write with no atomicity (confirmed by
+;; direct inspection): two concurrent writers can both derive the same
+;; `:seq` from the same `prev-cid` and silently FORK the chain -- there is no
+;; Transactor-equivalent single-writer serialization anywhere in this stack
+;; today. Fixing that PROPERLY requires an atomic primitive no storage
+;; backend already deployed here (R2, plain in-memory test stores) is
+;; guaranteed to support -- so this is deliberately an OPT-IN, ADDITIVE new
+;; function, not a change to `commit!`'s existing contract: a caller without
+;; (or not wanting) a CAS-capable head-store keeps calling plain `commit!`
+;; exactly as before, completely unaffected. `pds.aozora.app`'s already-
+;; deployed chains and storage contract need zero changes for this to exist.
+
+(def default-max-cas-retries
+  "How many times `commit-serialized!` retries after losing a `cas!` race
+  before giving up and throwing -- a defensive cap (persistent, unbounded
+  write contention on one head-key is a caller/deployment problem, not
+  something to retry forever for), not a tuned constant."
+  10)
+
+(defn commit-serialized!
+  "Like `commit!`, but coordinates through a caller-provided `cas!` --
+   `(cas! head-key expected-chain-cid new-chain-cid) -> actual-chain-cid`,
+   an ATOMIC compare-and-swap on `head-key` (a caller-chosen MUTABLE
+   pointer, e.g. a D1/DynamoDB row keyed by actor id -- NOT a chain-cid;
+   chain-cids are content-addressed and never change meaning). Contract:
+   if `head-key`'s CURRENT value equals `expected-chain-cid`, atomically
+   swap it to `new-chain-cid` and return `new-chain-cid`; otherwise leave
+   it untouched and return whatever its ACTUAL current value is (a
+   standard compare-and-exchange shape -- the caller can always tell
+   success from failure by comparing the return value to `new-chain-cid`,
+   and a failure directly hands back what to retry against, no separate
+   re-read needed) -- instead of blindly trusting a caller-passed
+   `prev-chain-cid`.
+
+   Re-derives `tx-data`'s tx-block against whatever the ACTUAL current
+   head turns out to be on every attempt, retrying (up to `max-retries`)
+   on a lost race, throwing if it never wins. True single-writer-per-
+   `head-key` serialization -- the ACID guarantee `commit!` alone cannot
+   make.
+
+   `head-key` identifies the mutable pointer. `expected-chain-cid` is the
+   chain-cid the CALLER currently believes is the head (`nil` means \"I
+   believe this chain doesn't exist yet\"). `cas!` is assumed synchronous
+   on BOTH platforms (matching `put!`/`get-fn`'s own existing convention
+   in this file -- only the crypto step is ever async here); only
+   `commit!`'s own crypto step needs promise-chaining on cljs."
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn]
+   (commit-serialized! put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn default-max-cas-retries))
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn max-retries]
+   #?(:clj
+      (loop [current-cid expected-chain-cid, attempts 0]
+        (when (> attempts max-retries)
+          (throw (ex-info "kotobase-peer: commit-serialized! exceeded max-cas-retries -- persistent write contention on head-key"
+                          {:head-key head-key :attempts attempts})))
+        (let [new-cid (commit! put! get-fn tx-data current-cid encrypt-fn)
+              actual (cas! head-key current-cid new-cid)]
+          (if (= actual new-cid)
+            new-cid
+            (recur actual (inc attempts)))))
+      :cljs
+      (letfn [(attempt [current-cid attempts]
+                (if (> attempts max-retries)
+                  (js/Promise.reject (ex-info "kotobase-peer: commit-serialized! exceeded max-cas-retries -- persistent write contention on head-key"
+                                              {:head-key head-key :attempts attempts}))
+                  (-> (commit! put! get-fn tx-data current-cid encrypt-fn)
+                      (.then (fn [new-cid]
+                               (let [actual (cas! head-key current-cid new-cid)]
+                                 (if (= actual new-cid)
+                                   new-cid
+                                   (attempt actual (inc attempts)))))))))]
+        (attempt expected-chain-cid 0)))))
+
+(defn commit-serialized-with-report!
+  "Like `commit-serialized!`, but returns a Datomic-shaped tx-report (see
+   `commit-with-report!`) -- `{:chain-cid-before :chain-cid-after
+   :tx-data}`, where `:chain-cid-before` is whichever chain-cid actually
+   won the CAS race and got committed against (NOT necessarily the
+   caller's original `expected-chain-cid`, if a retry happened)."
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn]
+   (commit-serialized-with-report! put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn default-max-cas-retries))
+  ([put! get-fn cas! head-key expected-chain-cid tx-data encrypt-fn max-retries]
+   (let [quads (mapv ->quad tx-data)]
+     #?(:clj
+        (loop [current-cid expected-chain-cid, attempts 0]
+          (when (> attempts max-retries)
+            (throw (ex-info "kotobase-peer: commit-serialized-with-report! exceeded max-cas-retries -- persistent write contention on head-key"
+                            {:head-key head-key :attempts attempts})))
+          (let [new-cid (commit! put! get-fn tx-data current-cid encrypt-fn)
+                actual (cas! head-key current-cid new-cid)]
+            (if (= actual new-cid)
+              {:chain-cid-before current-cid :chain-cid-after new-cid :tx-data quads}
+              (recur actual (inc attempts)))))
+        :cljs
+        (letfn [(attempt [current-cid attempts]
+                  (if (> attempts max-retries)
+                    (js/Promise.reject (ex-info "kotobase-peer: commit-serialized-with-report! exceeded max-cas-retries -- persistent write contention on head-key"
+                                                {:head-key head-key :attempts attempts}))
+                    (-> (commit! put! get-fn tx-data current-cid encrypt-fn)
+                        (.then (fn [new-cid]
+                                 (let [actual (cas! head-key current-cid new-cid)]
+                                   (if (= actual new-cid)
+                                     {:chain-cid-before current-cid :chain-cid-after new-cid :tx-data quads}
+                                     (attempt actual (inc attempts)))))))))]
+          (attempt expected-chain-cid 0))))))
+
 (defn novelty-size
   "How many not-yet-folded tx blocks sit on `chain-cid`'s current state —
    the `fold!` trigger signal."
@@ -408,6 +769,35 @@
    is empty)."
   [get-fn chain-cid]
   (when chain-cid (indexed-cid (state-at get-fn chain-cid))))
+
+;; ── time-travel: as-of / hydrate-chain ──────────────────────────────────────
+;; (one of the "3 pillars" this landing adds.) Keyed by commit `:seq`, NOT
+;; wall-clock time (design decision: `chain.core`'s commit envelope has no
+;; timestamp field, and adding one would change the CID of every future
+;; commit for chains ALREADY deployed live -- pds.aozora.app actors keep
+;; reading/writing with zero migration step, exactly as `normalize-state`'s
+;; own comment already promises elsewhere in this file). The raw capability
+;; already existed (`chain` walks the full history, `:state` included, for
+;; ANY commit along the way) -- `as-of`/`hydrate-chain` just make it
+;; ergonomic, without requiring a caller to hand-roll the walk.
+
+(defn as-of
+  "The chain-cid at-or-before `seq` (Datomic's `:as-of`, keyed by commit
+   :seq number here -- see ns section comment). Given `:seq`'s gaplessness
+   from 0 (`verify-chain`), this finds an exact match unless `seq` is
+   beyond the chain's own tip, in which case it clamps to the tip
+   (Datomic's own \"as-of the future just means now\" behavior). `nil` if
+   `chain-cid` itself is `nil` (no prior commit at all yet).
+
+   The result composes directly with every existing chain-cid-accepting
+   fn -- `(hot-datoms get-fn (as-of get-fn chain-cid 5) ...)` reads
+   \"hot-datoms as of seq 5\", no separate as-of-flavored sibling of each
+   read fn needed."
+  [get-fn chain-cid seq]
+  (when chain-cid
+    (let [entries (chain get-fn chain-cid)]
+      (:cid (or (some #(when (= seq (:seq %)) %) entries)
+                (last entries))))))
 
 ;; ── cold read: filtered datoms straight from a persisted snapshot ───────────
 ;; Closes the "nothing rehydrates a db from a snapshot CID" gap for the ONE case
@@ -556,6 +946,120 @@
          (js/Promise.resolve (qs/empty-db))
          (-> (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)
              (.then build))))))
+
+(defn hydrate-chain
+  "Rebuild the full hot db AS OF `chain-cid` — the persisted `indexed`
+   snapshot PLUS any not-yet-folded `novelty` re-asserted on top, in append
+   order. Unlike `hydrate-db` (indexed snapshot only, `fold!`'s internal
+   building block), this matches exactly what `fold!` would commit if
+   called at this exact point: `(hydrate-chain get-fn (as-of get-fn
+   chain-cid seq) blind-fn decrypt-fn)` is a true database VALUE as of
+   that point in history, safe to `q`/`query`/`pull` against like any
+   other hot db.
+
+   `blind-fn`/`decrypt-fn` (ADR-2607051000) REQUIRED, same contract as
+   `hydrate-db`/`hot-datoms`. Synchronous on JVM; a `js/Promise` of the db
+   on cljs."
+  [get-fn chain-cid blind-fn decrypt-fn]
+  (let [state (state-at get-fn chain-cid)]
+    #?(:clj
+       (let [base (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
+             novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))]
+         (reduce qs/assert-quad base novelty-quads))
+       :cljs
+       (-> (js/Promise.all
+            #js [(hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
+                 (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))])
+           (.then (fn [results]
+                    (let [[base novelty-quads-per-cid] (vec results)
+                          novelty-quads (apply concat novelty-quads-per-cid)]
+                      (reduce qs/assert-quad base novelty-quads))))))))
+
+(defn- newly-added-tx-cids
+  "Walk `chain-cid`'s full history: for each commit whose OWN novelty list
+   grew by exactly one entry relative to the PREVIOUS commit (a plain
+   `commit!` append, not a `fold!` compaction/reset) AND whose `:seq` is
+   greater than `after-seq`, collect that commit's newest novelty tx-cid.
+   A `fold!` commit itself contributes nothing (folding restructures
+   already-seen data into an indexed snapshot, it doesn't add new user
+   data) -- but any ORIGINAL `commit!` this walk already passed still
+   counts regardless of a LATER fold, since this reads each commit's
+   HISTORICAL state as it was at that point in the chain, not just the
+   tip's current shape. Shared walk `since`/`history` both build on."
+  [get-fn chain-cid after-seq]
+  (loop [prev-count 0, remaining (chain get-fn chain-cid), acc []]
+    (if (empty? remaining)
+      acc
+      (let [{:keys [seq state]} (first remaining)
+            novelty (get (normalize-state state) "novelty" [])
+            cur-count (count novelty)]
+        (recur cur-count
+               (rest remaining)
+               (if (and (> seq after-seq) (= cur-count (inc prev-count)))
+                 (conj acc (ipld/link-cid (last novelty)))
+                 acc))))))
+
+(defn since
+  "A hot db containing ONLY the quads from commits with `:seq` greater
+   than `since-seq` -- Datomic's `since`, a view of what changed AFTER a
+   point (NOT merged with state as-of that point; for the merged
+   \"everything up to and including now\" view, use `hydrate-chain` on
+   the chain-cid itself). See `newly-added-tx-cids` for exactly which
+   commits this includes. `decrypt-fn` (ADR-2607051000) REQUIRED.
+   Synchronous on JVM; a `js/Promise` of the db on cljs."
+  [get-fn chain-cid since-seq decrypt-fn]
+  (let [tx-cids (newly-added-tx-cids get-fn chain-cid since-seq)]
+    #?(:clj
+       (reduce qs/assert-quad (qs/empty-db) (mapcat #(read-tx-block get-fn % decrypt-fn) tx-cids))
+       :cljs
+       (-> (pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) tx-cids)
+           (.then (fn [quads-per-cid] (reduce qs/assert-quad (qs/empty-db) (apply concat quads-per-cid))))))))
+
+(defn- spo->quads [db]
+  (for [[e attrs] (:spo db), [a vs] attrs, v vs] {:s e :p a :o v}))
+
+(defn history
+  "A hot db containing every quad EVER asserted via any commit rooted at
+   `chain-cid`, across its WHOLE history from genesis to tip -- Datomic's
+   `history`, scoped HONESTLY to what this substrate can actually track:
+   assertions only, no retraction visibility. `commit!`'s novelty tx-
+   block format has no add/retract flag at all -- two separate `commit!`
+   calls asserting different values for the same `(s, p)` pair BOTH
+   remain visible via `hot-datoms`/`as-of` too today (`arrangement.core`
+   has no cardinality tracking of its own, ADR-2607061200 pillar note),
+   so `history` does NOT yet distinguish itself from the current view by
+   \"catching\" a retraction the current view has lost -- that would
+   require a schema-aware, retraction-EMITTING variant of `commit!`
+   itself (`transact-with-schema`'s cardinality `:one` retraction only
+   ever happens in-memory, on a hot db value that's never persisted
+   through `commit!`'s tx-block format), which is a natural follow-up,
+   not yet built. What `history` DOES give today: a complete, literal
+   audit trail across `fold!` compactions -- data folded away from
+   `hot-datoms`' novelty view remains fully reconstructable here.
+
+   Built from `(since get-fn chain-cid -1 decrypt-fn)` (every novelty
+   tx-block ever appended, across the whole chain -- `-1` because every
+   real commit's `:seq` is >= 0) UNION the tip's `indexed` snapshot
+   (`hydrate-db`, which already subsumes everything folded before it).
+   Overlap between the two (a commit whose novelty was later folded
+   appears in both) is harmless: `arrangement.core`'s indices are sets,
+   re-asserting an identical fact is a no-op.
+
+   `blind-fn`/`decrypt-fn` (ADR-2607051000) REQUIRED, same contract as
+   `hydrate-db`/`since`. Synchronous on JVM; a `js/Promise` of the db on
+   cljs."
+  [get-fn chain-cid blind-fn decrypt-fn]
+  #?(:clj
+     (let [novelty-db (since get-fn chain-cid -1 decrypt-fn)
+           snap-db (hydrate-db get-fn (latest-snapshot-cid get-fn chain-cid) blind-fn decrypt-fn)]
+       (reduce qs/assert-quad snap-db (spo->quads novelty-db)))
+     :cljs
+     (-> (js/Promise.all
+          #js [(since get-fn chain-cid -1 decrypt-fn)
+               (hydrate-db get-fn (latest-snapshot-cid get-fn chain-cid) blind-fn decrypt-fn)])
+         (.then (fn [results]
+                  (let [[novelty-db snap-db] (vec results)]
+                    (reduce qs/assert-quad snap-db (spo->quads novelty-db))))))))
 
 (defn hot-datoms
   "THE scale-safe read path (ADR-2607032430 D1): `datoms`-shaped rows as of
