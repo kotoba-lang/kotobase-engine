@@ -1533,24 +1533,57 @@
   "Compact `chain-cid`'s novelty into a fresh indexed snapshot: hydrate the
   current `indexed` snapshot, re-assert every novelty quad on top (append
   order), `qs/commit!` that as the new `indexed`, and append ONE new
-  chain entry with an empty `novelty`. Cost: O(graph_shard) — the same
-  full rebuild `snapshot!`/the pre-D1 `commit!` always paid, now amortized
-  over however many `commit!` writes accumulated the folded novelty instead
-  of being paid on every single one (`should-fold?`/`novelty-size` decide
-  when to call this; correctness never depends on it running promptly).
+  chain entry. Cost: O(graph_shard) — the same full rebuild `snapshot!`/the
+  pre-D1 `commit!` always paid, now amortized over however many `commit!`
+  writes accumulated the folded novelty instead of being paid on every
+  single one (`should-fold?`/`novelty-size` decide when to call this;
+  correctness never depends on it running promptly).
 
-  Deterministic: prolly-tree/arrangement are content-addressed, so folding
-  the identical (indexed, novelty) pair — from ANY writer, a server cron or
-  a browser at idle — always produces the same snapshot CID. Concurrent
-  folds of the same state are safe, redundant, and cheap (re-`put!`ing
-  already-stored bytes is a no-op at the block-store layer). NOTE
-  (ADR-2607051000, accepted 2026-07-06): this determinism now additionally
-  depends on `encrypt-fn` deriving its nonce deterministically from the
-  plaintext rather than randomly -- a random-nonce `encrypt-fn` would make
-  even identical (indexed, novelty) pairs fold to DIFFERENT snapshot CIDs,
-  silently losing the \"cheap redundant fold\" property this paragraph
-  otherwise promises. Callers should supply a deterministic `encrypt-fn`
-  (e.g. nonce = HMAC(nonce-key, plaintext)) if this property matters to them.
+  `max-novelty` (optional, default nil = unbounded/full fold, exactly
+  today's behavior): caps how many of the OLDEST not-yet-folded tx blocks
+  this call folds, leaving the rest as the new state's `novelty` tail
+  instead of always emptying it. Novelty is stored oldest-first (`commit!`
+  `conj`s each new tx-block link onto the END), so `take max-novelty`/
+  `drop max-novelty` folds strictly in chronological (append) order and the
+  remaining tail is exactly what a later `fold!` call would still need to
+  process — correctness (retraction-vs-earlier-assertion resolution, which
+  `apply-quad`'s reduce already handles by walking `indexed` then novelty
+  in order) is identical whether one call folds everything or N calls each
+  fold a bounded slice, since each call's own `hydrate-db` picks up
+  whatever the PREVIOUS call already committed to `indexed`.
+
+  Motivation (found live, gftdcojp/app-aozora#78): bounding `pmap-async`'s
+  in-flight fetch count (see that fn's docstring) fixes the Workers
+  subrequest-concurrency collapse for a MODERATE novelty backlog, but a
+  backlog large enough that even batched-but-still-sequential processing
+  of the WHOLE thing exceeds one Worker invocation's CPU/wall-time budget
+  can leave `fold!` itself unable to ever complete — a runaway: novelty
+  can only shrink via a successful fold, but the fold needed to shrink it
+  never finishes. `max-novelty` breaks that: a fold cron can call `fold!`
+  with a small bounded budget every cycle and make guaranteed forward
+  progress (novelty strictly shrinks by up to `max-novelty` per successful
+  call) even against a backlog too large to clear in one invocation,
+  instead of repeatedly attempting (and losing all the work of) one
+  all-or-nothing fold that never finishes.
+
+  Deterministic FOR A GIVEN novelty-cids ordering and a given `max-novelty`
+  choice: prolly-tree/arrangement are content-addressed, so folding the
+  identical (indexed, to-fold-slice) pair — from ANY writer, a server cron
+  or a browser at idle — always produces the same snapshot CID. Concurrent
+  folds of the same state with the same `max-novelty` are safe, redundant,
+  and cheap (re-`put!`ing already-stored bytes is a no-op at the
+  block-store layer); this property does NOT require every caller to agree
+  on `max-novelty` for overall correctness (only for the 'redundant folds
+  converge to the identical intermediate CID' optimization — the sequence
+  of indexed snapshots still monotonically absorbs novelty in order either
+  way). NOTE (ADR-2607051000, accepted 2026-07-06): this determinism now
+  additionally depends on `encrypt-fn` deriving its nonce deterministically
+  from the plaintext rather than randomly -- a random-nonce `encrypt-fn`
+  would make even identical (indexed, novelty) pairs fold to DIFFERENT
+  snapshot CIDs, silently losing the \"cheap redundant fold\" property this
+  paragraph otherwise promises. Callers should supply a deterministic
+  `encrypt-fn` (e.g. nonce = HMAC(nonce-key, plaintext)) if this property
+  matters to them.
 
   `blind-fn`/`encrypt-fn`/`decrypt-fn` are REQUIRED and threaded to
   `hydrate-db` (blind-fn, decrypt-fn), `read-tx-block` (decrypt-fn), and
@@ -1559,20 +1592,27 @@
   snapshot hydrate resolve concurrently there, via `js/Promise.all`, since
   they're independent)."
   ([put! get-fn chain-cid blind-fn encrypt-fn decrypt-fn]
-   (fold! put! get-fn chain-cid ipld/link? blind-fn encrypt-fn decrypt-fn))
+   (fold! put! get-fn chain-cid ipld/link? nil blind-fn encrypt-fn decrypt-fn))
   ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
-   (let [state (state-at get-fn chain-cid)]
+   (fold! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
+   (let [state (state-at get-fn chain-cid)
+         novelty (get state "novelty" [])
+         bounded? (and max-novelty (< max-novelty (count novelty)))
+         to-fold (if bounded? (subvec (vec novelty) 0 max-novelty) novelty)
+         remaining (if bounded? (subvec (vec novelty) max-novelty) [])
+         to-fold-cids (mapv ipld/link-cid to-fold)]
      #?(:clj
-        (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) (novelty-cids state))
+        (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) to-fold-cids)
               db (reduce (fn [db q] (apply-quad db q ref?))
                          (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
                          novelty-quads)
               new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
-              new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
+              new-state {"indexed" (ipld/link new-snap-cid) "novelty" (vec remaining)}]
           (cd/commit! put! get-fn new-state chain-cid))
         :cljs
         (-> (js/Promise.all
-             #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) (novelty-cids state))
+             #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) to-fold-cids)
                   (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)])
             (.then (fn [results]
                      (let [[novelty-quads-per-cid hydrated-db] (vec results)
@@ -1580,7 +1620,7 @@
                            db (reduce (fn [db q] (apply-quad db q ref?)) hydrated-db novelty-quads)]
                        (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn))))
             (.then (fn [new-snap-cid]
-                     (let [new-state {"indexed" (ipld/link new-snap-cid) "novelty" []}]
+                     (let [new-state {"indexed" (ipld/link new-snap-cid) "novelty" (vec remaining)}]
                        (cd/commit! put! get-fn new-state chain-cid)))))))))
 
 (defn verify-chain

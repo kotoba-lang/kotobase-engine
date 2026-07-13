@@ -913,6 +913,47 @@
            "the fold really did index the data -- a cold-only read (no novelty) sees it"))))
 
 #?(:clj
+   (deftest fold-bang-max-novelty-folds-a-bounded-prefix-and-leaves-the-rest
+     (let [{:keys [put! get-fn]} (mem-store)
+           everything (constantly true)
+           c0 (eng/commit! put! get-fn [{:s "actor-0" :p "role" :o "member"}] nil test-encrypt-fn)
+           c1 (eng/commit! put! get-fn [{:s "actor-1" :p "role" :o "member"}] c0 test-encrypt-fn)
+           c2 (eng/commit! put! get-fn [{:s "actor-2" :p "role" :o "member"}] c1 test-encrypt-fn)
+           c3 (eng/commit! put! get-fn [{:s "actor-3" :p "role" :o "member"}] c2 test-encrypt-fn)
+           before (set (eng/hot-datoms get-fn c3 everything test-blind-fn test-decrypt-fn))
+           folded (eng/fold! put! get-fn c3 ipld/link? 2 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+       (is (= 2 (eng/novelty-size get-fn folded))
+           "max-novelty=2 against 4 novelty entries folds only the oldest 2, leaves 2")
+       (is (some? (eng/latest-snapshot-cid get-fn folded)))
+       (is (= before (set (eng/hot-datoms get-fn folded everything test-blind-fn test-decrypt-fn)))
+           "hot-datoms still sees everything -- the 2 unfolded entries are still novelty, still merged in")
+       (is (= #{{:e "actor-0" :a "role" :v_edn "\"member\"" :added true}
+                {:e "actor-1" :a "role" :v_edn "\"member\"" :added true}}
+              (set (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded) nil everything
+                                    test-blind-fn test-decrypt-fn)))
+           "only the 2 oldest (actor-0, actor-1) actually got indexed into the new snapshot; actor-2/actor-3 are still in novelty, not yet cold")
+       (let [folded-again (eng/fold! put! get-fn folded ipld/link? 2 test-blind-fn test-encrypt-fn test-decrypt-fn)]
+         (is (= 0 (eng/novelty-size get-fn folded-again))
+             "a second bounded fold with the same budget clears the remaining tail")
+         (is (= before (set (eng/hot-datoms get-fn folded-again everything test-blind-fn test-decrypt-fn)))
+             "two bounded folds together lose/duplicate nothing vs. one unbounded fold")
+         (is (= before (set (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded-again) nil everything
+                                             test-blind-fn test-decrypt-fn)))
+             "after both bounded folds, everything is indexed -- same end state an unbounded fold would reach")))))
+
+#?(:clj
+   (deftest fold-bang-max-novelty-nil-is-unbounded-exactly-like-the-default-arity
+     ;; regression: explicit nil max-novelty (the 8-arity form) must behave
+     ;; identically to the pre-existing 6-/7-arity unbounded calls -- this is
+     ;; the "default nil = unbounded, zero behavior change for every existing
+     ;; caller" contract the fold! docstring promises.
+     (let [{:keys [put! get-fn]} (mem-store)
+           c0 (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+           c1 (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)
+           folded (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn test-decrypt-fn)]
+       (is (= 0 (eng/novelty-size get-fn folded)) "nil max-novelty still fully compacts"))))
+
+#?(:clj
    (deftest fold-bang-is-deterministic-across-independent-stores
      (testing "folding the identical (indexed, novelty) history from two independent
                stores yields the same snapshot CID -- content-addressing holds
@@ -1586,6 +1627,65 @@
                                                              (is (= (set before-rows) (set after-rows))
                                                                  "folding a >1-batch novelty tail loses/duplicates nothing")
                                                              (done)))))))))))))))))
+
+#?(:cljs
+   (deftest fold-bang-max-novelty-folds-a-bounded-prefix-and-leaves-the-rest
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             everything (constantly true)]
+         (-> (eng/commit! put! get-fn [{:s "actor-0" :p "role" :o "member"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "actor-1" :p "role" :o "member"}] c0 test-encrypt-fn)))
+             (.then (fn [c1] (eng/commit! put! get-fn [{:s "actor-2" :p "role" :o "member"}] c1 test-encrypt-fn)))
+             (.then (fn [c2] (eng/commit! put! get-fn [{:s "actor-3" :p "role" :o "member"}] c2 test-encrypt-fn)))
+             (.then (fn [c3]
+                      (-> (eng/hot-datoms get-fn c3 everything test-blind-fn test-decrypt-fn)
+                          (.then (fn [before-rows]
+                                   (let [before (set before-rows)]
+                                     (-> (eng/fold! put! get-fn c3 ipld/link? 2 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                         (.then (fn [folded]
+                                                  (is (= 2 (eng/novelty-size get-fn folded))
+                                                      "max-novelty=2 against 4 novelty entries folds only the oldest 2, leaves 2")
+                                                  (is (some? (eng/latest-snapshot-cid get-fn folded)))
+                                                  (-> (js/Promise.all
+                                                       #js [(eng/hot-datoms get-fn folded everything test-blind-fn test-decrypt-fn)
+                                                            (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded) nil everything
+                                                                             test-blind-fn test-decrypt-fn)])
+                                                      (.then (fn [results]
+                                                               (let [[after-rows cold-rows] (vec results)]
+                                                                 (is (= before (set after-rows))
+                                                                     "hot-datoms still sees everything -- unfolded entries still merged in")
+                                                                 (is (= #{{:e "actor-0" :a "role" :v_edn "\"member\"" :added true}
+                                                                          {:e "actor-1" :a "role" :v_edn "\"member\"" :added true}}
+                                                                        (set cold-rows))
+                                                                     "only the 2 oldest actually got indexed; actor-2/actor-3 aren't cold yet")
+                                                                 (-> (eng/fold! put! get-fn folded ipld/link? 2 test-blind-fn test-encrypt-fn test-decrypt-fn)
+                                                                     (.then (fn [folded-again]
+                                                                              (is (= 0 (eng/novelty-size get-fn folded-again))
+                                                                                  "a second bounded fold with the same budget clears the remaining tail")
+                                                                              (-> (js/Promise.all
+                                                                                   #js [(eng/hot-datoms get-fn folded-again everything test-blind-fn test-decrypt-fn)
+                                                                                        (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded-again) nil everything
+                                                                                                         test-blind-fn test-decrypt-fn)])
+                                                                                  (.then (fn [results2]
+                                                                                           (let [[after-rows2 cold-rows2] (vec results2)]
+                                                                                             (is (= before (set after-rows2))
+                                                                                                 "two bounded folds together lose/duplicate nothing vs. one unbounded fold")
+                                                                                             (is (= before (set cold-rows2))
+                                                                                                 "after both bounded folds, everything is indexed")
+                                                                                             (done))))))))))))))))))))))))))
+
+#?(:cljs
+   (deftest fold-bang-max-novelty-nil-is-unbounded-exactly-like-the-default-arity
+     ;; regression: explicit nil max-novelty (the 8-arity form) must behave
+     ;; identically to the pre-existing 6-/7-arity unbounded calls.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "bob" :p "role" :o "user"}] c0 test-encrypt-fn)))
+             (.then (fn [c1] (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn test-decrypt-fn)))
+             (.then (fn [folded]
+                      (is (= 0 (eng/novelty-size get-fn folded)) "nil max-novelty still fully compacts")
+                      (done))))))))
 
 #?(:cljs
    (deftest fold-bang-is-deterministic-across-independent-stores
