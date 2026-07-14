@@ -1805,6 +1805,91 @@
                       (is (= 0 (eng/novelty-size get-fn folded)) "nil max-novelty still fully compacts")
                       (done))))))))
 
+;; ── ADR-2607120730 Part 1: memoized hydration (fold!'s cache-get/cache-put!) ──
+
+#?(:cljs
+   (deftest fold-bang-cache-get-cache-put-avoids-rehydrating-on-a-retry-against-the-same-snapshot
+     ;; ADR-2607120730 Part 1 (memoized hydration): a fold attempt that
+     ;; hydrates the same still-current indexed snapshot twice (e.g. two cron
+     ;; retries against a chain nothing new has folded into since) should pay
+     ;; the cold-datoms decrypt-and-scan cost only ONCE -- the second attempt
+     ;; hits the cache instead of re-decrypting every cold entry.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             decrypt-calls (atom 0)
+             counting-decrypt-fn (fn [blob] (swap! decrypt-calls inc) (test-decrypt-fn blob))
+             cache (atom {})
+             cache-get (fn [k] (js/Promise.resolve (get @cache k)))
+             cache-put! (fn [k v] (js/Promise.resolve (swap! cache assoc k v)))]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/fold! put! get-fn c0 test-blind-fn test-encrypt-fn counting-decrypt-fn)))
+             (.then (fn [c1]
+                      (is (= 0 (eng/novelty-size get-fn c1)) "nothing pending after the warm-up fold")
+                      (reset! decrypt-calls 0)
+                      (-> (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn counting-decrypt-fn
+                                     cache-get cache-put!)
+                          (.then (fn [attempt1]
+                                   (let [attempt1-calls @decrypt-calls]
+                                     (is (pos? attempt1-calls) "attempt 1 (cache empty) actually decrypts the cold entry")
+                                     (is (contains? @cache (eng/hydrate-cache-key (eng/latest-snapshot-cid get-fn c1)))
+                                         "cache-put! populated the cache under the expected key")
+                                     (reset! decrypt-calls 0)
+                                     (-> (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn counting-decrypt-fn
+                                                    cache-get cache-put!)
+                                         (.then (fn [attempt2]
+                                                  (is (zero? @decrypt-calls)
+                                                      "attempt 2 (cache hit) decrypts nothing -- the cold scan was skipped entirely")
+                                                  (is (= (eng/latest-snapshot-cid get-fn attempt1)
+                                                         (eng/latest-snapshot-cid get-fn attempt2))
+                                                      "cached and uncached hydration fold to the identical (content-addressed) snapshot CID")
+                                                  (done)))))))))))))))
+
+#?(:cljs
+   (deftest fold-bang-no-cache-args-behaves-exactly-like-before
+     ;; backward compat: the pre-existing 8-arity call (no cache-get/cache-put!)
+     ;; must still work identically -- fold! delegates it to the new 10-arity
+     ;; impl with cache-get=nil cache-put!=nil, which hydrate-db-cached treats
+     ;; as "caching disabled", the same as calling plain hydrate-db.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/fold! put! get-fn c0 ipld/link? nil test-blind-fn test-encrypt-fn test-decrypt-fn)))
+             (.then (fn [folded]
+                      (is (= 0 (eng/novelty-size get-fn folded)))
+                      (is (some? (eng/latest-snapshot-cid get-fn folded)))
+                      (done))))))))
+
+#?(:cljs
+   (deftest fold-bang-cache-hit-preserves-link-values-not-just-plain-scalars
+     ;; the cache serializes rows through the SAME v->edn/edn->link round trip
+     ;; :v_edn already uses (not a raw pr-str of the whole row, which would
+     ;; shred a Link the way v->edn's own docstring / ADR-2607051000's
+     ;; follow-up already document for :v elsewhere in this codebase) --
+     ;; specifically exercises a CACHE-HIT hydrate (not just a fresh one) to
+     ;; prove that round trip is correct on the read-back path too.
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             cache (atom {})
+             cache-get (fn [k] (js/Promise.resolve (get @cache k)))
+             cache-put! (fn [k v] (js/Promise.resolve (swap! cache assoc k v)))]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "knows" :o bob-link}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/fold! put! get-fn c0 test-blind-fn test-encrypt-fn test-decrypt-fn)))
+             (.then (fn [c1]
+                      ;; attempt 1: cache miss, populates the cache
+                      (-> (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn test-decrypt-fn
+                                     cache-get cache-put!)
+                          (.then (fn [_attempt1]
+                                   ;; attempt 2: cache HIT -- this is the path under test
+                                   (-> (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn test-decrypt-fn
+                                                  cache-get cache-put!)
+                                       (.then (fn [attempt2]
+                                                (-> (eng/hydrate-db get-fn (eng/latest-snapshot-cid get-fn attempt2)
+                                                                    test-blind-fn test-decrypt-fn)
+                                                    (.then (fn [db]
+                                                             (is (= {"knows" #{"alice"}} (qs/refs-to db bob-link))
+                                                                 "a cache-hit hydration still reconstructs a real Link, not a shredded seq")
+                                                             (done)))))))))))))))))
+
 ;; ── kotoba-lang/kotobase-peer#16: front/back persistent-queue novelty ──────
 
 #?(:cljs

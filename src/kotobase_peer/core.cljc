@@ -1415,6 +1415,93 @@
          (-> (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)
              (.then build))))))
 
+(defn hydrate-cache-key
+  "The cache key `hydrate-db-cached` stores/looks up its memoized rows under
+   for a given `snapshot-cid`. Exposed so callers constructing a storage-
+   backed cache-get/cache-put! (e.g. an R2 adapter keyed by string) can share
+   the exact same derivation without duplicating the \"hydrate-cache/v1/\"
+   namespace prefix."
+  [snapshot-cid]
+  (str "hydrate-cache/v1/" snapshot-cid))
+
+(defn hydrate-db-cached
+  "Like `hydrate-db`, but memoizes the expensive `cold-datoms` decrypt-and-
+   scan result via `cache-get`/`cache-put!` (both optional; nil for either
+   disables caching, falling back to identical behavior to `hydrate-db`),
+   keyed by `snapshot-cid` (`hydrate-cache-key`) -- so a fold retried against
+   the SAME still-unfolded snapshot (the common case while a backlog is too
+   large to clear in one attempt: `snapshot-cid` doesn't change between
+   retries since no fold has succeeded yet) skips straight to a cache hit
+   instead of re-paying the O(graph_shard) decrypt-and-scan on every single
+   retry (ADR-2607120730 Part 1, \"memoized hydration\").
+
+   `cache-put!` is invoked as soon as the rows are computed -- BEFORE the
+   caller applies novelty/re-commits -- specifically so a fold attempt that
+   hydrates successfully but then exceeds its CPU budget LATER (applying
+   novelty, or `qs/commit!`'s tree rebuild) still leaves the cache populated
+   for the next attempt. This is why `cache-put!` must be a storage write
+   that lands immediately, NOT one threaded through a buffered end-of-request
+   flush (e.g. `kotobase-cljc-worker`'s `run-write-attempt` buffers `put!`
+   and only flushes to R2 after the whole call returns a response) -- a
+   cache write buffered that way would be lost on exactly the failure this
+   fn exists to survive.
+
+   `cache-get`/`cache-put!` are `(fn [key]) -> bytes|nil` / `(fn [key bytes])`
+   on JVM (synchronous, matching `get-fn`/`put!`'s own JVM contract); on cljs
+   they are Promise-returning (`(fn [key]) -> js/Promise<bytes|nil>` /
+   `(fn [key bytes]) -> js/Promise<_>`) since a real cache-put! is a direct
+   (unbuffered) R2 write, unlike the synchronous `get-fn`/`put!` block-store
+   trampoline.
+
+   Serialization deliberately does NOT `pr-str` a `cold-datoms` row
+   (`{:e :a :v_edn :added}`) as-is: `:v_edn` is already a safely-encoded EDN
+   string (`v->edn`'s `qs/link->edn` form, readable with no custom reader),
+   but `:e`/`:a` are raw decoded values that -- exactly like `:v` before
+   `v->edn` -- may themselves be `ipld.core` Links, which plain `pr-str`
+   shreds into a bare, untyped seq on read-back (the same regression
+   `v->edn`'s docstring/ADR-2607051000 follow-up already document for `:v`).
+   Each row is therefore re-encoded through the SAME `v->edn`/`qs/edn->link`
+   round-trip for `:e` and `:a` too before caching."
+  [get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put!]
+  (letfn [(build [rows]
+            (reduce (fn [db {:keys [e a v_edn]}]
+                      (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
+                    (qs/empty-db)
+                    rows))
+          (encode-rows [rows]
+            (pr-str (mapv (fn [{:keys [e a v_edn added]}]
+                            [(v->edn e) (v->edn a) v_edn added])
+                          rows)))
+          (decode-rows [s]
+            (mapv (fn [[e_edn a_edn v_edn added]]
+                    {:e (qs/edn->link (edn/read-string e_edn))
+                     :a (qs/edn->link (edn/read-string a_edn))
+                     :v_edn v_edn
+                     :added added})
+                  (edn/read-string s)))]
+    #?(:clj
+       (if (nil? snapshot-cid)
+         (qs/empty-db)
+         (let [cached (when cache-get (cache-get (hydrate-cache-key snapshot-cid)))]
+           (if cached
+             (build (decode-rows cached))
+             (let [rows (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)]
+               (when cache-put! (cache-put! (hydrate-cache-key snapshot-cid) (encode-rows rows)))
+               (build rows)))))
+       :cljs
+       (if (nil? snapshot-cid)
+         (js/Promise.resolve (qs/empty-db))
+         (-> (if cache-get (cache-get (hydrate-cache-key snapshot-cid)) (js/Promise.resolve nil))
+             (.then (fn [cached]
+                      (if cached
+                        (build (decode-rows cached))
+                        (-> (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)
+                            (.then (fn [rows]
+                                     (-> (if cache-put!
+                                           (cache-put! (hydrate-cache-key snapshot-cid) (encode-rows rows))
+                                           (js/Promise.resolve nil))
+                                         (.then (fn [_] (build rows)))))))))))))))
+
 (defn hydrate-chain
   "Rebuild the full hot db AS OF `chain-cid` — the persisted `indexed`
    snapshot PLUS any not-yet-folded `novelty` re-asserted on top, in append
@@ -1795,6 +1882,8 @@
   ([put! get-fn chain-cid ref? blind-fn encrypt-fn decrypt-fn]
    (fold! put! get-fn chain-cid ref? nil blind-fn encrypt-fn decrypt-fn))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn nil nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put!]
    (let [state (state-at get-fn chain-cid)
          bounded? (some? max-novelty)
          take-result (when bounded? (take-oldest-novelty put! get-fn state max-novelty))
@@ -1805,7 +1894,7 @@
      #?(:clj
         (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) to-fold-cids)
               db (reduce (fn [db q] (apply-quad db q ref?))
-                         (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)
+                         (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)
                          novelty-quads)
               new-snap-cid (qs/commit! put! db nil qs/current-schema-version blind-fn encrypt-fn)
               new-state (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)]
@@ -1813,7 +1902,7 @@
         :cljs
         (-> (js/Promise.all
              #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) to-fold-cids)
-                  (hydrate-db get-fn (indexed-cid state) blind-fn decrypt-fn)])
+                  (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)])
             (.then (fn [results]
                      (let [[novelty-quads-per-cid hydrated-db] (vec results)
                            novelty-quads (apply concat novelty-quads-per-cid)
