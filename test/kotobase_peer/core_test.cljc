@@ -1890,6 +1890,46 @@
                                                                  "a cache-hit hydration still reconstructs a real Link, not a shredded seq")
                                                              (done)))))))))))))))))
 
+#?(:cljs
+   (deftest fold-bang-async-get-fn-produces-identical-results-to-the-sync-path
+     ;; ADR-2607120730 follow-up: fold!'s optional async-get-fn (routed to
+     ;; cold-datoms-async/scan-prefix-async instead of cold-datoms/scan-prefix)
+     ;; is a pure performance path -- confirmed live against the real stuck
+     ;; yoro-social-v2 backlog (5130 leaf entries: 806ms via scan-prefix-async
+     ;; vs. a 300s CPU budget exceeded via the sync with-blocks-trampolined
+     ;; path). This proves it produces the IDENTICAL folded result as the
+     ;; sync path, including a Link-valued datom (not just plain scalars).
+     (async done
+       (let [{:keys [put! get-fn]} (mem-store)
+             async-get-fn (fn [cid] (js/Promise.resolve (get-fn cid)))
+             everything (constantly true)]
+         (-> (eng/commit! put! get-fn [{:s "alice" :p "role" :o "admin"}] nil test-encrypt-fn)
+             (.then (fn [c0] (eng/commit! put! get-fn [{:s "alice" :p "knows" :o bob-link}] c0 test-encrypt-fn)))
+             (.then (fn [c1]
+                      (-> (eng/hot-datoms get-fn c1 everything test-blind-fn test-decrypt-fn)
+                          (.then (fn [before-rows]
+                                   (let [before (set before-rows)]
+                                     (-> (eng/fold! put! get-fn c1 ipld/link? nil test-blind-fn test-encrypt-fn test-decrypt-fn
+                                                    nil nil async-get-fn)
+                                         (.then (fn [folded]
+                                                  (is (= 0 (eng/novelty-size get-fn folded))
+                                                      "fold via async-get-fn still fully compacts")
+                                                  (-> (js/Promise.all
+                                                       #js [(eng/hot-datoms get-fn folded everything test-blind-fn test-decrypt-fn)
+                                                            (eng/cold-datoms get-fn (eng/latest-snapshot-cid get-fn folded) nil everything
+                                                                             test-blind-fn test-decrypt-fn)
+                                                            (eng/hydrate-db get-fn (eng/latest-snapshot-cid get-fn folded)
+                                                                            test-blind-fn test-decrypt-fn)])
+                                                      (.then (fn [results]
+                                                               (let [[after-rows cold-rows db] (vec results)]
+                                                                 (is (= before (set after-rows))
+                                                                     "folding via the async-get-fn path loses/duplicates nothing")
+                                                                 (is (= before (set cold-rows))
+                                                                     "the async cold scan really did index the data")
+                                                                 (is (= {"knows" #{"alice"}} (qs/refs-to db bob-link))
+                                                                     "Link values survive the async cold-scan path too")
+                                                                 (done)))))))))))))))))))
+
 ;; ── kotoba-lang/kotobase-peer#16: front/back persistent-queue novelty ──────
 
 #?(:cljs
