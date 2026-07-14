@@ -1377,6 +1377,56 @@
                             rows (cond->> rows limit (take limit))]
                         (vec rows)))))))))
 
+#?(:cljs
+   (defn cold-datoms-async
+     "Like `cold-datoms`, but for `async-get-fn`: a Promise-returning `(fn
+     [cid]) -> js/Promise<bytes>` that fetches DIRECTLY -- bypassing a
+     synchronous block-miss trampoline (e.g. `kotobase-cljc-worker`'s
+     `with-blocks`) entirely -- and uses `prolly-tree.core/scan-prefix-
+     async`'s batched-concurrent node discovery instead of `scan-prefix`'s
+     one-miss-discovered-per-retry-from-root pattern.
+
+     Motivation, confirmed live (gftdcojp/app-aozora#78, ADR-2607120730
+     follow-up): `scan-prefix` run over `with-blocks` re-walks AND
+     re-decodes every already-fetched node on every retry (only raw bytes
+     are cached, not decoded nodes), so a walk touching N distinct blocks
+     costs O(N^2) total node decodes -- for `yoro-social-v2`'s real stuck
+     snapshot (5130 leaf entries), a `diagHydrateCost` probe using
+     `scan-prefix-async` completed in 806ms; the equivalent `with-blocks`-
+     trampolined path was exceeding a 300-SECOND CPU budget. The graph was
+     never actually too large to hydrate in one Worker invocation -- the
+     block-discovery strategy was quadratic.
+
+     Same `{:index :components :limit}`/`visible?`/`blind-fn`/`decrypt-fn`
+     contract, same row shape, same decrypt batching (`pmap-async`) as
+     `cold-datoms`. `:cljs`-only (`async-get-fn`/`scan-prefix-async` have no
+     JVM analog -- JVM callers have no comparable network-latency-driven
+     retry-inflation problem to fix)."
+     [async-get-fn snapshot-cid {:keys [index components limit]} visible? blind-fn decrypt-fn]
+     (if (nil? snapshot-cid)
+       (js/Promise.resolve [])
+       (let [{:keys [root ->eav]} (index-spec (or index :eavt))]
+         (-> (async-get-fn snapshot-cid)
+             (.then ipld/decode)
+             (.then (fn [snap]
+                      (let [root-cid (some-> (get-in snap ["index-roots" root]) ipld/link-cid)]
+                        (-> (components-prefix components blind-fn)
+                            (.then (fn [prefix]
+                                     (if (nil? root-cid)
+                                       []
+                                       (pt/scan-prefix-async async-get-fn root-cid (or prefix "")))))))))
+             (.then (fn [entries]
+                      (pmap-async (fn [[_ ciphertext]]
+                                    (.then (decrypt-fn ciphertext) ipld/decode))
+                                  entries)))
+             (.then (fn [triples]
+                      (let [rows (for [[k1 k2 v3] triples
+                                       :let [[e a v] (->eav (mapv qs/edn->link [k1 k2 v3]))]]
+                                   {:e e :a a :v_edn (v->edn v) :added true})
+                            rows (filter visible? rows)
+                            rows (cond->> rows limit (take limit))]
+                        (vec rows)))))))))
+
 (defn hydrate-db
   "Rebuild the full hot 4-index `db` from a persisted snapshot. Reads ONE
   index tree (spo) in full and re-asserts every quad, so the reconstructed
@@ -1461,9 +1511,24 @@
    shreds into a bare, untyped seq on read-back (the same regression
    `v->edn`'s docstring/ADR-2607051000 follow-up already document for `:v`).
    Each row is therefore re-encoded through the SAME `v->edn`/`qs/edn->link`
-   round-trip for `:e` and `:a` too before caching."
-  [get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put!]
-  (letfn [(build [rows]
+   round-trip for `:e` and `:a` too before caching.
+
+   `async-get-fn` (optional, `:cljs` only, nil-safe -- absent falls back to
+   `cold-datoms`'s `with-blocks`-trampolined scan, identical to before this
+   param existed): a DIRECT Promise-returning `(fn [cid]) -> js/Promise
+   <bytes>`, routed to `cold-datoms-async` instead of `cold-datoms` --
+   confirmed live (ADR-2607120730 follow-up) to fix the actual dominant
+   cost of a stuck fold: `with-blocks`' one-miss-per-retry-from-root
+   trampoline re-walks/re-decodes every already-fetched node on every
+   retry, O(N^2) for a tree touching N distinct blocks, regardless of
+   `cache-get`/`cache-put!` (which only helps a SECOND attempt against an
+   already-hydrated snapshot -- if the FIRST hydrate itself never
+   completes, cache-put! never even fires). `cold-datoms-async`'s batched-
+   concurrent discovery is O(N)."
+  ([get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put!]
+   (hydrate-db-cached get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put! nil))
+  ([get-fn snapshot-cid blind-fn decrypt-fn cache-get cache-put! async-get-fn]
+   (letfn [(build [rows]
             (reduce (fn [db {:keys [e a v_edn]}]
                       (qs/assert-quad db {:s e :p a :o (qs/edn->link (edn/read-string v_edn))}))
                     (qs/empty-db)
@@ -1495,12 +1560,14 @@
              (.then (fn [cached]
                       (if cached
                         (build (decode-rows cached))
-                        (-> (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)
+                        (-> (if async-get-fn
+                              (cold-datoms-async async-get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn)
+                              (cold-datoms get-fn snapshot-cid {:index :eavt} (constantly true) blind-fn decrypt-fn))
                             (.then (fn [rows]
                                      (-> (if cache-put!
                                            (cache-put! (hydrate-cache-key snapshot-cid) (encode-rows rows))
                                            (js/Promise.resolve nil))
-                                         (.then (fn [_] (build rows)))))))))))))))
+                                         (.then (fn [_] (build rows))))))))))))))))
 
 (defn hydrate-chain
   "Rebuild the full hot db AS OF `chain-cid` — the persisted `indexed`
@@ -1884,6 +1951,8 @@
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn]
    (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn nil nil))
   ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put!]
+   (fold! put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! nil))
+  ([put! get-fn chain-cid ref? max-novelty blind-fn encrypt-fn decrypt-fn cache-get cache-put! async-get-fn]
    (let [state (state-at get-fn chain-cid)
          bounded? (some? max-novelty)
          take-result (when bounded? (take-oldest-novelty put! get-fn state max-novelty))
@@ -1902,7 +1971,7 @@
         :cljs
         (-> (js/Promise.all
              #js [(pmap-async (fn [cid] (read-tx-block get-fn cid decrypt-fn)) to-fold-cids)
-                  (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put!)])
+                  (hydrate-db-cached get-fn (indexed-cid state) blind-fn decrypt-fn cache-get cache-put! async-get-fn)])
             (.then (fn [results]
                      (let [[novelty-quads-per-cid hydrated-db] (vec results)
                            novelty-quads (apply concat novelty-quads-per-cid)
