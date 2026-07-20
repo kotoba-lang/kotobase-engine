@@ -136,6 +136,29 @@ this content-addressed chain:
 and as a one-shot cold-start entry point for callers that already have a
 fully materialized hot `db` (backfill/migration tooling, tests).
 
+## Merkle-LSM migration (ADR-2607201600)
+
+`kotobase-peer.merkle-lsm` contains the pure M1 kernel and M2 shadow-flush
+vertical slice replacing full-snapshot folding:
+
+- canonical newest-first physical keys for EAVT/AEVT/AVET/VAET;
+- deterministic immutable MerkleRun v1 blocks with min/max range metadata;
+- sparse VAET runs containing only real IPLD Link values;
+- VersionManifest v1 linking L0 runs by index, epoch, safe epoch, statistics,
+  and the previous manifest;
+- declarative BlockGet/Put, HeadRead/CAS, and CacheGet/Put effects; and
+- `flush-plan`, which turns one datom batch into covering L0 runs, a manifest,
+  and an ordered `BlockPut ... HeadCAS` publication plan without performing I/O;
+- `visible-rows`, a snapshot-epoch MVCC multi-run merge; and
+- `compact-runs`, which retains all versions newer than safe epoch plus the
+  newest boundary version, preserving every snapshot at/above that epoch while
+  pruning older shadowed versions.
+
+This is currently a behavior-preserving shadow substrate: existing
+`commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
+CLJ/CLJS CID determinism gates pass. New storage work must target the
+Merkle-LSM surface; no new IStore dependency is permitted.
+
 ## Composition decision (resolves a known gap from ADR-2607022600)
 
 `arrangement.core/commit!` and `chain.core/commit!` (`commit-dag.core/
