@@ -53,6 +53,17 @@
     (is (= (:cid a)
            (ipld/link-cid (get-in directory [:node "previous"]))))))
 
+(deftest range-directory-inherits-checkpoint-refs
+  (let [old-run (lsm/build-run :eavt "t" entries)
+        new-run (lsm/build-run :eavt "t" (take 1 entries))
+        old-directory (:node (lsm/build-range-directory
+                              {:db-id "db" :epoch 1
+                               :indexes {:eavt [old-run]}}))
+        merged (lsm/merge-range-directory-indexes
+                {:eavt [(lsm/run-ref new-run)]} old-directory)]
+    (is (= [(lsm/run-ref new-run) (lsm/run-ref old-run)]
+           (:eavt merged)))))
+
 (deftest first-component-range-prunes-run-refs
   (let [alice (lsm/build-run :eavt "t"
                              [{:components ["alice" "name" "Alice"]
