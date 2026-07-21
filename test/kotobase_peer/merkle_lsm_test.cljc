@@ -22,6 +22,8 @@
     (is (= 3 (:count a)))
     (is (= (:min-key a) (get (:node a) "min-key")))
     (is (= (:max-key a) (get (:node a) "max-key")))
+    (is (= "salice" (:first-component-min a)))
+    (is (= "sbob" (:first-component-max a)))
     (is (= {:effect/type :block/put :cid (:cid a) :bytes (:bytes a)}
            (first (:effects a))))))
 
@@ -35,6 +37,25 @@
     (is (= (:cid a) (:cid b)))
     (is (ipld/link? run-link))
     (is (= (:cid run) (ipld/link-cid run-link)))))
+
+(deftest first-component-range-prunes-run-refs
+  (let [alice (lsm/build-run :eavt "t"
+                             [{:components ["alice" "name" "Alice"]
+                               :epoch 1 :op :assert :value "Alice"}])
+        bob (lsm/build-run :eavt "t"
+                           [{:components ["bob" "name" "Bob"]
+                             :epoch 1 :op :assert :value "Bob"}])
+        old-ref (dissoc (lsm/run-ref bob)
+                        "first-component-min" "first-component-max")]
+    (is (= [(lsm/run-ref alice)]
+           (lsm/select-run-refs-by-first-component
+            [(lsm/run-ref alice) (lsm/run-ref bob)] "ali")))
+    (is (= [(lsm/run-ref alice) old-ref]
+           (lsm/select-run-refs-by-first-component
+            [(lsm/run-ref alice) old-ref] "ali")))
+    (is (= [(lsm/run-ref alice) (lsm/run-ref bob)]
+           (lsm/select-run-refs-by-first-component
+            [(lsm/run-ref alice) (lsm/run-ref bob)] "")))))
 
 (deftest overlapping-run-ranges-form-transitive-tasks
   (let [ref (fn [id lo hi] {"cid" id "min-key" lo "max-key" hi})

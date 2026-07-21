@@ -97,17 +97,26 @@
                   (sort-by #(get % "key"))
                   vec)
         keys' (mapv #(get % "key") rows)
-        node {"format" "kotobase/merkle-run"
-              "version" format-version
-              "index" (name index)
-              "tenant" (str tenant)
-              "count" (count rows)
-              "min-key" (first keys')
-              "max-key" (peek keys')
-              "rows" rows}]
-    (assoc (encoded node)
-           :index index :tenant (str tenant) :count (count rows)
-           :min-key (first keys') :max-key (peek keys'))))
+        first-components (->> rows
+                              (map #(component-text (first (get % "components"))))
+                              sort vec)
+        component-min (first first-components)
+        component-max (peek first-components)
+        node (cond-> {"format" "kotobase/merkle-run"
+                      "version" format-version
+                      "index" (name index)
+                      "tenant" (str tenant)
+                      "count" (count rows)
+                      "min-key" (first keys')
+                      "max-key" (peek keys')
+                      "rows" rows}
+               component-min (assoc "first-component-min" component-min
+                                    "first-component-max" component-max))]
+    (cond-> (assoc (encoded node)
+                   :index index :tenant (str tenant) :count (count rows)
+                   :min-key (first keys') :max-key (peek keys'))
+      component-min (assoc :first-component-min component-min
+                           :first-component-max component-max))))
 
 (defn- datom-entry [index epoch {:keys [e a v op] :or {op :assert}}]
   (let [components (case index
@@ -167,11 +176,31 @@
 
 (defn run-ref
   "Manifest-safe metadata for a run returned by build-run."
-  [{:keys [cid count min-key max-key]}]
-  {"cid" (ipld/link cid)
-   "count" count
-   "min-key" min-key
-   "max-key" max-key})
+  [{:keys [cid count min-key max-key first-component-min first-component-max]}]
+  (cond-> {"cid" (ipld/link cid)
+           "count" count
+           "min-key" min-key
+           "max-key" max-key}
+    first-component-min
+    (assoc "first-component-min" first-component-min
+           "first-component-max" first-component-max)))
+
+(defn select-run-refs-by-first-component
+  "Select refs whose first-component range can contain a string PREFIX.
+  Missing metadata is retained for compatibility with older manifests."
+  [refs prefix]
+  (if (empty? prefix)
+    (vec refs)
+    (let [minimum (component-text (str prefix))
+          maximum (str minimum "\uffff")]
+      (->> refs
+           (filter (fn [ref]
+                     (let [lo (get ref "first-component-min")
+                           hi (get ref "first-component-max")]
+                       (or (nil? lo) (nil? hi)
+                           (and (not (neg? (compare hi minimum)))
+                                (not (pos? (compare lo maximum))))))))
+           vec))))
 
 (defn overlapping-run-ranges
   "Partition run refs into deterministic, disjoint key-range tasks. Refs in a
