@@ -193,31 +193,53 @@
 
 (defn find-entities!
   "Return {entity [EAVT rows]} for every entity whose id starts with PREFIX.
-  Reads each manifest/run at most once. Intended for bounded list/event reads
-  until range-directed L1 lookup lands."
+  A checkpoint directory replaces the compacted portion of the manifest walk."
   ([e db-id prefix] (find-entities! e db-id prefix 256))
   ([e db-id prefix max-depth]
    (-> (get-head e db-id)
        (.then
         (fn [{head-cid :value}]
-          (-> (manifest-window! e head-cid max-depth)
-              (.then
-               (fn [{:keys [manifests tail]}]
-                 (when tail
-                   (throw (ex-info "Merkle entity scan depth exceeded"
-                                   {:db-id db-id :prefix prefix
-                                    :max-depth max-depth})))
-                 (-> (load-runs!
-                      e (-> (index-run-refs manifests :eavt)
-                            (lsm/select-run-refs-by-first-component prefix)))
-                     (.then
-                      (fn [runs]
-                        (->> runs
-                             (mapcat #(get-in % [:node "rows"]))
-                             (filter (fn [row]
-                                       (str/starts-with?
-                                        (str (first (get row "components"))) prefix)))
-                             (group-by #(first (get % "components")))))))))))))))
+          (letfn [(collect [cid remaining refs]
+                    (cond
+                      (nil? cid) (js/Promise.resolve refs)
+                      (zero? remaining)
+                      (js/Promise.reject
+                       (ex-info "Merkle entity scan depth exceeded"
+                                {:db-id db-id :prefix prefix
+                                 :max-depth max-depth}))
+                      :else
+                      (-> (get-node! e cid)
+                          (.then
+                           (fn [manifest]
+                             (if-let [directory-link
+                                      (get-in manifest ["statistics" "range-directory"])]
+                               (-> (get-node! e (ipld/link-cid directory-link))
+                                   (.then
+                                    (fn [directory]
+                                      (collect
+                                       (some-> (get directory "previous") ipld/link-cid)
+                                       (dec remaining)
+                                       (into refs
+                                             (lsm/range-directory-refs
+                                              directory :eavt))))))
+                               (collect
+                                (some-> (get manifest "previous") ipld/link-cid)
+                                (dec remaining)
+                                (into refs
+                                      (index-run-refs [{:node manifest}] :eavt)))))))))]
+            (-> (collect head-cid max-depth [])
+                (.then
+                 (fn [refs]
+                   (-> (load-runs!
+                        e (lsm/select-run-refs-by-first-component refs prefix))
+                       (.then
+                        (fn [runs]
+                          (->> runs
+                               (mapcat #(get-in % [:node "rows"]))
+                               (filter (fn [row]
+                                         (str/starts-with?
+                                          (str (first (get row "components"))) prefix)))
+                               (group-by #(first (get % "components"))))))))))))))))
 
 (defn- manifest-window!
   [e head-cid limit]
@@ -265,6 +287,17 @@
    (js/Promise.resolve [])
    (lsm/overlapping-run-ranges refs)))
 
+(defn- load-tail-checkpoint! [e tail]
+  (if-not tail
+    (js/Promise.resolve nil)
+    (-> (get-node! e tail)
+        (.then
+         (fn [manifest]
+           (when-let [directory-link
+                      (get-in manifest ["statistics" "range-directory"])]
+             (-> (get-node! e (ipld/link-cid directory-link))
+                 (.then (fn [directory] {:directory directory})))))))))
+
 (defn compact-head!
   "Compact the newest manifest window into range-partitioned L1 runs and
   publish it with R2 CAS. The untouched tail remains linked as :previous.
@@ -291,28 +324,49 @@
                                           (index-run-refs manifests index))
                                          (.then #(assoc compacted index %))))))
                           (js/Promise.resolve {})
-                          present)
+                         present)
                          (.then
                           (fn [compacted]
-                            (let [directory (lsm/build-range-directory
-                                             {:db-id db-id :epoch epoch
-                                              :indexes compacted :previous tail})
-                                  manifest (lsm/build-manifest
-                                            {:db-id db-id :epoch epoch :safe-epoch epoch
-                                             :previous tail
-                                             :indexes (into {}
-                                                            (map (fn [[index runs]]
-                                                                   [index {:l1 runs}]))
-                                                            compacted)
-                                             :statistics {"operation" "window-compaction"
-                                                          "range-directory" (ipld/link (:cid directory))
-                                                          "manifest-count" (count manifests)
-                                                          "target-run-rows" target-run-rows
-                                                          "output-run-count" (reduce + (map count (vals compacted)))}})
-                                  effects (concat (:effects directory) (:effects manifest))]
-                              (-> (put-blocks! e effects)
-                                  (.then (fn [_]
-                                           (cas-head! e db-id (:cid manifest) etag))))))))))))))))))
+                            (-> (load-tail-checkpoint! e tail)
+                                (.then
+                                 (fn [inherited]
+                                   (let [directory-indexes
+                                         (if inherited
+                                           (lsm/merge-range-directory-indexes
+                                            compacted (:directory inherited))
+                                           compacted)
+                                         directory-previous
+                                         (if inherited
+                                           (some-> (get (:directory inherited) "previous")
+                                                   ipld/link-cid)
+                                           tail)
+                                         directory (lsm/build-range-directory
+                                                    {:db-id db-id :epoch epoch
+                                                     :indexes directory-indexes
+                                                     :previous directory-previous})
+                                         manifest (lsm/build-manifest
+                                                   {:db-id db-id :epoch epoch
+                                                    :safe-epoch epoch
+                                                    :previous (when-not inherited tail)
+                                                    :indexes (into {}
+                                                                   (map (fn [[index runs]]
+                                                                          [index {:l1 runs}]))
+                                                                   compacted)
+                                                    :statistics
+                                                    {"operation" "window-compaction"
+                                                     "range-directory" (ipld/link (:cid directory))
+                                                     "inherited-checkpoint" (boolean inherited)
+                                                     "manifest-count" (count manifests)
+                                                     "target-run-rows" target-run-rows
+                                                     "output-run-count"
+                                                     (reduce + (map count (vals compacted)))}})
+                                         effects (concat (:effects directory)
+                                                         (:effects manifest))]
+                                     (-> (put-blocks! e effects)
+                                         (.then
+                                          (fn [_]
+                                            (cas-head! e db-id (:cid manifest)
+                                                       etag)))))))))))))))))))))
 
 (defn reachable-cids!
   "Walk decoded IPLD links from ROOT-CID and return a Promise<set<CID>>."

@@ -259,6 +259,16 @@
 (defn range-directory-refs [directory index]
   (get-in directory ["indexes" (name index)] []))
 
+(defn range-directory-indexes [directory]
+  (into {}
+        (map (fn [[index refs]] [(keyword index) (vec refs)]))
+        (get directory "indexes")))
+
+(defn merge-range-directory-indexes
+  "Prepend newly compacted refs to an inherited checkpoint directory."
+  [new-indexes inherited-directory]
+  (merge-with into new-indexes (range-directory-indexes inherited-directory)))
+
 (defn build-manifest
   "Build VersionManifest v1. INDEXES maps :eavt/:aevt/:avet/:vaet to level
   maps such as {:l0 [run] :l1 [run-ref]}. PREVIOUS is nil or a manifest CID."
