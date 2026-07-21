@@ -44,7 +44,7 @@
   (let [indexes-map (get (:node manifest) "indexes")]
     (into {}
           (map (fn [[index-name levels]]
-                 [index-name
+                 [(keyword index-name)
                   (let [runs (mapcat val levels)]
                     (build-cardinality-histogram
                      (keyword index-name)

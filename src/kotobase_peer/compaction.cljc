@@ -15,13 +15,14 @@
 
 (defn key-range-overlap?
   "Check if two [min-key max-key] ranges have any overlap.
-   Returns true if ranges overlap, false otherwise."
+   Returns true if ranges overlap, false otherwise.
+   Works with any comparable types (strings, numbers, vectors)."
   [range-a range-b]
   (let [[min-a max-a] range-a
         [min-b max-b] range-b]
     (and (not (nil? min-a)) (not (nil? min-b))
          (not (nil? max-a)) (not (nil? max-b))
-         (<= min-a max-b) (<= min-b max-a))))
+         (<= (compare min-a max-b) 0) (<= (compare min-b max-a) 0))))
 
 (defn run-key-range
   "Extract [min-key max-key] range from a run or run-ref.
@@ -139,11 +140,20 @@
    Returns set of live CID strings."
   [manifest]
   (let [cids (atom #{})
-        add-cid! (fn [c] (when c (swap! cids conj c)))
+        ;; Normalize CID to string format, handling both Link objects and raw strings
+        normalize-cid (fn [c]
+                       (cond
+                         (nil? c) nil
+                         (string? c) c
+                         :else (try (ipld/link-cid c) (catch #?(:clj Throwable :cljs :default) _ c))))
+
+        add-cid! (fn [c]
+                  (when-let [normalized (normalize-cid c)]
+                    (swap! cids conj normalized)))
 
         visit-run-ref (fn [ref]
                        (if-let [cid (get ref "cid")]
-                         (add-cid! (ipld/link-cid cid))
+                         (add-cid! cid)
                          (when-let [run-cid (:cid ref)]
                            (add-cid! run-cid))))
 
@@ -156,7 +166,7 @@
         visit-node (fn [node]
                     (add-cid! (:cid manifest))
                     (when-let [prev-link (get node "previous")]
-                      (add-cid! (ipld/link-cid prev-link)))
+                      (add-cid! prev-link))
                     (when-let [indexes (get node "indexes")]
                       (visit-indexes indexes))
                     (when-let [stats (get node "statistics")]
@@ -198,7 +208,8 @@
    :epoch-readers (or epoch-readers [])
    :replicas (or replicas [])
    :legal-hold legal-hold
-   :pinned-at (System/currentTimeMillis)})
+   :pinned-at #?(:clj (System/currentTimeMillis)
+                 :cljs (js/Date.now))})
 
 (defn minimum-safe-epoch
   "M4: Compute minimum epoch that must be retained.
