@@ -146,7 +146,8 @@
     (assoc arrangement
            :arrangement/materialized? true
            :arrangement/delta-rows delta-rows
-           :arrangement/last-updated (System/currentTimeMillis))))
+           :arrangement/last-updated #?(:clj (System/currentTimeMillis)
+                                        :cljs (js/Date.now)))))
 
 (defn query-with-arrangements
   "M5: Execute query using pre-materialized arrangements when available.
