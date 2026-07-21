@@ -15,10 +15,14 @@
                (filter #(.isDirectory (io/file %)))))
 
 (spit "shadow-cljs.edn"
-      (str "{:source-paths " (pr-str (vec (concat ["test"] dirs))) "\n"
+      (str "{:source-paths " (pr-str (vec (concat ["test" "bench"] dirs))) "\n"
            " :builds\n"
            " {:test {:target :node-test\n"
            "         :output-to \"out/test.js\"\n"
-           "         :ns-regexp \"-test$\"}}}\n"))
+           "         :ns-regexp \"-test$\"}\n"
+           "  :view-e2e {:target :browser\n"
+           "             :output-dir \"out/view-e2e\"\n"
+           "             :asset-path \"/\"\n"
+           "             :modules {:view-e2e {:init-fn kotobase-peer.browser-view-e2e/run}}}}}\n"))
 
 (println "wrote shadow-cljs.edn with" (count dirs) "source dirs from clojure -Spath")

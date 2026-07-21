@@ -4,6 +4,7 @@
   "scripts": {
     "ci:local": "node scripts/ci-local.mjs",
     "test:r2-gateway": "node bench/r2_view_bench_worker_test.mjs",
+    "build:view-e2e": "bb gen-shadow-cljs-edn.bb && shadow-cljs release view-e2e",
     "test:cljs": "bb gen-shadow-cljs-edn.bb && shadow-cljs compile test && node out/test.js",
     "test:nbb": "bb run-nbb-tests.bb"
   },
