@@ -1,0 +1,74 @@
+(ns kotobase-peer.statistics-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [kotobase-peer.merkle-lsm :as lsm]
+            [kotobase-peer.statistics :as statistics]))
+
+;; ============================================================================
+;; M5 Statistics Tests
+;; ============================================================================
+
+(deftest m5-histogram-estimates-cardinality
+  (testing "build-cardinality-histogram should compute full and prefix cardinalities"
+    (let [rows (mapv (fn [i]
+                      {"key" (lsm/canonical-key :eavt "t" ["e" "a" (str i)] i)
+                       "components" ["e" "a" (str i)]
+                       "epoch" i
+                       "op" "assert"
+                       "value" i})
+                    (range 100))
+          hist (statistics/build-cardinality-histogram :eavt rows)]
+      (is (= 100 (:full-cardinality hist)))
+      (is (pos? (count (:prefix-cardinalities hist)))))))
+
+(deftest m5-join-planner-orders-by-selectivity
+  (testing "plan-join-order should order indexes by selectivity reduction"
+    (let [histograms {:eavt {:full-cardinality 1000}
+                      :aevt {:full-cardinality 50}
+                      :avet {:full-cardinality 500}}
+          plan (statistics/plan-join-order {:query-indexes [:eavt :aevt :avet]}
+                                          histograms)]
+      (is (= :eavt (:index (first plan))))
+      (is (some #(= :aevt (:index %)) (rest plan))))))
+
+(deftest m5-selectivity-estimate-computes-ratio
+  (testing "selectivity-estimate should compute cardinality reduction factor"
+    (let [histograms {:eavt {:full-cardinality 1000}
+                      :aevt {:full-cardinality 100}}
+          sel (statistics/selectivity-estimate histograms :eavt :aevt)]
+      (is (< 0.0 sel 1.0))
+      (is (= 0.1 sel)))))
+
+(deftest m5-arrangement-materializes-deltas
+  (testing "maintain-materialized-delta should record delta rows"
+    (let [arr (statistics/delta-arrangement
+              {:name :resource-index :base-index :eavt})
+          new-datoms [{:e "e1" :a :type :v "resource" :op :assert}]
+          updated (statistics/maintain-materialized-delta arr new-datoms)]
+      (is (:arrangement/materialized? updated))
+      (is (= 1 (count (:arrangement/delta-rows updated)))))))
+
+(deftest m5-delta-arrangement-initialization
+  (testing "delta-arrangement should create uninitialized arrangement descriptor"
+    (let [arr (statistics/delta-arrangement
+              {:name :test-arr :base-index :eavt :manifest-cid "cid1" :epoch 1})]
+      (is (= :test-arr (:arrangement/name arr)))
+      (is (false? (:arrangement/materialized? arr)))
+      (is (empty? (:arrangement/rows arr))))))
+
+(deftest m5-query-with-arrangements-fallback
+  (testing "query-with-arrangements should fall back to scan when no arrangement"
+    (let [manifest (lsm/build-manifest {:db-id "test" :epoch 1})
+          result (statistics/query-with-arrangements
+                 manifest {:arrangement-name :missing} [])]
+      (is (= :scan (:result-type result)))
+      (is (true? (:needs-index-scan result))))))
+
+(deftest m5-build-index-statistics
+  (testing "build-index-statistics should create histograms for all indexes"
+    (let [run (lsm/build-run :eavt "t" [{:components ["a" "b"] :epoch 1 :op :assert :value 1}])
+          manifest (lsm/build-manifest
+                   {:db-id "test" :epoch 1
+                    :indexes {:eavt {:l0 [run]}}})
+          stats (statistics/build-index-statistics manifest)]
+      (is (contains? stats :eavt))
+      (is (pos? (:full-cardinality (:eavt stats)))))))
