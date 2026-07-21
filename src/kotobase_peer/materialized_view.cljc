@@ -70,16 +70,19 @@
   retain deterministic value ordering. BLOCK-ROWS controls the browser read
   granularity. The result contains one :object/put for the packed bytes and one
   :block/put for the small query bundle."
-  [{:keys [view-id epoch entries block-rows source-manifest plan-cid sorted?]
+  [{:keys [view-id epoch entries block-rows source-manifest plan-cid sorted?
+           previous-bundle mode]
     :or {block-rows 512}}]
   (when-not (and (integer? epoch) (not (neg? epoch)))
     (throw (ex-info "View epoch must be a non-negative integer" {:epoch epoch})))
   (when-not (and (integer? block-rows) (pos? block-rows))
     (throw (ex-info "View block rows must be positive" {:block-rows block-rows})))
-  (let [row-seq (map (fn [{:keys [key value]}]
+  (let [row-seq (map (fn [{:keys [key value op] :or {op :assert}}]
                        (when-not (string? key)
                          (throw (ex-info "View key must be a string" {:key key})))
-                       {"key" key "value" value})
+                       (when-not (#{:assert :retract} op)
+                         (throw (ex-info "View op must be :assert or :retract" {:op op})))
+                       {"key" key "op" (name op) "value" value})
                      entries)
         rows (if sorted?
                (let [rows (vec row-seq)]
@@ -112,12 +115,14 @@
                       "version" format-version
                       "view-id" (str view-id)
                       "epoch" epoch
+                      "mode" (name (or mode :base))
                       "count" (count rows)
                       "pack-cid" (ipld/link pack-cid)
                       "pack-bytes" (byte-count pack-bytes)
                       "blocks" descriptors}
                       source-manifest (assoc "source-manifest" (ipld/link source-manifest))
-                      plan-cid (assoc "plan-cid" (ipld/link plan-cid)))
+                      plan-cid (assoc "plan-cid" (ipld/link plan-cid))
+                      previous-bundle (assoc "previous-bundle" (ipld/link previous-bundle)))
         bundle-bytes (ipld/encode bundle-node)
         bundle-cid (ipld/cid bundle-bytes)]
     {:view-id (str view-id)
@@ -129,6 +134,21 @@
      :bundle {:node bundle-node :bytes bundle-bytes :cid bundle-cid}
      :effects [(object-put pack-cid pack-bytes)
                {:effect/type :block/put :cid bundle-cid :bytes bundle-bytes}]}))
+
+(defn build-view-delta
+  "Build one incremental materialized-view L0 pack. CHANGES are
+  {:key string :value value :op :assert|:retract}. The previous bundle link
+  pins the older view generation; newest-first merge applies tombstones."
+  [{:keys [view-id epoch changes previous-bundle block-rows source-manifest plan-cid]}]
+  (when-not previous-bundle
+    (throw (ex-info "View delta requires a previous bundle CID" {})))
+  (doseq [{:keys [op]} changes]
+    (when-not (#{:assert :retract} op)
+      (throw (ex-info "View delta op must be :assert or :retract" {:op op}))))
+  (build-view {:view-id view-id :epoch epoch :entries changes
+               :block-rows (or block-rows 512)
+               :source-manifest source-manifest :plan-cid plan-cid
+               :previous-bundle previous-bundle :mode :delta}))
 
 (defn build-datom-projection
   "Bridge the peer's existing RisingWave-style `view-rows` result into a
@@ -196,13 +216,12 @@
                       {:expected expected :actual actual})))
     (ipld/decode bytes)))
 
-(defn finish-range-query
-  "Finish a query from RANGE-BYTES in descriptor order. This function is the
-  pure browser/Wasm execution kernel; storage and fetch remain host effects."
+(defn finish-range-rows
+  "Verify/decode RANGE-BYTES and return bounded physical rows, including
+  tombstones. Delta-chain merge consumes this lower-level browser primitive."
   [plan range-bytes]
   (let [lower (:lower plan)
-        upper (:upper plan)
-        limit (or (:limit plan) #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER))]
+        upper (:upper plan)]
     (->> (map vector (:descriptors plan) range-bytes)
          (mapcat (fn [[descriptor bytes]]
                    (get (decode-range descriptor bytes) "rows")))
@@ -210,6 +229,15 @@
                    (let [key (get row "key")]
                      (and (or (nil? lower) (not (neg? (compare key lower))))
                           (or (nil? upper) (not (pos? (compare key upper))))))))
+         vec)))
+
+(defn finish-range-query
+  "Finish one base-view query. This is the pure browser/Wasm execution kernel;
+  storage and fetch remain host effects."
+  [plan range-bytes]
+  (let [limit (or (:limit plan) #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER))]
+    (->> (finish-range-rows plan range-bytes)
+         (filter #(= "assert" (get % "op")))
          (take limit)
          (mapv #(get % "value")))))
 
@@ -221,3 +249,72 @@
         ranges (mapv #(slice-bytes pack-bytes (get % "offset") (get % "length"))
                      (:descriptors plan))]
     {:plan plan :values (finish-range-query plan ranges)}))
+
+(defn range-query-plan-chain
+  "Plan the same bounded query against BUNDLES ordered newest first. Fetching
+  the small linked bundles is a host concern; all packed data reads stay
+  explicit and bounded here."
+  [bundles {:keys [lower upper limit]}]
+  (let [plans (mapv #(range-query-plan {:bundle % :lower lower :upper upper}) bundles)]
+    {:plans plans :lower lower :upper upper :limit limit
+     :estimated-requests (reduce + (map :estimated-requests plans))
+     :estimated-bytes (reduce + (map :estimated-bytes plans))
+     :need (vec (mapcat :need plans))}))
+
+(defn- newest-chain-rows [plans range-bytes-by-plan]
+  (let [rows (mapcat (fn [plan range-bytes]
+                       (finish-range-rows plan range-bytes))
+                     plans range-bytes-by-plan)]
+    (->> rows
+         (reduce (fn [result row]
+                   (let [key (get row "key")]
+                     (if (contains? result key) result (assoc result key row))))
+                 {})
+         (sort-by key)
+         (mapv val))))
+
+(defn finish-range-query-chain
+  "Newest-first MVCC merge for materialized-view delta packs. The first row
+  for a key wins; a retract tombstone suppresses older assertions."
+  [chain-plan range-bytes-by-plan]
+  (let [limit (or (:limit chain-plan)
+                  #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER))]
+    (->> (newest-chain-rows (:plans chain-plan) range-bytes-by-plan)
+         (keep (fn [row]
+                 (when (= "assert" (get row "op")) (get row "value"))))
+         (take limit)
+         vec)))
+
+(defn query-packed-chain
+  "In-memory oracle for a newest-first sequence of {:bundle :pack-bytes}."
+  [generations query]
+  (let [bundles (mapv :bundle generations)
+        plan (range-query-plan-chain bundles query)
+        range-groups
+        (mapv (fn [generation generation-plan]
+                (mapv #(slice-bytes (:pack-bytes generation)
+                                    (get % "offset") (get % "length"))
+                      (:descriptors generation-plan)))
+              generations (:plans plan))]
+    {:plan plan :values (finish-range-query-chain plan range-groups)}))
+
+(defn compact-packed-chain
+  "Compact complete newest-first packed generations into one deterministic
+  base view. Intended for host/background compaction; memory-bounded remote
+  streaming is a subsequent host executor concern."
+  [{:keys [view-id epoch generations block-rows source-manifest plan-cid]}]
+  (let [chain-plan (range-query-plan-chain (mapv :bundle generations) {})
+        range-groups
+        (mapv (fn [generation generation-plan]
+                (mapv #(slice-bytes (:pack-bytes generation)
+                                    (get % "offset") (get % "length"))
+                      (:descriptors generation-plan)))
+              generations (:plans chain-plan))
+        entries (->> (newest-chain-rows (:plans chain-plan) range-groups)
+                     (keep (fn [row]
+                             (when (= "assert" (get row "op"))
+                               {:key (get row "key") :value (get row "value")})))
+                     vec)]
+    (build-view {:view-id view-id :epoch epoch :entries entries
+                 :block-rows (or block-rows 512) :sorted? true
+                 :source-manifest source-manifest :plan-cid plan-cid})))
