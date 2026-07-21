@@ -178,6 +178,10 @@ bundle records the source manifest/epoch and optional plan CID; canonical datoms
 remain authoritative and a view can be discarded and rebuilt. Physical packed
 objects and logical block CIDs intentionally have different granularity, while
 every returned range is verified against its logical block CID before decode.
+`build-view-delta` appends an epoch pack linked to the previous bundle;
+`query-packed-chain` applies newest-key-wins assertions/retraction tombstones,
+and `compact-packed-chain` deterministically collapses a bounded chain back to
+one base pack. Run `clojure -M:view-delta-bench 10000 1000 512` for this gate.
 
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and

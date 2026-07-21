@@ -7,6 +7,7 @@ const steps = [
   ["cljs-test", "npm", ["run", "test:cljs"]],
   ["merkle-bench", "clojure", ["-M:merkle-bench", "1000"]],
   ["view-bench", "clojure", ["-M:view-bench", "1000", "128"]],
+  ["view-delta-bench", "clojure", ["-M:view-delta-bench", "1000", "100", "128"]],
 ];
 const receipt = { schema: 1, runner: "kotobase-peer", startedAt: new Date().toISOString(), steps: [] };
 for (const [name, command, args] of steps) {

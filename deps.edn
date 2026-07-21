@@ -39,4 +39,6 @@
   :merkle-bench {:extra-paths ["bench"]
                  :main-opts ["-m" "kotobase-peer.merkle-lsm-bench"]}
   :view-bench {:extra-paths ["bench"]
-               :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}}}
+               :main-opts ["-m" "kotobase-peer.materialized-view-bench"]}
+  :view-delta-bench {:extra-paths ["bench"]
+                     :main-opts ["-m" "kotobase-peer.materialized-view-delta-bench"]}}}

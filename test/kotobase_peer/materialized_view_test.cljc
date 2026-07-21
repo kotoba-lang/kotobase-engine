@@ -75,3 +75,34 @@
     (is (= 1 (:count built)))
     (is (= source (ipld/link-cid (get bundle "source-manifest"))))
     (is (= "alice" (get-in result [:values 0 "e"])))))
+
+(deftest delta-view-chain-applies-assertions-and-retractions
+  (let [base (view/build-view
+              {:view-id :feed :epoch 10 :block-rows 2
+               :entries [{:key "a" :value {"version" 1}}
+                         {:key "b" :value {"version" 1}}]})
+        delta (view/build-view-delta
+               {:view-id :feed :epoch 11 :block-rows 2
+                :previous-bundle (get-in base [:bundle :cid])
+                :changes [{:key "a" :value nil :op :retract}
+                          {:key "b" :value {"version" 2} :op :assert}
+                          {:key "c" :value {"version" 1} :op :assert}]})
+        generations [{:bundle (get-in delta [:bundle :node])
+                      :pack-bytes (:pack-bytes delta)}
+                     {:bundle (get-in base [:bundle :node])
+                      :pack-bytes (:pack-bytes base)}]
+        result (view/query-packed-chain generations {:lower "a" :upper "z"})
+        compacted (view/compact-packed-chain
+                   {:view-id :feed :epoch 11 :block-rows 2
+                    :generations generations})
+        compacted-result (view/query-packed
+                          (get-in compacted [:bundle :node]) (:pack-bytes compacted)
+                          {:lower "a" :upper "z"})]
+    (is (= "delta" (get-in delta [:bundle :node "mode"])))
+    (is (= (get-in base [:bundle :cid])
+           (ipld/link-cid (get-in delta [:bundle :node "previous-bundle"]))))
+    (is (= [{"version" 2} {"version" 1}] (:values result)))
+    (is (= 3 (get-in result [:plan :estimated-requests])))
+    (is (= (:values result) (:values compacted-result)))
+    (is (= "base" (get-in compacted [:bundle :node "mode"])))
+    (is (nil? (get-in compacted [:bundle :node "previous-bundle"])))))

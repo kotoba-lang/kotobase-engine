@@ -1,0 +1,21 @@
+{:schema 1
+ :date "2026-07-21"
+ :implementation "kotobase-peer.materialized-view/build-view-delta"
+ :workload {:base-rows 10000 :changed-rows 1000 :block-rows 512
+            :point-samples 500}
+ :delta {:build-ms 1343.125292
+         :rows-per-second 744.5321787596864
+         :pack-bytes 49269
+         :blocks 2}
+ :newest-first-chain-query
+ {:semantics [:assert :retract :newest-key-wins]
+  :p50-ms 15.180333
+  :p95-ms 71.521917
+  :p99-ms 96.531791
+  :estimated-requests 2
+  :estimated-bytes 53763}
+ :verification {:jvm {:tests 6 :assertions 23 :failures 0 :errors 0}
+                :cljs {:tests 158 :assertions 409 :failures 0 :errors 0}}
+ :limitations ["two-generation chain only in this receipt"
+               "background packed-chain compaction is currently in-memory"
+               "remote streaming compactor remains open"]}
