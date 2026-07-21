@@ -81,7 +81,7 @@
                                {:manifest-cid (str "m" (rand-int 1000))
                                 :epoch (rand-int 100)
                                 :epoch-readers (vec (repeatedly (rand-int 5)
-                                                               #(rand-int 100)))})))
+                                                               (fn [] (rand-int 100))))})))
         timings (atom [])]
     (dotimes [_ 10]
       (let [{:keys [ms]} (elapsed-ms #(compaction/minimum-safe-epoch pins))]
