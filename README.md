@@ -189,6 +189,11 @@ Adjacent selected blocks are coalesced into bounded (default 1 MiB) object
 ranges. The response is split back into logical blocks and every CID is still
 verified independently, reducing request amplification without weakening IPLD
 integrity.
+Each block descriptor also carries a deterministic CLJ/CLJS Bloom filter (10
+bits/key, 7 hashes). Exact negative lookups can therefore complete from the
+small query bundle with zero data-object requests. Missing/legacy filters and
+false positives always fall back to a verified block read; range scans do not
+apply an exact-key filter.
 
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and

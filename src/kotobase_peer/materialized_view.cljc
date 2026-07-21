@@ -8,6 +8,8 @@
   (:require [ipld.core :as ipld]))
 
 (def format-version 1)
+(def ^:private bloom-bits-per-key 10)
+(def ^:private bloom-hash-count 7)
 
 (defn- byte-count [bytes]
   #?(:clj (alength ^bytes bytes)
@@ -35,6 +37,70 @@
 (defn- slice-bytes [bytes offset length]
   #?(:clj (java.util.Arrays/copyOfRange ^bytes bytes offset (+ offset length))
      :cljs (.slice bytes offset (+ offset length))))
+
+(defn- empty-bytes [n]
+  #?(:clj (byte-array n) :cljs (js/Uint8Array. n)))
+
+(defn- byte-at [bytes i]
+  (bit-and 255 (aget bytes i)))
+
+(defn- set-byte! [bytes i value]
+  #?(:clj (aset-byte ^bytes bytes i (unchecked-byte value))
+     :cljs (aset bytes i value)))
+
+(defn- portable-hash
+  "Small deterministic CLJ/CLJS string hash. Arithmetic stays below JS's safe
+  integer bound before each modulus; it is not used for identity/security."
+  [s seed]
+  (loop [i 0 h seed]
+    (if (< i (count s))
+      (recur (inc i)
+             (mod (+ (* h 131)
+                     #?(:clj (int (.charAt ^String s i))
+                        :cljs (.charCodeAt s i)))
+                  2147483647))
+      h)))
+
+(defn build-bloom
+  "Build a deterministic ~1% false-positive block filter (10 bits/key, 7
+  hashes). Empty blocks omit the filter."
+  [keys]
+  (let [keys (vec keys)]
+    (when (seq keys)
+      (let [bit-count (max 64 (* bloom-bits-per-key (count keys)))
+            byte-count (long (quot (+ bit-count 7) 8))
+            bit-count (* 8 byte-count)
+            bits (empty-bytes byte-count)]
+        (doseq [key keys
+                :let [h1 (portable-hash key 17)
+                      h2 (inc (portable-hash key 65537))]
+                i (range bloom-hash-count)]
+          (let [bit (mod (+ h1 (* i h2) (* i i)) bit-count)
+                byte-index (quot bit 8)
+                mask (bit-shift-left 1 (mod bit 8))]
+            (set-byte! bits byte-index (bit-or (byte-at bits byte-index) mask))))
+        {"algorithm" "bloom-v1"
+         "bit-count" bit-count
+         "hash-count" bloom-hash-count
+         "bits" bits}))))
+
+(defn bloom-might-contain?
+  "False means a definite miss; true means possible hit. Missing filters are
+  correctness-safe and return true for backward compatibility."
+  [filter-data key]
+  (if-not filter-data
+    true
+    (let [bit-count (get filter-data "bit-count")
+          hash-count (get filter-data "hash-count")
+          bits (get filter-data "bits")
+          h1 (portable-hash key 17)
+          h2 (inc (portable-hash key 65537))]
+      (every? (fn [i]
+                (let [bit (mod (+ h1 (* i h2) (* i i)) bit-count)
+                      byte-index (quot bit 8)
+                      mask (bit-shift-left 1 (mod bit 8))]
+                  (not (zero? (bit-and (byte-at bits byte-index) mask)))))
+              (range hash-count)))))
 
 (defn view-key
   "Portable ordered key for materialized views. Components are length framed;
@@ -100,15 +166,20 @@
         pack-cid (ipld/cid pack-bytes)
         descriptors (loop [offset 0, blocks blocks, result []]
                       (if-let [block (first blocks)]
-                        (let [length (byte-count (:bytes block))]
+                        (let [length (byte-count (:bytes block))
+                              filter-data (build-bloom
+                                           (map #(get % "key")
+                                                (get (:node block) "rows")))]
                           (recur (+ offset length) (next blocks)
                                  (conj result
-                                       {"cid" (ipld/link (:cid block))
-                                        "offset" offset
-                                        "length" length
-                                        "count" (get (:node block) "count")
-                                        "min-key" (get (:node block) "min-key")
-                                        "max-key" (get (:node block) "max-key")})))
+                                       (cond->
+                                        {"cid" (ipld/link (:cid block))
+                                         "offset" offset
+                                         "length" length
+                                         "count" (get (:node block) "count")
+                                         "min-key" (get (:node block) "min-key")
+                                         "max-key" (get (:node block) "max-key")}
+                                         filter-data (assoc "filter" filter-data)))))
                         result))
         bundle-node (cond->
                      {"format" "kotobase/query-bundle"
@@ -190,6 +261,8 @@
          (take-while #(or (nil? upper)
                           (not (pos? (compare (get % "min-key") upper)))))
          (filter #(overlaps? % lower upper))
+         (filter #(or (nil? lower) (not= lower upper)
+                      (bloom-might-contain? (get % "filter") lower)))
          vec)))
 
 (defn coalesce-block-ranges
