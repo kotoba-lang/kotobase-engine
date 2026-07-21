@@ -57,6 +57,16 @@
                                                      :upper (key-of i)
                                                      :limit 1}))
                             (drop 2 point-ids))
+        miss-keys (mapv #(str (key-of (mod (* % 7919) (dec n))) "-missing")
+                        (range 1002))
+        _ (doseq [key (take 2 miss-keys)]
+            (view/query-packed bundle pack {:lower key :upper key :limit 1}))
+        miss-results (mapv (fn [key]
+                             (let [timing (timed #(view/query-packed
+                                                  bundle pack {:lower key :upper key :limit 1}))]
+                               {:ms (:ms timing)
+                                :requests (get-in timing [:value :plan :estimated-requests])}))
+                           (drop 2 miss-keys))
         range-starts (mapv #(mod (* % 1543) (- n 20)) (range 202))
         _ (doseq [i (take 2 range-starts)]
             (view/query-packed bundle pack {:lower (key-of i)
@@ -89,6 +99,12 @@
      :point (assoc (stats point-samples)
                    :estimated-requests (:estimated-requests sample-plan)
                    :estimated-bytes (:estimated-bytes sample-plan))
+     :point-miss (assoc (stats (mapv :ms miss-results))
+                        :zero-request-ratio
+                        (/ (count (filter #(zero? (:requests %)) miss-results))
+                           (double (count miss-results)))
+                        :false-positive-requests
+                        (reduce + (map :requests miss-results)))
      :range-20 (stats range-samples)
      :range-coalesced
      (let [i (first scan-starts)

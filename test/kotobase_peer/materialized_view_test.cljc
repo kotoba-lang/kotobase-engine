@@ -65,6 +65,23 @@
     (is (thrown? #?(:clj Exception :cljs js/Error)
                  (view/decode-range descriptor corrupt)))))
 
+(deftest block-bloom-has-no-false-negatives-and-prunes-exact-misses
+  (let [built (view/build-view {:view-id :lookup :epoch 1
+                                :block-rows 100 :entries (entries 100)})
+        bundle (get-in built [:bundle :node])
+        filter-data (get-in bundle ["blocks" 0 "filter"])
+        present (mapv :key (entries 100))
+        absent (mapv #(str "tenant-a/000000" % "-missing") (range 10 100))
+        pruned (count (remove #(view/bloom-might-contain? filter-data %) absent))
+        missing-key "tenant-a/00000050-missing"
+        result (view/query-packed bundle (:pack-bytes built)
+                                  {:lower missing-key :upper missing-key :limit 1})]
+    (is (every? #(view/bloom-might-contain? filter-data %) present))
+    (is (>= pruned 80))
+    (is (empty? (:values result)))
+    (is (zero? (get-in result [:plan :estimated-requests])))
+    (is (zero? (get-in result [:plan :estimated-bytes])))))
+
 (deftest query-plan-is-browser-host-effect-data
   (let [built (view/build-view {:view-id :entities :epoch 9
                                 :block-rows 2 :entries (entries 5)})
