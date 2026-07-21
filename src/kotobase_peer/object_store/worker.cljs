@@ -161,7 +161,8 @@
                (-> (get-node! e manifest-cid)
                    (.then
                     (fn [manifest]
-                      (let [refs (get-in manifest ["indexes" "eavt" "l0"])
+                      (let [refs (-> (index-run-refs [{:node manifest}] :eavt)
+                                     (lsm/select-run-refs-by-first-component entity))
                             previous (some-> (get manifest "previous") ipld/link-cid)
                             loads (mapv #(get-node! e (ipld/link-cid (get % "cid"))) refs)]
                         (-> (js/Promise.all (clj->js loads))
@@ -194,7 +195,9 @@
                    (throw (ex-info "Merkle entity scan depth exceeded"
                                    {:db-id db-id :prefix prefix
                                     :max-depth max-depth})))
-                 (-> (load-runs! e (index-run-refs manifests :eavt))
+                 (-> (load-runs!
+                      e (-> (index-run-refs manifests :eavt)
+                            (lsm/select-run-refs-by-first-component prefix)))
                      (.then
                       (fn [runs]
                         (->> runs
