@@ -331,6 +331,34 @@
      :estimated-bytes (reduce + (map :length fetches))
      :need (mapv #(object-range-get pack-cid (:offset %) (:length %)) fetches)}))
 
+(defn batch-point-query-plan
+  "Compile non-contiguous exact keys into deduplicated logical blocks and
+  bounded physical ranges. Bloom false positives may add a block but never
+  remove a present key. Results are filtered back to REQUESTED-KEYS."
+  [{:keys [bundle keys max-range-bytes]
+    :or {max-range-bytes 1048576}}]
+  (let [requested-keys (vec (distinct keys))
+        descriptors
+        (->> requested-keys
+             (mapcat #(select-blocks bundle % %))
+             (sort-by #(get % "offset"))
+             (reduce (fn [result descriptor]
+                       (if (= (get (peek result) "offset")
+                              (get descriptor "offset"))
+                         result
+                         (conj result descriptor)))
+                     []))
+        fetches (coalesce-block-ranges descriptors max-range-bytes)
+        pack-cid (ipld/link-cid (get bundle "pack-cid"))]
+    {:view-id (get bundle "view-id")
+     :epoch (get bundle "epoch")
+     :requested-keys requested-keys
+     :descriptors descriptors
+     :fetches fetches
+     :estimated-requests (count fetches)
+     :estimated-bytes (reduce + (map :length fetches))
+     :need (mapv #(object-range-get pack-cid (:offset %) (:length %)) fetches)}))
+
 (defn decode-range
   "Verify and decode one independently addressed block returned by Range GET."
   [descriptor bytes]
@@ -370,6 +398,17 @@
          (filter #(= "assert" (get % "op")))
          (take limit)
          (mapv #(get % "value")))))
+
+(defn finish-logical-blocks-batch-query
+  "Finish a non-contiguous exact-key batch as key→value, after host decrypt."
+  [plan plaintext-blocks]
+  (let [requested (set (:requested-keys plan))]
+    (->> (finish-logical-blocks-rows plan plaintext-blocks)
+         (keep (fn [row]
+                 (when (and (= "assert" (get row "op"))
+                            (contains? requested (get row "key")))
+                   [(get row "key") (get row "value")])))
+         (into {}))))
 
 (defn finish-range-rows
   "Verify/decode RANGE-BYTES and return bounded physical rows, including

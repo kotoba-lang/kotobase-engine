@@ -42,7 +42,7 @@
                        (range 100))
                   (map (fn [i]
                          {:key (str "tenant-a/post-author/" (pad i))
-                          :value {"post-id" i "author-id" (mod i 100)}})
+                          :value {"post-id" i "author-id" (mod (* i 37) 100)}})
                        (range 1000))))
         built (view/build-view (cond-> {:view-id :browser/e2e :epoch 1
                                         :entries entries :sorted? true :block-rows 100}

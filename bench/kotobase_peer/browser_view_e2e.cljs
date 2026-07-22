@@ -103,6 +103,29 @@
               :first (first values)
               :last (last values)}))))))
 
+(defn- batch-query-once [bundle keyring keys sample]
+  (let [plan (view/batch-point-query-plan {:bundle bundle :keys keys})
+        started (now)
+        requests
+        (mapv (fn [effect]
+                (fetch-bytes (str "/e2e/object?sample=batch-" sample "-" (now))
+                             #js {:cache "reload"
+                                  :headers (auth-headers
+                                            #js {"Range" (range-header effect)})}))
+              (:need plan))]
+    (-> (js/Promise.all (clj->js requests))
+        (.then #(decrypt-ranges keyring plan (vec (array-seq %))))
+        (.then
+         (fn [plaintext-blocks]
+           (let [values (view/finish-logical-blocks-batch-query plan plaintext-blocks)]
+             (when-not (= (count keys) (count values))
+               (throw (js/Error. (str "batch lookup expected " (count keys)
+                                      " values, got " (count values)))))
+             {:ms (- (now) started)
+              :requests (:estimated-requests plan)
+              :range-bytes (:estimated-bytes plan)
+              :values values}))))))
+
 (defn- join-once [bundle keyring sample]
   (let [started (now)
         outer-query {:lower "tenant-a/post-author/000000450"
@@ -114,17 +137,13 @@
          (fn [outer]
            (let [edges (:values outer)
                  author-ids (vec (sort (distinct (map #(get % "author-id") edges))))
-                 author-key #(str "tenant-a/author/" (.padStart (str %) 9 "0"))]
+                 author-key #(str "tenant-a/author/" (.padStart (str %) 9 "0"))
+                 author-keys (mapv author-key author-ids)]
              (.then
-              (query-once bundle keyring
-                          {:lower (author-key (first author-ids))
-                           :upper (author-key (last author-ids))
-                           :limit (count author-ids)
-                           :expected-count (count author-ids)
-                           :cache "reload"
-                           :nonce (str "join-inner-batch-" sample "-" (now))})
+              (batch-query-once bundle keyring author-keys sample)
               (fn [inner]
-                (let [authors (into {} (map (juxt #(get % "id") identity)
+                (let [authors (into {} (map (fn [[_ author]]
+                                              [(get author "id") author])
                                             (:values inner)))
                       joined (mapv (fn [edge]
                                      {:post-id (get edge "post-id")
@@ -227,7 +246,7 @@
                            :concurrent {:batches 5 :concurrency 8
                                         :latency (summary concurrency-latencies)
                                         :batch-wall (summary (map :wall-ms concurrent))}
-                           :join {:kind "batched-index-range"
+                           :join {:kind "non-contiguous-block-batch"
                                   :cold (summary (map :ms joins))
                                   :rows (:rows (first joins))
                                   :deduplicated-keys (:deduplicated-keys (first joins))

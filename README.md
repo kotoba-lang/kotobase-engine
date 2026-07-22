@@ -243,6 +243,14 @@ naive index nested loop from 21 requests/148,786 bytes to 2 requests/14,912
 bytes while retaining AES-GCM and plaintext CID verification. See
 `bench/results/2026-07-22-browser-r2-batched-join.edn`.
 
+`batch-point-query-plan` generalizes the inner join step for non-contiguous
+keys. It resolves each exact key through sparse metadata and Bloom filters,
+deduplicates shared logical blocks, coalesces only physically adjacent selected
+blocks, and filters decoded overfetch back to the requested key set. The plan
+is pure CLJ/CLJS effect data and is reusable by browser and Datalog hosts. Its
+real encrypted R2 gate is in
+`bench/results/2026-07-22-browser-r2-noncontiguous-batch.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
