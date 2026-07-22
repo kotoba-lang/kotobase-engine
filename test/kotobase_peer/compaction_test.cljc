@@ -32,6 +32,21 @@
     (is (true? (compaction/key-range-overlap? ["a" "d"] ["a" "d"])))
     (is (false? (compaction/key-range-overlap? ["a" "c"] ["d" "f"])))))
 
+(deftest production-scheduler-task-lease-and-backpressure
+  (let [opts {:db-id "db-a" :expected-head "bafy-head"
+              :window-size 32 :target-run-rows 2048}
+        task-a (compaction/scheduler-task opts)
+        task-b (compaction/scheduler-task opts)
+        lease (compaction/lease-node
+               {:task task-a :owner "murakumo-1" :token "token-1"
+                :attempt 2 :acquired-at 1000 :expires-at 2000})]
+    (is (= (:id task-a) (:id task-b)) "retry identity is deterministic")
+    (is (= "bafy-head" (get-in task-a [:node "expected-head"])))
+    (is (compaction/lease-active? lease 1999))
+    (is (not (compaction/lease-active? lease 2000)))
+    (is (compaction/reclaimable? lease 2000))
+    (is (= [[1 2] [3 4] [5]] (compaction/bounded-batches 2 [1 2 3 4 5])))))
+
 (deftest m4-gc-candidates-finds-unreachable-blocks
   (testing "gc-candidates should identify orphaned CIDs"
     (let [run-1 (lsm/build-run :eavt "t" [{:components ["a"] :epoch 1 :op :assert :value 1}])

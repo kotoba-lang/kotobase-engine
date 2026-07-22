@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
+            [kotobase-peer.compaction :as compaction]
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.retention :as retention]
             [kotobase-peer.object-store.s3-sigv4 :as sigv4]))
@@ -16,6 +17,11 @@
 (defn block-key [e cid] (str (prefix e) "blocks/" cid))
 (defn object-key [e cid] (str (prefix e) "objects/" cid))
 (defn head-key [e db-id] (str (prefix e) "heads/" db-id))
+(defn compaction-lease-key [e db-id]
+  (str (prefix e) "scheduler/compaction/" (js/encodeURIComponent db-id) "/lease"))
+(defn compaction-checkpoint-key [e db-id task-id token]
+  (str (prefix e) "scheduler/compaction/" (js/encodeURIComponent db-id)
+       "/checkpoints/" task-id "/" (js/encodeURIComponent token)))
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
@@ -518,6 +524,201 @@
                                           (fn [_]
                                             (cas-head! e db-id (:cid manifest)
                                                        etag)))))))))))))))))))))
+
+(defn get-compaction-lease!
+  "Read and validate the mutable per-database compaction lease."
+  [e db-id]
+  (if-let [bucket (env e "MERKLE_BUCKET")]
+    (-> (.get bucket (compaction-lease-key e db-id))
+        (.then
+         (fn [object]
+           (if object
+             (-> (.text object)
+                 (.then
+                  (fn [value]
+                    {:lease (compaction/validate-lease-node
+                             (js->clj (js/JSON.parse value)))
+                     :etag (gobj/get object "etag")})))
+             {:lease nil :etag nil}))))
+    (js/Promise.reject
+     (js/Error. "Compaction scheduler currently requires an R2 binding"))))
+
+(defn compaction-pressure!
+  "Inspect a bounded newest-first window. Scheduling is warranted when either
+  the manifest backlog reaches MIN-MANIFESTS or an index reaches L0-THRESHOLD."
+  [e head-cid min-manifests l0-threshold]
+  (when-not (and (pos-int? min-manifests) (pos-int? l0-threshold))
+    (throw (ex-info "Compaction pressure thresholds must be positive"
+                    {:min-manifests min-manifests :l0-threshold l0-threshold})))
+  (-> (manifest-window! e head-cid min-manifests)
+      (.then
+       (fn [{:keys [manifests tail]}]
+         (let [l0-count (reduce
+                         +
+                         (for [{:keys [node]} manifests
+                               index lsm/indexes]
+                           (count (get-in node ["indexes" (name index) "l0"]))))
+               manifest-count (count manifests)]
+           {:needed? (or (>= manifest-count min-manifests)
+                         (>= l0-count l0-threshold))
+            :manifest-count manifest-count
+            :l0-count l0-count
+            :tail? (boolean tail)})))))
+
+(defn claim-compaction-lease!
+  "Claim one deterministic head task using R2 ETag CAS. An active lease is
+  never stolen; an expired/completed lease increments attempt and may be
+  reclaimed. TOKEN and NOW-MS are injectable for tests and external schedulers."
+  [e {:keys [db-id owner window-size target-run-rows lease-ms now-ms token
+             min-manifests l0-threshold]
+      :or {window-size 64 target-run-rows 4096 lease-ms 60000
+           min-manifests 8 l0-threshold 4}}]
+  (let [now-ms (or now-ms (js/Date.now))
+        token (or token (str (random-uuid)))]
+    (when-not (and (string? db-id) (seq db-id)
+                   (string? owner) (seq owner) (pos-int? lease-ms))
+      (throw (ex-info "Compaction claim requires db-id, owner, and positive lease-ms"
+                      {:db-id db-id :owner owner :lease-ms lease-ms})))
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (get-head e db-id)
+          (.then
+           (fn [{expected-head :value}]
+             (if-not expected-head
+               {:claimed? false :reason :no-head}
+               (-> (compaction-pressure! e expected-head min-manifests l0-threshold)
+                   (.then
+                    (fn [{:keys [needed?] :as pressure}]
+                      (if-not needed?
+                        (assoc pressure :claimed? false :reason :no-pressure)
+                        (-> (get-compaction-lease! e db-id)
+                            (.then
+                             (fn [{current :lease :keys [etag]}]
+                               (if (and current
+                                        (compaction/lease-active? current now-ms))
+                                 {:claimed? false :reason :leased
+                                  :owner (get current "owner")
+                                  :expires-at (get current "expires-at")}
+                                 (let [task (compaction/scheduler-task
+                                             {:db-id db-id
+                                              :expected-head expected-head
+                                              :window-size window-size
+                                              :target-run-rows target-run-rows})
+                                       lease (compaction/lease-node
+                                              {:task task :owner owner :token token
+                                               :attempt (inc (or (get current "attempt") 0))
+                                               :acquired-at now-ms
+                                               :expires-at (+ now-ms lease-ms)})
+                                       condition (if etag
+                                                   #js {:etagMatches etag}
+                                                   #js {:etagDoesNotMatch "*"})]
+                                   (-> (.put bucket (compaction-lease-key e db-id)
+                                             (js/JSON.stringify (clj->js lease))
+                                             #js {:onlyIf condition})
+                                       (.then
+                                        (fn [result]
+                                          (if result
+                                            {:claimed? true
+                                             :task task
+                                             :lease lease
+                                             :pressure pressure
+                                             :lease-etag (gobj/get result "etag")}
+                                            {:claimed? false
+                                             :reason :cas-lost})))))))))))))))))
+      (js/Promise.reject
+       (js/Error. "Compaction scheduler currently requires an R2 binding")))))
+
+(defn renew-compaction-lease!
+  "Extend a running lease with ETag fencing. A stale worker receives won? false."
+  [e lease etag lease-ms now-ms]
+  (when-not (and (pos-int? lease-ms) (integer? now-ms))
+    (throw (ex-info "Lease renewal requires positive lease-ms and integer now-ms"
+                    {:lease-ms lease-ms :now-ms now-ms})))
+  (let [lease (compaction/validate-lease-node lease)
+        _ (when-not (= "running" (get lease "status"))
+            (throw (ex-info "Only a running compaction lease may be renewed"
+                            {:status (get lease "status")})))
+        new-expiry (+ now-ms lease-ms)
+        _ (when (<= new-expiry (get lease "expires-at"))
+            (throw (ex-info "Lease renewal must extend expiry"
+                            {:current (get lease "expires-at")
+                             :requested new-expiry})))
+        renewed (assoc lease "expires-at" new-expiry)]
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (.put bucket (compaction-lease-key e (get lease "db-id"))
+                (js/JSON.stringify (clj->js renewed))
+                #js {:onlyIf #js {:etagMatches etag}})
+          (.then (fn [result]
+                   {:won? (boolean result)
+                    :lease (when result renewed)
+                    :etag (when result (gobj/get result "etag"))})))
+      (js/Promise.reject
+       (js/Error. "Compaction scheduler currently requires an R2 binding")))))
+
+(defn- finish-compaction-task!
+  [e {:keys [task lease lease-etag]} outcome completed-at]
+  (let [db-id (get lease "db-id")
+        token (get lease "token")
+        checkpoint {"format" "kotobase/compaction-checkpoint"
+                    "version" 1
+                    "task-id" (:id task)
+                    "db-id" db-id
+                    "expected-head" (get lease "expected-head")
+                    "token" token
+                    "attempt" (get lease "attempt")
+                    "outcome" (name outcome)
+                    "completed-at" completed-at}
+        terminal (assoc lease "status" (if (= outcome :error) "failed" "completed"))]
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (.put bucket (compaction-checkpoint-key e db-id (:id task) token)
+                (js/JSON.stringify (clj->js checkpoint))
+                #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+          (.then
+           (fn [_]
+             (-> (.put bucket (compaction-lease-key e db-id)
+                       (js/JSON.stringify (clj->js terminal))
+                       #js {:onlyIf #js {:etagMatches lease-etag}})
+                 (.then (fn [result]
+                          {:task-id (:id task) :outcome outcome
+                           :checkpoint checkpoint
+                           :lease-fenced? (not (boolean result))}))))))
+      (js/Promise.reject
+       (js/Error. "Compaction scheduler currently requires an R2 binding")))))
+
+(defn run-compaction-once!
+  "Claim, execute, checkpoint, and terminally fence one database compaction.
+  HeadCAS remains the publication authority; lease loss cannot publish stale
+  output, and every attempt writes an immutable token-scoped checkpoint."
+  [e opts]
+  (-> (claim-compaction-lease! e opts)
+      (.then
+       (fn [{:keys [claimed? task lease] :as claim}]
+         (if-not claimed?
+           claim
+           (-> (get-head e (get lease "db-id"))
+               (.then
+                (fn [{current :value}]
+                  (if (not= current (get lease "expected-head"))
+                    (finish-compaction-task! e claim :stale-head (js/Date.now))
+                    (-> (compact-head! e (get lease "db-id")
+                                       (get-in task [:node "window-size"])
+                                       (get-in task [:node "target-run-rows"]))
+                        (.then #(finish-compaction-task!
+                                 e claim (if % :published :cas-lost) (js/Date.now)))))))
+               (.catch (fn [_]
+                         (finish-compaction-task! e claim :error (js/Date.now))))))))))
+
+(defn run-compaction-batch!
+  "Run database compactions in deterministic bounded batches."
+  [e database-opts max-concurrency]
+  (reduce
+   (fn [result batch]
+     (.then result
+            (fn [completed]
+              (-> (js/Promise.all
+                   (clj->js (mapv #(run-compaction-once! e %) batch)))
+                  (.then #(into completed (array-seq %)))))))
+   (js/Promise.resolve [])
+   (compaction/bounded-batches max-concurrency database-opts)))
 
 (defn reachable-cids!
   "Walk decoded IPLD links from ROOT-CID and return a Promise<set<CID>>."

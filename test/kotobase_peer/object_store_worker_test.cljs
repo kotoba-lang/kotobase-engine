@@ -1,6 +1,8 @@
 (ns kotobase-peer.object-store-worker-test
   (:require [cljs.test :refer [deftest is async]]
+            [clojure.string :as str]
             [ipld.core :as ipld]
+            [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.object-store.worker :as worker]
             [kotobase-peer.retention :as retention]))
 
@@ -190,4 +192,102 @@
                    (done)))
           (.catch (fn [error]
                     (is false (str "GC promise rejected: " error))
+                    (done)))))))
+
+(deftest compaction-scheduler-leases-reclaims-and-checkpoints
+  (async done
+    (let [prefix "test/"
+          manifest-1 (lsm/build-manifest {:db-id "db-a" :epoch 1})
+          manifest-2 (lsm/build-manifest {:db-id "db-a" :epoch 2
+                                          :previous (:cid manifest-1)})
+          entries (atom {(str prefix "heads/db-a")
+                         {:value (:cid manifest-2) :etag "v-head"}
+                         (str prefix "blocks/" (:cid manifest-1))
+                         {:value (:bytes manifest-1) :etag "v-m1"}
+                         (str prefix "blocks/" (:cid manifest-2))
+                         {:value (:bytes manifest-2) :etag "v-m2"}})
+          version (atom 10)
+          bucket
+          #js {:list
+               (fn [_]
+                 (js/Promise.resolve #js {:objects #js [] :truncated false}))
+               :get
+               (fn [key]
+                 (let [{:keys [value etag]} (get @entries key)]
+                   (js/Promise.resolve
+                    (when value
+                      #js {:etag etag
+                           :text (fn [] (js/Promise.resolve value))
+                           :arrayBuffer
+                           (fn []
+                             (js/Promise.resolve
+                              (if (string? value)
+                                (.-buffer (.encode (js/TextEncoder.) value))
+                                (.slice (.-buffer value)
+                                        (.-byteOffset value)
+                                        (+ (.-byteOffset value)
+                                           (.-byteLength value))))))}))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       condition (when opts (.-onlyIf opts))
+                       matches (when condition (.-etagMatches condition))
+                       absent (when condition (.-etagDoesNotMatch condition))
+                       won? (cond
+                              matches (= matches (:etag current))
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if won?
+                     (let [etag (str "v" (swap! version inc))]
+                       (swap! entries assoc key {:value value :etag etag})
+                       (js/Promise.resolve #js {:etag etag}))
+                     (js/Promise.resolve nil))))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}
+          opts {:db-id "db-a" :owner "murakumo-a" :window-size 2
+                :target-run-rows 16 :min-manifests 2 :l0-threshold 4
+                :lease-ms 100 :now-ms 1000 :token "token-a"}]
+      (-> (worker/claim-compaction-lease! env opts)
+          (.then
+           (fn [first-claim]
+             (is (:claimed? first-claim))
+             (is (= 1 (get-in first-claim [:lease "attempt"])))
+             (-> (worker/claim-compaction-lease!
+                  env (assoc opts :owner "murakumo-b" :now-ms 1001 :token "token-b"))
+                 (.then (fn [contender]
+                          (is (= :leased (:reason contender)))
+                          (worker/renew-compaction-lease!
+                           env (:lease first-claim) (:lease-etag first-claim) 100 1050)))
+                 (.then (fn [renewed]
+                          (is (:won? renewed))
+                          (-> (worker/renew-compaction-lease!
+                               env (:lease first-claim) (:lease-etag first-claim) 200 1050)
+                              (.then (fn [stale-renewal]
+                                       (is (not (:won? stale-renewal)))
+                                       renewed))))))))
+          (.then
+           (fn [_]
+             (worker/claim-compaction-lease!
+              env (assoc opts :owner "murakumo-b" :now-ms 1150 :token "token-b"))))
+          (.then
+           (fn [reclaimed]
+             (is (:claimed? reclaimed))
+             (is (= 2 (get-in reclaimed [:lease "attempt"])))
+             (worker/run-compaction-once!
+              env (assoc opts :owner "murakumo-c" :now-ms 1250 :token "token-c"))))
+          (.then
+           (fn [result]
+             (is (= :published (:outcome result)))
+             (is (false? (:lease-fenced? result)))
+             (is (not= (:cid manifest-2)
+                       (:value (get @entries (str prefix "heads/db-a")))))
+             (is (some #(str/includes? % "/checkpoints/") (keys @entries)))
+             (worker/claim-compaction-lease!
+              env (assoc opts :owner "murakumo-d" :now-ms 1400 :token "token-d"))))
+          (.then
+           (fn [idle]
+             (is (= :no-pressure (:reason idle))
+                 "a compacted head is not scheduled forever")
+             (done)))
+          (.catch (fn [error]
+                    (is false (str "scheduler promise rejected: " error))
                     (done)))))))

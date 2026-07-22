@@ -75,6 +75,92 @@
          :l0-count l0-count}))))
 
 ;; ============================================================================
+;; Production scheduler state
+;; ============================================================================
+
+(defn scheduler-task
+  "Build a deterministic task identity. CREATED-AT and worker identity are
+  intentionally excluded: retrying the same head and bounds yields one task
+  CID and therefore one idempotency domain."
+  [{:keys [db-id expected-head window-size target-run-rows]
+    :or {window-size 64 target-run-rows 4096}}]
+  (when-not (and (string? db-id) (seq db-id)
+                 (string? expected-head) (seq expected-head))
+    (throw (ex-info "Compaction task requires db-id and expected head"
+                    {:db-id db-id :expected-head expected-head})))
+  (when-not (and (pos-int? window-size) (pos-int? target-run-rows))
+    (throw (ex-info "Compaction bounds must be positive"
+                    {:window-size window-size :target-run-rows target-run-rows})))
+  (let [node {"format" "kotobase/compaction-task"
+              "version" 1
+              "db-id" db-id
+              "expected-head" expected-head
+              "window-size" window-size
+              "target-run-rows" target-run-rows}
+        bytes (ipld/encode node)]
+    {:id (ipld/cid bytes) :node node :bytes bytes}))
+
+(defn lease-node
+  "Construct the mutable lease value. TOKEN is a host-generated fencing token;
+  ATTEMPT monotonically increases when an expired task is reclaimed."
+  [{:keys [task owner token attempt acquired-at expires-at status]
+    :or {attempt 1 status :running}}]
+  (when-not (and task (:id task) (string? owner) (seq owner)
+                 (string? token) (seq token)
+                 (pos-int? attempt)
+                 (integer? acquired-at) (integer? expires-at)
+                 (> expires-at acquired-at))
+    (throw (ex-info "Invalid compaction lease"
+                    {:owner owner :token token :attempt attempt
+                     :acquired-at acquired-at :expires-at expires-at})))
+  {"format" "kotobase/compaction-lease"
+   "version" 1
+   "task-id" (:id task)
+   "db-id" (get-in task [:node "db-id"])
+   "expected-head" (get-in task [:node "expected-head"])
+   "owner" owner
+   "token" token
+   "attempt" attempt
+   "acquired-at" acquired-at
+   "expires-at" expires-at
+   "status" (name status)})
+
+(defn lease-active? [lease now-ms]
+  (and (= "running" (get lease "status"))
+       (> (get lease "expires-at" 0) now-ms)))
+
+(defn validate-lease-node
+  "Fail closed on malformed mutable scheduler state."
+  [lease]
+  (when-not (and (= "kotobase/compaction-lease" (get lease "format"))
+                 (= 1 (get lease "version"))
+                 (string? (get lease "task-id"))
+                 (string? (get lease "db-id"))
+                 (string? (get lease "expected-head"))
+                 (string? (get lease "owner"))
+                 (string? (get lease "token"))
+                 (pos-int? (get lease "attempt"))
+                 (integer? (get lease "acquired-at"))
+                 (integer? (get lease "expires-at"))
+                 (> (get lease "expires-at") (get lease "acquired-at"))
+                 (contains? #{"running" "completed" "failed"}
+                            (get lease "status")))
+    (throw (ex-info "Malformed compaction lease" {:lease lease})))
+  lease)
+
+(defn reclaimable? [lease now-ms]
+  (or (nil? lease) (not (lease-active? lease now-ms))))
+
+(defn bounded-batches
+  "Deterministically partition task inputs so a host never starts more than
+  MAX-CONCURRENCY compactions at once."
+  [max-concurrency values]
+  (when-not (pos-int? max-concurrency)
+    (throw (ex-info "max-concurrency must be positive"
+                    {:max-concurrency max-concurrency})))
+  (mapv vec (partition-all max-concurrency values)))
+
+;; ============================================================================
 ;; Level-based Compaction
 ;; ============================================================================
 

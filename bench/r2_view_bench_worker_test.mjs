@@ -188,4 +188,26 @@ assert.deepEqual({heads: gcResult.heads, reachable: gcResult.reachable,
                   deleted: 1, liveAfter: 4, orphanExistsAfter: false});
 assert.equal(gcObjects.size, 0, "GC drill objects and heads are deleted in finally");
 
-console.log(JSON.stringify({ tests: 18, assertions: 55, outcome: "succeeded" }));
+const schedulerResponse = await worker.fetch(new Request(`${origin}/bench/compaction-lease`, {
+  method: "POST", headers: {Authorization: "Bearer gc-capability"},
+}), gcEnv);
+assert.equal(schedulerResponse.status, 200);
+const schedulerResult = await schedulerResponse.json();
+assert.deepEqual({firstClaimed: schedulerResult.firstClaimed,
+                  contenderFenced: schedulerResult.contenderFenced,
+                  renewed: schedulerResult.renewed,
+                  staleRenewalFenced: schedulerResult.staleRenewalFenced,
+                  reclaimed: schedulerResult.reclaimed,
+                  reclaimAttempt: schedulerResult.reclaimAttempt,
+                  checkpointed: schedulerResult.checkpointed,
+                  staleFinishFenced: schedulerResult.staleFinishFenced,
+                  completed: schedulerResult.completed,
+                  finalOwner: schedulerResult.finalOwner,
+                  finalStatus: schedulerResult.finalStatus},
+                 {firstClaimed: true, contenderFenced: true, renewed: true,
+                  staleRenewalFenced: true, reclaimed: true, reclaimAttempt: 2,
+                  checkpointed: true, staleFinishFenced: true, completed: true,
+                  finalOwner: "murakumo-b", finalStatus: "completed"});
+assert.equal(gcObjects.size, 0, "scheduler drill objects are deleted in finally");
+
+console.log(JSON.stringify({ tests: 19, assertions: 58, outcome: "succeeded" }));
