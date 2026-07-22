@@ -154,7 +154,8 @@
   granularity. The result contains one :object/put for the packed bytes and one
   :block/put for the small query bundle."
   [{:keys [view-id epoch entries block-rows source-manifest plan-cid sorted?
-           previous-bundle mode key-id encrypt-block-fn]
+           previous-bundle mode key-id encrypt-block-fn query-statistics
+           statistics-scope]
     :or {block-rows 512}}]
   (when-not (and (integer? epoch) (not (neg? epoch)))
     (throw (ex-info "View epoch must be a non-negative integer" {:epoch epoch})))
@@ -165,6 +166,14 @@
                     {:key-id key-id})))
   (when (and key-id (not (string? key-id)))
     (throw (ex-info "View encryption key-id must be a string" {:key-id key-id})))
+  (when (and query-statistics (not (string? statistics-scope)))
+    (throw (ex-info "Query statistics require a string visibility scope"
+                    {:statistics-scope statistics-scope})))
+  (doseq [{:keys [pattern rows]} query-statistics]
+    (when-not (and (vector? pattern) (= 3 (count pattern))
+                   (integer? rows) (not (neg? rows)))
+      (throw (ex-info "Query statistic requires a triple pattern and non-negative rows"
+                      {:pattern pattern :rows rows}))))
   (let [row-seq (map (fn [{:keys [key value op] :or {op :assert}}]
                        (when-not (string? key)
                          (throw (ex-info "View key must be a string" {:key key})))
@@ -220,6 +229,14 @@
                       "blocks" descriptors}
                       source-manifest (assoc "source-manifest" (ipld/link source-manifest))
                       plan-cid (assoc "plan-cid" (ipld/link plan-cid))
+                      query-statistics
+                      (assoc "query-statistics"
+                             {"visibility-scope" statistics-scope
+                              "clauses" (->> query-statistics
+                                             (map (fn [{:keys [pattern rows]}]
+                                                    {"pattern" pattern "rows" rows}))
+                                             (sort-by #(pr-str (get % "pattern")))
+                                             vec)})
                       previous-bundle (assoc "previous-bundle" (ipld/link previous-bundle)))
         bundle-bytes (ipld/encode bundle-node)
         bundle-cid (ipld/cid bundle-bytes)]
@@ -237,7 +254,8 @@
   "Build one incremental materialized-view L0 pack. CHANGES are
   {:key string :value value :op :assert|:retract}. The previous bundle link
   pins the older view generation; newest-first merge applies tombstones."
-  [{:keys [view-id epoch changes previous-bundle block-rows source-manifest plan-cid]}]
+  [{:keys [view-id epoch changes previous-bundle block-rows source-manifest plan-cid
+           query-statistics statistics-scope]}]
   (when-not previous-bundle
     (throw (ex-info "View delta requires a previous bundle CID" {})))
   (doseq [{:keys [op]} changes]
@@ -246,19 +264,23 @@
   (build-view {:view-id view-id :epoch epoch :entries changes
                :block-rows (or block-rows 512)
                :source-manifest source-manifest :plan-cid plan-cid
+               :query-statistics query-statistics :statistics-scope statistics-scope
                :previous-bundle previous-bundle :mode :delta}))
 
 (defn build-datom-projection
   "Bridge the peer's existing RisingWave-style `view-rows` result into a
   browser-addressable packed view. Retractions are absent from current-state
   projections; callers pass the pinned source manifest/epoch explicitly."
-  [{:keys [view-id epoch rows block-rows source-manifest plan-cid]}]
+  [{:keys [view-id epoch rows block-rows source-manifest plan-cid
+           query-statistics statistics-scope]}]
   (build-view
    {:view-id view-id
     :epoch epoch
     :block-rows (or block-rows 512)
     :source-manifest source-manifest
     :plan-cid plan-cid
+    :query-statistics query-statistics
+    :statistics-scope statistics-scope
     :entries (keep (fn [{:keys [e a v_edn added] :or {added true}}]
                      (when added
                        {:key (view-key [e a])

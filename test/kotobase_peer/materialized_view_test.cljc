@@ -42,6 +42,26 @@
     (is (= (:pack-cid a) (ipld/link-cid (get bundle "pack-cid"))))
     (is (= [:object/put :block/put] (mapv :effect/type (:effects a))))))
 
+(deftest query-statistics-are-deterministic-scoped-bundle-metadata
+  (let [statistics [{:pattern [nil "name" nil] :rows 101}
+                    {:pattern [nil "role" "admin"] :rows 1}]
+        built (view/build-view {:view-id :entities :epoch 1 :entries (entries 2)
+                                :statistics-scope "tenant-a/public-v1"
+                                :query-statistics (reverse statistics)})
+        rebuilt (view/build-view {:view-id :entities :epoch 1 :entries (entries 2)
+                                  :statistics-scope "tenant-a/public-v1"
+                                  :query-statistics statistics})
+        bundled (get-in built [:bundle :node "query-statistics"])]
+    (is (= (get-in built [:bundle :cid]) (get-in rebuilt [:bundle :cid])))
+    (is (= "tenant-a/public-v1" (get bundled "visibility-scope")))
+    (is (= [101 1] (mapv #(get % "rows") (get bundled "clauses"))))))
+
+(deftest query-statistics-require-an-explicit-visibility-scope
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (view/build-view {:view-id :entities :epoch 1 :entries (entries 1)
+                                 :query-statistics [{:pattern [nil nil nil]
+                                                     :rows 1}]}))))
+
 (deftest bounded-query-fetches-only-overlapping-blocks
   (let [built (view/build-view {:view-id :posts/by-time :epoch 7
                                 :block-rows 100 :entries (entries 1000)})

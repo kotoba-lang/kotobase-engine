@@ -572,6 +572,17 @@
 (defn- reorderable-triple? [clause]
   (and (vector? clause) (= 3 (count clause))))
 
+(defn- supplied-cardinality [query-statistics statistics-scope pattern]
+  (let [scope (or (get query-statistics "visibility-scope")
+                  (:visibility-scope query-statistics))
+        clauses (or (get query-statistics "clauses")
+                    (:clauses query-statistics))]
+    (when (= statistics-scope scope)
+      (some (fn [statistic]
+              (when (= pattern (or (get statistic "pattern") (:pattern statistic)))
+                (or (get statistic "rows") (:rows statistic))))
+            clauses))))
+
 (defn datalog-query-plan
   "Compile a safe cost-ordered plan for a plain conjunctive Datalog query.
    Positive triple clauses commute, so their visible cardinalities can drive
@@ -583,6 +594,8 @@
      (if (every? reorderable-triple? where)
        (let [input-vars (vec (remove #{'$} (or (:in query) [])))
              input-bindings (into {} (map vector input-vars inputs))
+             query-statistics (:query-statistics query)
+             statistics-scope (:statistics-scope query)
              clauses (mapv (fn [id clause]
                              (let [pattern (mapv (fn [term]
                                                    (cond
@@ -590,11 +603,18 @@
                                                      (contains? input-bindings term) (get input-bindings term)
                                                      (datalog-var? term) nil
                                                      :else term))
-                                                 clause)]
+                                                 clause)
+                                   supplied (supplied-cardinality query-statistics
+                                                                  statistics-scope pattern)]
                                {:id id
                                 :clause clause
                                 :vars (into #{} (filter datalog-var?) clause)
-                                :estimated-rows (count (kqe/query db pattern visible?))}))
+                                :estimated-rows (if (some? supplied)
+                                                  supplied
+                                                  (count (kqe/query db pattern visible?)))
+                                :estimate-source (if (some? supplied)
+                                                   :materialized-statistics
+                                                   :visible-scan)}))
                            (range) where)
              plan (stats/plan-clause-order clauses)]
          {:query (assoc query :where (mapv :clause plan))

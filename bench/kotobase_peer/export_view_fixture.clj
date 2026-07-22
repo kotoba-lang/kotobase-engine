@@ -46,6 +46,11 @@
                        (range 1000))))
         built (view/build-view (cond-> {:view-id :browser/e2e :epoch 1
                                         :entries entries :sorted? true :block-rows 100}
+                                 true (assoc :statistics-scope "tenant-a/benchmark-v1"
+                                             :query-statistics
+                                             [{:pattern [nil "post-author/window" nil] :rows 20}
+                                              {:pattern [nil "author/name" nil] :rows 100}
+                                              {:pattern [nil "post/title" nil] :rows 1000}])
                                  encrypted? (assoc :key-id key-id
                                                    :encrypt-block-fn
                                                    (aes-gcm-encrypt fixture-key))))
