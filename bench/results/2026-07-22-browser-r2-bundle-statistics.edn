@@ -1,0 +1,32 @@
+{:date "2026-07-22"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e/bundle-stats-v1"
+ :worker-version "baf41a8e-39ad-4902-9b5e-af24f5b86563"
+ :asset-version "bundle-stats-v1"
+ :backend :cloudflare-r2
+ :fixture {:rows 2100
+           :pack-cid "bafyreiceomjfxm2ew3tftlsjr6sak5gzhjgitkiap4skr6tjcn73eav5ai"
+           :pack-bytes 148676
+           :bundle-cid "bafyreiah6vcxx4hatnq66ingvubhbdmfi4xyv2jxcmhqvaqml7ktyz23ue"
+           :bundle-bytes 10279
+           :previous-bundle-bytes 10114
+           :statistics-overhead-bytes 165}
+ :statistics {:visibility-scope "tenant-a/benchmark-v1"
+              :estimates {:edges 20 :authors 100 :posts 1000}
+              :order [:edges :authors :posts]}
+ :planner-benchmark {:runtime :jvm :entities 10000 :samples 30
+                     :visible-scan {:p50-ms 59.78575 :p95-ms 203.495583}
+                     :materialized-statistics {:p50-ms 0.077625 :p95-ms 0.316833}}
+ :join {:kind :materialized-statistics-three-clause
+        :samples 10 :rows 20 :requests 3 :range-bytes 21276
+        :cold {:p50-ms 111.1 :p95-ms 128.0 :p99-ms 128.0
+               :min-ms 102.8 :max-ms 151.5}}
+ :security {:encryption "AES-256-GCM"
+            :key-ids ["tenant-a/dek-v2"]
+            :plaintext-cid-verified? true
+            :scope-match-required? true}
+ :tests {:clj {:tests 176 :assertions 457}
+         :cljs {:tests 170 :assertions 451}
+         :gateway {:tests 14 :assertions 43}
+         :lint-errors 0}
+ :console-errors []
+ :outcome :succeeded}

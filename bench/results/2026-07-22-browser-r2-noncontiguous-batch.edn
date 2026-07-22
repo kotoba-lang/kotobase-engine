@@ -1,0 +1,29 @@
+{:date "2026-07-22"
+ :target "https://kotobase-view-bench.04-feasts-minded.workers.dev/e2e/noncontig-v1"
+ :worker-version "30bd8e29-1cfd-47d2-bbe2-1ea22af94a6c"
+ :asset-version "noncontig-v1"
+ :backend :cloudflare-r2
+ :fixture {:rows 2100
+           :non-contiguous-author-function "(post-id * 37) mod 100"
+           :pack-cid "bafyreiceomjfxm2ew3tftlsjr6sak5gzhjgitkiap4skr6tjcn73eav5ai"
+           :pack-bytes 148676
+           :bundle-cid "bafyreihg2cnlutee3f463wbbghrccs5bxcrxd3s3s5sy52exbs4qdlrjli"
+           :bundle-bytes 10114}
+ :planner {:name :batch-point-query-plan
+           :steps [:exact-sparse-seek :bloom-filter :block-deduplicate
+                   :adjacent-range-coalesce :requested-key-filter]
+           :portable [:clj :cljs]}
+ :join {:kind :non-contiguous-block-batch
+        :samples 10 :rows 20 :deduplicated-keys 20
+        :requests 2 :range-bytes 14912
+        :cold {:p50-ms 94.9 :p95-ms 169.1 :p99-ms 169.1
+               :min-ms 75.9 :max-ms 177.1}
+        :first {"post-id" 450 "author" {"id" 50 "name" "Author 50"}}}
+ :security {:encryption "AES-256-GCM"
+            :key-ids ["tenant-a/dek-v2"]
+            :plaintext-cid-verified? true}
+ :tests {:clj {:tests 169 :assertions 441}
+         :cljs {:tests 163 :assertions 435}
+         :lint-errors 0}
+ :console-errors []
+ :outcome :succeeded}

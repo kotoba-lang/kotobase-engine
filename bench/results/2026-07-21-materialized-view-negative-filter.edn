@@ -1,0 +1,22 @@
+{:schema 1
+ :date "2026-07-21"
+ :implementation "kotobase-peer.materialized-view/bloom-v1"
+ :configuration {:bits-per-key 10 :hashes 7 :scope :logical-block}
+ :workload {:rows 10000 :blocks 20 :block-rows 512
+            :exact-miss-samples 1000}
+ :bundle {:bytes-with-filter 16484
+          :bytes-before-filter 2784}
+ :exact-miss
+ {:zero-request-count 984
+  :zero-request-ratio 0.984
+  :false-positive-requests 16
+  :observed-false-positive-ratio 0.016
+  :planner-p50-ms 0.030042
+  :planner-p95-ms 0.115958
+  :planner-p99-ms 21.041334
+  :planner-mean-ms 0.586154672}
+ :invariants [:no-false-negatives-in-present-key-tests
+              :missing-filter-means-possible-hit
+              :range-query-does-not-use-exact-key-filter
+              :portable-clj-cljs-hash]
+ :interpretation "The bundle grows by 13.7KB for 10k rows while 98.4% of in-range exact misses avoid a data Range GET. False positives preserve correctness."}

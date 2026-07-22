@@ -147,6 +147,10 @@ older than a caller-supplied grace period.
 
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
+Run `clojure -M:view-bench 100000 512` for the browser/no-local-disk serving
+gate. It builds an immutable materialized-view pack, then executes deterministic
+point and bounded-range queries through the same sparse-index selection, byte
+range slicing, block-CID verification, and decode path used by a browser host.
 `npm run ci:local` is the canonical JVM/lint/CLJS/benchmark pre-push gate; CI
 execution does not depend on GitHub Actions.
 
@@ -161,7 +165,120 @@ execution does not depend on GitHub Actions.
 - `visible-rows`, a snapshot-epoch MVCC multi-run merge; and
 - `compact-runs`, which retains all versions newer than safe epoch plus the
   newest boundary version, preserving every snapshot at/above that epoch while
-  pruning older shadowed versions.
+  pruning older shadowed versions; and
+- `kotobase-peer.materialized-view`, which packs independently addressed view
+  blocks into a large immutable object and publishes a small query-bundle CID
+  containing sparse min/max keys and byte offsets. A browser query binary-seeks
+  that bundle and emits bounded `:object/range-get` effects; it never needs the
+  full view or a persistent local database. The Worker adapter interprets these
+  effects using native R2 or standard S3 HTTP Range requests without KV.
+
+Materialized views are derived acceleration data, not a second authority. Their
+bundle records the source manifest/epoch and optional plan CID; canonical datoms
+remain authoritative and a view can be discarded and rebuilt. Physical packed
+objects and logical block CIDs intentionally have different granularity, while
+every returned range is verified against its logical block CID before decode.
+`build-view-delta` appends an epoch pack linked to the previous bundle;
+`query-packed-chain` applies newest-key-wins assertions/retraction tombstones,
+and `compact-packed-chain` deterministically collapses a bounded chain back to
+one base pack. Run `clojure -M:view-delta-bench 10000 1000 512` for this gate.
+Adjacent selected blocks are coalesced into bounded (default 1 MiB) object
+ranges. The response is split back into logical blocks and every CID is still
+verified independently, reducing request amplification without weakening IPLD
+integrity.
+Each block descriptor also carries a deterministic CLJ/CLJS Bloom filter (10
+bits/key, 7 hashes). Exact negative lookups can therefore complete from the
+small query bundle with zero data-object requests. Missing/legacy filters and
+false positives always fall back to a verified block read; range scans do not
+apply an exact-key filter.
+
+`wrangler.view-bench.jsonc` deploys a fixed-object verification gateway for the
+browser gate. It exposes only single ranges up to 1 MiB and returns standard
+HTTP `206`, `Content-Range`, `ETag`, CORS, and
+`Cache-Control: public, max-age=31536000, immutable`. It does not use KV or the
+Cloudflare Cache API; ordinary browser/CDN HTTP caches are optional host
+acceleration. Run `npm run test:r2-gateway` for its contract test.
+
+`npm run build:view-e2e` compiles the CLJS query executor served at `/e2e`.
+That page downloads and verifies the query-bundle CID, decodes DAG-CBOR, plans
+from sparse metadata and Bloom filters, fetches one bounded R2 byte range,
+verifies the selected block CID, decodes its rows, and renders the result. The
+2026-07-21 real-browser R2 gate returned `tenant-a/000000500` in one 6,348-byte
+range request: 207.3 ms on the first navigation and 27.3–29.5 ms total across
+five warm reloads. The measured receipt is in
+`bench/results/2026-07-21-browser-full-query-e2e.edn`.
+
+The load gate extends that executor to repeated point and 200-row range queries
+plus five batches of eight concurrent cold point queries. Protected fixture
+routes require an `E2E_BEARER_TOKEN` Worker secret; the browser accepts the
+capability only through the URL fragment and sends it as `Authorization`, so it
+is neither committed nor sent in the page URL. Tenant responses are
+`private, immutable` and vary on authorization. See
+`bench/results/2026-07-21-browser-r2-load-auth.edn` for the real R2 receipt.
+
+Encrypted views keep plaintext logical block CIDs separate from ciphertext
+storage CIDs. Each bundle descriptor carries its key ID, algorithm, nonce,
+plaintext length, and ciphertext range. The browser retrieves a DEK only
+through the authorized, no-store host endpoint, decrypts each selected block
+with WebCrypto AES-256-GCM, then resumes the pure kernel and verifies the
+plaintext IPLD CID before decode. Rotating a key therefore replaces the
+ciphertext pack and bundle while preserving logical block identity. The real
+encrypted R2/browser result is recorded in
+`bench/results/2026-07-22-browser-r2-encrypted-view.edn`.
+
+Rotation uses a keyring resolved from the immutable bundle descriptors rather
+than a client-side current-key constant. During a rollout the host may expose
+both old and new key IDs; clients fetch only IDs referenced by their pinned
+bundle. After the new pack and bundle are published and verified, the old key
+can be revoked without interrupting new queries. The v1→v2 dual-key and revoke
+drill is recorded in `bench/results/2026-07-22-browser-r2-key-rotation.edn`.
+
+The browser join gate uses an encrypted edge view as its outer bounded scan,
+deduplicates the resulting foreign keys, and turns a contiguous lookup batch
+into one inner sparse-index range. For 20 post→author results this reduces the
+naive index nested loop from 21 requests/148,786 bytes to 2 requests/14,912
+bytes while retaining AES-GCM and plaintext CID verification. See
+`bench/results/2026-07-22-browser-r2-batched-join.edn`.
+
+`batch-point-query-plan` generalizes the inner join step for non-contiguous
+keys. It resolves each exact key through sparse metadata and Bloom filters,
+deduplicates shared logical blocks, coalesces only physically adjacent selected
+blocks, and filters decoded overfetch back to the requested key set. The plan
+is pure CLJ/CLJS effect data and is reusable by browser and Datalog hosts. Its
+real encrypted R2 gate is in
+`bench/results/2026-07-22-browser-r2-noncontiguous-batch.edn`.
+
+`plan-clause-order` adds a portable greedy join-order kernel: it starts with
+the lowest estimated cardinality, then prefers clauses connected to already
+bound variables before comparing their estimated rows. The three-clause
+post-author browser gate therefore executes `edges → authors → posts`, returns
+20 joined rows with 3 bounded requests/21,276 bytes, and keeps AES-GCM plus
+plaintext CID verification. See
+`bench/results/2026-07-22-browser-r2-cost-join.edn`.
+
+The hot Datalog compiler now calls the same clause-order kernel for queries
+whose `:where` consists entirely of positive triple patterns. It estimates
+each clause through the caller's required `visible?` decision, then passes the
+reordered query to `arrangement.datalog/q`; this keeps authorization filtering
+in the planning path as well as execution. Binding-sensitive negation,
+function, rule, and `or` queries deliberately retain source order. The
+compiler plan is inspectable through `datalog-query-plan`.
+
+Query bundles may carry deterministic `query-statistics` entries scoped by an
+explicit visibility identifier. A query uses them only when its
+`:statistics-scope` matches; legacy bundles, missing patterns, and mismatched
+scopes fall back to the visibility-filtered scan estimator. On a 10,000-entity
+JVM fixture this removes planning scans (p50 59.786 ms → 0.078 ms). The real
+encrypted R2/browser receipt is
+`bench/results/2026-07-22-browser-r2-bundle-statistics.edn`.
+
+`refresh-query-statistics` advances those counts from normalized effective
+assert/retract deltas and rejects epoch regression, unknown operations, and
+cardinality underflow. Statistics carry their source epoch; callers may set
+`:query-epoch` and `:max-statistics-age`, with stale or future metadata falling
+back to visible scans. Refreshing 10,000 deltas across three clauses measured
+p50 24.87 ms on the JVM. The epoch-pinned R2/browser receipt is
+`bench/results/2026-07-22-browser-r2-statistics-refresh.edn`.
 
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and

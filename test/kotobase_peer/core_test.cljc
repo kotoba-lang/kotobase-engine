@@ -310,6 +310,71 @@
                                    [?s "name" ?name]]}
                       everything)))))
 
+(deftest query-plans-selective-connected-triples-before-broad-clauses
+  (let [db (eng/transact
+            (eng/empty-db)
+            (concat [{:s "alice" :p "role" :o "admin"}
+                     {:s "alice" :p "name" :o "Alice"}]
+                    (mapcat (fn [i]
+                              [{:s (str "user-" i) :p "role" :o "user"}
+                               {:s (str "user-" i) :p "name" :o (str "User " i)}])
+                            (range 100))))
+        everything (constantly true)
+        query {:find '[?name]
+               :where '[[?s "name" ?name]
+                        [?s "role" "admin"]]}
+        plan (eng/datalog-query-plan db query everything)]
+    (is (:optimized? plan))
+    (is (= '[[?s "role" "admin"] [?s "name" ?name]]
+           (get-in plan [:query :where])))
+    (is (= [1 0] (mapv :id (:plan plan))))
+    (is (= #{["Alice"]} (eng/query db query everything)))))
+
+(deftest query-plan-preserves-order-for-binding-sensitive-forms
+  (let [db (eng/empty-db)
+        query {:find '[?s]
+               :where '[[?s "age" ?age] [(> ?age 18)]]}
+        plan (eng/datalog-query-plan db query (constantly true))]
+    (is (false? (:optimized? plan)))
+    (is (= (:where query) (get-in plan [:query :where])))))
+
+(deftest query-plan-consumes-scoped-materialized-statistics-without-scanning
+  (let [visibility-calls (atom 0)
+        visible? (fn [_] (swap! visibility-calls inc) true)
+        query {:find '[?name]
+               :where '[[?s "name" ?name] [?s "role" "admin"]]
+               :statistics-scope "tenant-a/public-v1"
+               :query-epoch 7
+               :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "epoch" 7
+                                  "clauses" [{"pattern" [nil "name" nil] "rows" 101}
+                                             {"pattern" [nil "role" "admin"] "rows" 1}]}}
+        plan (eng/datalog-query-plan (eng/empty-db) query visible?)]
+    (is (= [1 0] (mapv :id (:plan plan))))
+    (is (= [:materialized-statistics :materialized-statistics]
+           (mapv :estimate-source (:plan plan))))
+    (is (zero? @visibility-calls))))
+
+(deftest query-plan-rejects-statistics-from-another-visibility-scope
+  (let [query {:find '[?s]
+               :where '[[?s "role" "admin"]]
+               :statistics-scope "tenant-b/private-v1"
+               :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "clauses" [{"pattern" [nil "role" "admin"] "rows" 1}]}}
+        plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
+    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+
+(deftest query-plan-falls-back-when-materialized-statistics-are-stale
+  (let [query {:find '[?s] :where '[[?s "role" "admin"]]
+               :statistics-scope "tenant-a/public-v1"
+               :query-epoch 9 :max-statistics-age 1
+               :query-statistics {"visibility-scope" "tenant-a/public-v1"
+                                  "epoch" 7
+                                  "clauses" [{"pattern" [nil "role" "admin"]
+                                              "rows" 1}]}}
+        plan (eng/datalog-query-plan (eng/empty-db) query (constantly true))]
+    (is (= :visible-scan (-> plan :plan first :estimate-source)))))
+
 (deftest query-visible-is-required
   (let [db (eng/transact (eng/empty-db) [{:s "alice" :p "role" :o "admin"}])]
     (is (thrown? #?(:clj clojure.lang.ArityException :cljs js/Error)

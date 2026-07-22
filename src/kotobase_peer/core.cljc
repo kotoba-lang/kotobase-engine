@@ -50,7 +50,8 @@
             [arrangement.query :as kqe]
             [arrangement.datalog :as datalog]
             [chain.core :as cd]
-            [datom.core :as dc]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
+            [datom.core :as dc]
+            [kotobase-peer.statistics :as stats]))   ; canonical datom model (kotoba : kotobase = Clojure : Datomic)
 
 (defn- verified-node [get-fn expected-cid]
   (when-let [bytes (get-fn expected-cid)]
@@ -565,6 +566,73 @@
   [db pattern visible?]
   (kqe/query db pattern visible?))
 
+(defn- datalog-var? [x]
+  (and (symbol? x) (str/starts-with? (name x) "?")))
+
+(defn- reorderable-triple? [clause]
+  (and (vector? clause) (= 3 (count clause))))
+
+(defn- supplied-cardinality [query-statistics statistics-scope query-epoch
+                             max-statistics-age pattern]
+  (let [scope (or (get query-statistics "visibility-scope")
+                  (:visibility-scope query-statistics))
+        statistics-epoch (or (get query-statistics "epoch")
+                             (:epoch query-statistics))
+        clauses (or (get query-statistics "clauses")
+                    (:clauses query-statistics))]
+    (when (and (= statistics-scope scope)
+               (stats/query-statistics-fresh? statistics-epoch query-epoch
+                                                max-statistics-age))
+      (some (fn [statistic]
+              (when (= pattern (or (get statistic "pattern") (:pattern statistic)))
+                (or (get statistic "rows") (:rows statistic))))
+            clauses))))
+
+(defn datalog-query-plan
+  "Compile a safe cost-ordered plan for a plain conjunctive Datalog query.
+   Positive triple clauses commute, so their visible cardinalities can drive
+   `plan-clause-order`. Queries containing negation, functions, rules, or `or`
+   retain source order because those forms have binding/safety semantics."
+  ([db query visible?] (datalog-query-plan db query visible? []))
+  ([db query visible? inputs]
+   (let [where (:where query)]
+     (if (every? reorderable-triple? where)
+       (let [input-vars (vec (remove #{'$} (or (:in query) [])))
+             input-bindings (into {} (map vector input-vars inputs))
+             query-statistics (:query-statistics query)
+             statistics-scope (:statistics-scope query)
+             query-epoch (:query-epoch query)
+             max-statistics-age (:max-statistics-age query 0)
+             clauses (mapv (fn [id clause]
+                             (let [pattern (mapv (fn [term]
+                                                   (cond
+                                                     (= term '_) nil
+                                                     (contains? input-bindings term) (get input-bindings term)
+                                                     (datalog-var? term) nil
+                                                     :else term))
+                                                 clause)
+                                   supplied (supplied-cardinality query-statistics
+                                                                  statistics-scope query-epoch
+                                                                  max-statistics-age pattern)]
+                               {:id id
+                                :clause clause
+                                :vars (into #{} (filter datalog-var?) clause)
+                                :estimated-rows (if (some? supplied)
+                                                  supplied
+                                                  (count (kqe/query db pattern visible?)))
+                                :estimate-source (if (some? supplied)
+                                                   :materialized-statistics
+                                                   :visible-scan)}))
+                           (range) where)
+             plan (stats/plan-clause-order clauses)]
+         {:query (assoc query :where (mapv :clause plan))
+          :plan plan
+          :optimized? true})
+       {:query query
+        :plan (mapv (fn [id clause] {:id id :clause clause :step id})
+                    (range) where)
+        :optimized? false}))))
+
 (defn query
   "`datomic.api/q`-equivalent: `{:find [?var ...] :in [?param ...] :where
    [[e a v] ...] :rules [...]}` conjunctive multi-clause join over
@@ -583,8 +651,10 @@
    `or` are all safe against `visible?` (enforced in arrangement, this
    fn is a straight passthrough). Returns a set of `:find`-ordered
    vectors. `visible?` is REQUIRED, same convention as `q` above."
-  ([db find+where visible?] (datalog/q db find+where visible?))
-  ([db find+where visible? inputs] (datalog/q db find+where visible? inputs)))
+  ([db find+where visible?] (query db find+where visible? []))
+  ([db find+where visible? inputs]
+   (let [{planned-query :query} (datalog-query-plan db find+where visible? inputs)]
+     (datalog/q db planned-query visible? inputs))))
 
 ;; ── pull: a Datomic-shaped pull-pattern language over entity-attrs/refs-to ──
 ;; (one of the "3 pillars" this landing adds -- ADR-2607061200's own note
