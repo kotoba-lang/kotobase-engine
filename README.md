@@ -215,6 +215,15 @@ every returned range is verified against its logical block CID before decode.
 `query-packed-chain` applies newest-key-wins assertions/retraction tombstones,
 and `compact-packed-chain` deterministically collapses a bounded chain back to
 one base pack. Run `clojure -M:view-delta-bench 10000 1000 512` for this gate.
+
+Resumable join hosts can encode a large positive-conjunctive Datalog frontier
+with `datalog-materialization/build-frontier-work-chain`. It canonicalizes
+symbol-keyed bindings into portable DAG-CBOR, recursively splits them by an
+explicit byte budget, and links work nodes so a checkpoint needs only one CID.
+New join waves can be prepended to an existing pending chain without rewriting
+it. `decode-frontier-work` validates the format and restores ordinary Datalog
+bindings. A single binding larger than the configured budget fails closed.
+
 Adjacent selected blocks are coalesced into bounded (default 1 MiB) object
 ranges. The response is split back into logical blocks and every CID is still
 verified independently, reducing request amplification without weakening IPLD
