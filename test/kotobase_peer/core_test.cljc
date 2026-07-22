@@ -2234,6 +2234,46 @@
         (is (= [{:e "e1" :a ":a/x" :v_edn "\"v9\"" :added true}]
                (eng/datoms db' {:index :eavt :components ["e1"]} everything)))))))
 
+(deftest transact-effective-emits-only-state-transitions
+  (let [db (eng/transact (eng/empty-db)
+                         [["e1" "role" "admin"] ["e1" "name" "Alice"]])
+        result (eng/transact-effective
+                db
+                [[:db/add "e1" "role" "admin"]
+                 [:db/retract "missing" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/add "e1" "role" "user"]])]
+    (is (= [{:e "e1" :a "role" :v "admin" :op :retract}
+            {:e "e1" :a "role" :v "user" :op :assert}]
+           (:effective-deltas result)))
+    (is (= #{"user"} (get (qs/entity-attrs (:db-after result) "e1") "role")))))
+
+(deftest transact-effective-expands-entity-retraction-deterministically
+  (let [db (eng/transact (eng/empty-db)
+                         [["e1" "role" "admin"] ["e1" "name" "Alice"]])
+        result (eng/transact-effective db [[:db/retractEntity "e1"]])]
+    (is (= [{:e "e1" :a "name" :v "Alice" :op :retract}
+            {:e "e1" :a "role" :v "admin" :op :retract}]
+           (:effective-deltas result)))
+    (is (empty? (qs/entity-attrs (:db-after result) "e1")))))
+
+(deftest transact-with-statistics-refreshes-from-effective-deltas
+  (let [db (eng/transact (eng/empty-db) [["e1" "role" "admin"]])
+        statistics {:visibility-scope "tenant-a/public-v1" :epoch 4
+                    :clauses [{:pattern [nil "role" nil] :rows 1}
+                              {:pattern [nil "role" "admin"] :rows 1}]}
+        result (eng/transact-with-statistics
+                db
+                [[:db/add "e1" "role" "admin"]
+                 [:db/retract "missing" "role" "admin"]
+                 [:db/retract "e1" "role" "admin"]
+                 [:db/add "e2" "role" "user"]]
+                statistics 5)]
+    (is (= 5 (get-in result [:query-statistics :epoch])))
+    (is (= [1 0] (mapv :rows (get-in result [:query-statistics :clauses]))))
+    (is (= 2 (count (:effective-deltas result))))))
+
 #?(:clj
    (deftest commit-retraction-cancels-across-blocks-and-fold
      ;; assert in block 1 → retract in block 2 → current reads drop it, both

@@ -170,6 +170,59 @@
     :retract        (qs/retract-quad db q ref?)
     :retract-entity (retract-entity* db (:s q) ref?)))
 
+(defn- asserted? [db {:keys [s p o]}]
+  (contains? (get (qs/entity-attrs db s) p #{}) o))
+
+(defn transact-effective
+  "Apply raw TX-DATA and return only state-changing datom deltas. Duplicate
+  asserts and missing retracts emit nothing. `:retract-entity` expands the
+  entity's currently asserted triples in deterministic order."
+  ([db tx-data] (transact-effective db tx-data ipld/link?))
+  ([db tx-data ref?]
+   (reduce
+    (fn [{:keys [db-after] :as result} item]
+      (let [{:keys [s p o op] :as quad} (->quad item)
+            op (or op :assert)]
+        (case op
+          :assert
+          (if (asserted? db-after quad)
+            result
+            {:db-after (qs/assert-quad db-after quad ref?)
+             :effective-deltas (conj (:effective-deltas result)
+                                     {:e s :a p :v o :op :assert})})
+
+          :retract
+          (if-not (asserted? db-after quad)
+            result
+            {:db-after (qs/retract-quad db-after quad ref?)
+             :effective-deltas (conj (:effective-deltas result)
+                                     {:e s :a p :v o :op :retract})})
+
+          :retract-entity
+          (let [deltas (->> (qs/entity-attrs db-after s)
+                            (mapcat (fn [[attr values]]
+                                      (map (fn [value]
+                                             {:e s :a attr :v value :op :retract})
+                                           values)))
+                            (sort-by (juxt :a #(pr-str (:v %))))
+                            vec)]
+            {:db-after (retract-entity* db-after s ref?)
+             :effective-deltas (into (:effective-deltas result) deltas)}))))
+    {:db-after db :effective-deltas []}
+    tx-data)))
+
+(defn transact-with-statistics
+  "Normalize and apply TX-DATA, then refresh scoped query statistics at
+  NEW-EPOCH from the effective deltas only. Returns both immutable results."
+  ([db tx-data query-statistics new-epoch]
+   (transact-with-statistics db tx-data ipld/link? query-statistics new-epoch))
+  ([db tx-data ref? query-statistics new-epoch]
+   (let [{:keys [db-after effective-deltas]} (transact-effective db tx-data ref?)]
+     {:db-after db-after
+      :effective-deltas effective-deltas
+      :query-statistics (stats/refresh-query-statistics query-statistics
+                                                        effective-deltas new-epoch)})))
+
 (defn- retraction-filters
   "Set-based snapshot-half cancellation for `hot-datoms` (ADR-2607071610):
   which [s p o] triples / s entities do the novelty blocks retract? Order-
@@ -206,8 +259,7 @@
    migration/backfill tooling). The write path proper is `commit!`, below."
   ([db tx-data] (transact db tx-data ipld/link?))
   ([db tx-data ref?]
-   (reduce (fn [db item] (apply-quad db (->quad item) ref?))
-           db tx-data)))
+   (:db-after (transact-effective db tx-data ref?))))
 
 ;; ── schema: Datomic-style "schema is just datoms too" ───────────────────────
 ;; (one of the "3 pillars" this landing adds.) An attribute is a normal

@@ -280,6 +280,14 @@ back to visible scans. Refreshing 10,000 deltas across three clauses measured
 p50 24.87 ms on the JVM. The epoch-pinned R2/browser receipt is
 `bench/results/2026-07-22-browser-r2-statistics-refresh.edn`.
 
+`transact-effective` is the pure boundary between raw transaction requests and
+those statistics: duplicate asserts and missing/double retracts produce no
+delta, while entity retracts expand the entity's currently asserted triples in
+deterministic order. `transact-with-statistics` applies that normalized result
+and refreshes the scoped statistics at the same epoch. A 10,000-op fixture with
+9,998 no-ops produced two effective deltas in p50 10.06 ms. See
+`bench/results/2026-07-22-effective-statistics-delta.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
