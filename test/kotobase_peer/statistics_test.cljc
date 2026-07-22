@@ -76,7 +76,10 @@
           new-datoms [{:e "e1" :a :type :v "resource" :op :assert}]
           updated (statistics/maintain-materialized-delta arr new-datoms)]
       (is (:arrangement/materialized? updated))
-      (is (= 1 (count (:arrangement/delta-rows updated)))))))
+      (is (= 1 (count (:arrangement/delta-rows updated))))
+      (is (= 0 (:arrangement/epoch updated)))
+      (is (not (contains? updated :arrangement/last-updated))
+          "the pure arrangement kernel does not read wall clock state"))))
 
 (deftest m5-delta-arrangement-initialization
   (testing "delta-arrangement should create uninitialized arrangement descriptor"

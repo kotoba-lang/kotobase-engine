@@ -275,6 +275,15 @@ each current query bundle's `source-manifest`, preserves statistics/view packs,
 puts those immutable blocks first, and finally CASes a replacement publication
 root. A legacy direct VersionManifest remains a supported migration input.
 
+`datalog-materialization/refresh-plan` closes the refresh-consistency path for
+registered query views. Positive conjunctive queries use changed datoms as
+clause anchors and re-check only affected result tuples, including alternative
+join derivations and parameter inputs. Negation, aggregation, functions, and
+rules use a correctness-preserving recompute path. Every registered view must
+be supplied exactly once with an older pinned bundle; its delta bundle, scoped
+statistics, and base flush are then published at one epoch through the same
+single-HeadCAS `EpochPublication` plan.
+
 Rotation uses a keyring resolved from the immutable bundle descriptors rather
 than a client-side current-key constant. During a rollout the host may expose
 both old and new key IDs; clients fetch only IDs referenced by their pinned
