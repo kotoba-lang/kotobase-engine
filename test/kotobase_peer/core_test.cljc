@@ -917,15 +917,19 @@
                             test-encrypt-fn test-blind-fn test-decrypt-fn)))
                         nil (range 20))
            decrypts (atom 0)
+           reads (atom 0)
+           counted-get (fn [cid] (swap! reads inc) (get-fn cid))
            counting-decrypt (fn [ciphertext]
                               (swap! decrypts inc)
                               (test-decrypt-fn ciphertext))
            slice (eng/hydrate-transaction-slice
-                  get-fn head [["entity-7" "role" "user"]]
+                  counted-get head [["entity-7" "role" "user"]]
                   test-blind-fn counting-decrypt)]
        (is (= #{"user"} (get-in slice [:spo "entity-7" "role"])))
        (is (= 1 @decrypts)
-           "20 novelty nodes are classified by blind token; only the matching tx ciphertext is opened"))))
+           "20 novelty entries are classified by blind token; only the matching tx ciphertext is opened")
+       (is (<= @reads 6)
+           "20 entries fit in two metadata segments instead of requiring 20 queue-node reads"))))
 
 #?(:clj
    (deftest commit-serialized-effective-publishes-only-effective-deltas

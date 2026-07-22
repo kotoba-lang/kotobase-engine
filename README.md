@@ -314,6 +314,14 @@ writes, effective commits averaged 19.5 total block gets instead of fetching
 every novelty ciphertext; the remaining linear cost is the queue-node walk.
 See `bench/results/2026-07-22-novelty-subject-index.edn`.
 
+The subject directory is now grouped into immutable 16-entry metadata
+segments. The head points only to the newest segment; full segments link to the
+previous segment, while appends rewrite at most one bounded partial segment.
+At the default fold threshold this caps directory reads at four blocks instead
+of 64 queue nodes. Thirty accumulating writes averaged 7.37 total block gets,
+down from 19.5 with the per-node directory. See
+`bench/results/2026-07-22-novelty-segment-index.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
@@ -382,7 +390,7 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 181 tests / 467 assertions
+clojure -M:test              # JVM      -- 181 tests / 468 assertions
 npm run test:cljs            # cljs     -- 171 tests / 447 assertions (real shadow-cljs build + node, not nbb)
 ```
 

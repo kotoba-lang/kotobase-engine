@@ -1025,6 +1025,37 @@
           back (walk-novelty-entries get-fn (some-> (get state "novelty-back") ipld/link-cid))]
       (into front (rseq back)))))
 
+(def ^:private novelty-index-segment-size 16)
+
+(defn- append-novelty-index!
+  "Append one indexed novelty entry to a newest-first chain of bounded
+   metadata segments. Returns a state fragment, or {} when pre-existing
+   unindexed novelty makes the directory incomplete (the reader then uses the
+   conservative queue fallback)."
+  [put! get-fn state tx-cid subject-tokens]
+  (let [root (some-> (get state "novelty-subject-index") ipld/link-cid)
+        eligible? (or root (zero? (get state "novelty-count" 0)))]
+    (if-not (and eligible? (seq subject-tokens))
+      {}
+      (let [entry {"e" (ipld/link tx-cid) "subjects" (vec subject-tokens)}
+            current (when root (verified-node get-fn root))
+            entries (get current "entries" [])
+            node (if (< (count entries) novelty-index-segment-size)
+                   {"entries" (conj (vec entries) entry) "rest" (get current "rest")}
+                   {"entries" [entry] "rest" (ipld/link root)})]
+        {"novelty-subject-index" (ipld/link (ipld/put-node! put! node))}))))
+
+(defn- indexed-novelty-entries [get-fn state]
+  (when-let [root (some-> (get state "novelty-subject-index") ipld/link-cid)]
+    (loop [cid root segments []]
+      (if-not cid
+        (->> segments rseq (mapcat #(get % "entries"))
+             (mapv (fn [{:strs [e subjects]}]
+                     {:cid (ipld/link-cid e) :subjects subjects})))
+        (let [segment (verified-node get-fn cid)]
+          (recur (some-> (get segment "rest") ipld/link-cid)
+                 (conj segments segment)))))))
+
 (defn- novelty-cids
   "ALL not-yet-folded tx-block cids, oldest-first (chronological order).
   O(current total novelty length) -- necessarily, since returning everything
@@ -1201,8 +1232,9 @@
     #?(:clj
        (let [tokens (when blind-fn (mapv blind-fn subjects))
              tx-cid (put-tx-block! put! quads encrypt-fn)
-             new-state (merge (dissoc state "novelty")
-                              (push-novelty! put! state tx-cid tokens))]
+             new-state (merge (dissoc state "novelty" "novelty-subject-index")
+                              (push-novelty! put! state tx-cid tokens)
+                              (append-novelty-index! put! get-fn state tx-cid tokens))]
          (cd/commit! put! get-fn new-state prev-chain-cid))
        :cljs
        (-> (js/Promise.all
@@ -1210,8 +1242,9 @@
                  (if blind-fn (pmap-async blind-fn subjects) (js/Promise.resolve nil))])
            (.then (fn [results]
                     (let [[tx-cid tokens] (vec results)
-                          new-state (merge (dissoc state "novelty")
-                                           (push-novelty! put! state tx-cid tokens))]
+                          new-state (merge (dissoc state "novelty" "novelty-subject-index")
+                                           (push-novelty! put! state tx-cid tokens)
+                                           (append-novelty-index! put! get-fn state tx-cid tokens))]
                       (cd/commit! put! get-fn new-state prev-chain-cid)))))))))
 
 (defn commit-with-report!
@@ -1794,7 +1827,8 @@
    (let [subjects (into #{} (map (comp :s ->quad)) tx-data)
          state (state-at get-fn chain-cid)
          snapshot-cid (indexed-cid state)
-         novelty (novelty-entries get-fn state)
+         novelty (or (indexed-novelty-entries get-fn state)
+                     (novelty-entries get-fn state))
          matching-entries (fn [subject-tokens]
                             (filterv (fn [{entry-tokens :subjects}]
                                        (or (nil? entry-tokens)
