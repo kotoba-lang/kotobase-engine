@@ -51,14 +51,20 @@
                             [] head-requests)))
           vec))))
 
-(defn batch-receipt
-  "Attach logical-request acknowledgement metadata to one successful commit
-  report without changing the canonical transaction or chain format."
-  [batch commit-report]
+(defn validate-batch
+  "Validate a planned batch before any immutable block or head is written."
+  [batch]
   (when-not (and (:head-key batch) (seq (:request-ids batch))
                  (= (:request-count batch) (count (:request-ids batch)))
                  (= (:datom-count batch) (count (:tx-data batch))))
     (throw (ex-info "Malformed planned transactor batch" {:batch batch})))
+  batch)
+
+(defn batch-receipt
+  "Attach logical-request acknowledgement metadata to one successful commit
+  report without changing the canonical transaction or chain format."
+  [batch commit-report]
+  (validate-batch batch)
   (assoc commit-report
          :head-key (:head-key batch)
          :request-ids (:request-ids batch)

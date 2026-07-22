@@ -1402,20 +1402,21 @@
    (commit-serialized-batch! put! get-fn cas! head-key expected-chain-cid
                              batch encrypt-fn default-max-cas-retries))
   ([put! get-fn cas! head-key expected-chain-cid batch encrypt-fn max-retries]
-   (when-not (= head-key (:head-key batch))
-     (throw (ex-info "Transactor batch/head mismatch"
-                     {:head-key head-key :batch-head (:head-key batch)})))
-   #?(:clj
-      (transactor/batch-receipt
-       batch
-       (commit-serialized-with-report! put! get-fn cas! head-key
-                                       expected-chain-cid (:tx-data batch)
-                                       encrypt-fn max-retries))
-      :cljs
-      (-> (commit-serialized-with-report! put! get-fn cas! head-key
-                                          expected-chain-cid (:tx-data batch)
-                                          encrypt-fn max-retries)
-          (.then #(transactor/batch-receipt batch %))))))
+   (let [batch (transactor/validate-batch batch)]
+     (when-not (= head-key (:head-key batch))
+       (throw (ex-info "Transactor batch/head mismatch"
+                       {:head-key head-key :batch-head (:head-key batch)})))
+     #?(:clj
+        (transactor/batch-receipt
+         batch
+         (commit-serialized-with-report! put! get-fn cas! head-key
+                                         expected-chain-cid (:tx-data batch)
+                                         encrypt-fn max-retries))
+        :cljs
+        (-> (commit-serialized-with-report! put! get-fn cas! head-key
+                                            expected-chain-cid (:tx-data batch)
+                                            encrypt-fn max-retries)
+            (.then #(transactor/batch-receipt batch %)))))))
 
 (defn novelty-size
   "How many not-yet-folded tx blocks sit on `chain-cid`'s current state —

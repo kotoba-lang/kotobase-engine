@@ -48,3 +48,9 @@
                (transactor/plan-head-batches
                 [{:request-id 1 :head-key "a" :tx-data [1]}
                  {:request-id 1 :head-key "b" :tx-data [2]}]))))
+
+(deftest validates-receipt-counts-before-publication
+  (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+               (transactor/validate-batch
+                {:head-key "a" :request-ids [1] :request-count 1
+                 :datom-count 2 :tx-data [1]}))))
