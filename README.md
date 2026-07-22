@@ -153,6 +153,16 @@ cleans it in `finally`; the 2026-07-22 real-R2 run marked 2 heads and 4 live
 blocks, found/deleted exactly 1 orphan, retained all 4 live blocks, and took
 571 ms.
 
+`kotobase-peer.retention` defines the pure retention-root contract. Active
+reader and replication roots are leases with an explicit millisecond expiry;
+legal-hold and release roots are durable. The Worker persists mutable registry
+records under `roots/<db-id>/<kind>/<encoded-id>` using R2 ETag CAS. Renewal and release
+therefore cannot overwrite a concurrent owner; release writes an inactive CAS
+tombstone instead of performing an unsafe delete. GC marks every active root,
+reports the effective minimum safe epoch, and fences sweep when either a head
+or registry ETag changes. `compact-head!` uses the same minimum epoch, so a
+pinned snapshot is protected from both version pruning and physical block GC.
+
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
 Run `clojure -M:view-bench 100000 512` for the browser/no-local-disk serving

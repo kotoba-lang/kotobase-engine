@@ -1,7 +1,8 @@
 (ns kotobase-peer.object-store-worker-test
   (:require [cljs.test :refer [deftest is async]]
             [ipld.core :as ipld]
-            [kotobase-peer.object-store.worker :as worker]))
+            [kotobase-peer.object-store.worker :as worker]
+            [kotobase-peer.retention :as retention]))
 
 (deftest immutable-object-and-block-namespaces-are-distinct
   (let [env #js {"MERKLE_S3_PREFIX" "test-prefix"}]
@@ -45,6 +46,35 @@
                    (is (= "cid-2" actual))
                    (is (= "cid-2" (:value @state)))
                    (done)))))))
+
+(deftest retention-root-renewal-and-release-use-etag-cas
+  (async done
+    (let [{:keys [bucket]} (cas-bucket)
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}
+          root (retention/root-node {:db-id "db-a" :kind :reader :id "query/a"
+                                     :manifest-cid "cid-1" :epoch 4
+                                     :expires-at 2000})]
+      (is (= "test/roots/db-a/reader/query%2Fa"
+             (worker/retention-root-key env "db-a" :reader "query/a")))
+      (-> (worker/cas-retention-root! env root nil)
+          (.then (fn [created]
+                   (is (:won? created))
+                   (worker/get-retention-root! env "db-a" :reader "query/a")))
+          (.then (fn [{stored :root :keys [etag]}]
+                   (is (= root stored))
+                   (-> (worker/cas-retention-root!
+                        env (assoc root "expires-at" 3000) "stale-etag")
+                       (.then (fn [stale]
+                                (is (not (:won? stale)))
+                                (worker/release-retention-root!
+                                 env stored etag 1500))))))
+          (.then (fn [released]
+                   (is (:won? released))
+                   (is (= 1500 (get-in released [:root "released-at"])))
+                   (done)))
+          (.catch (fn [error]
+                    (is false (str "retention registry promise rejected: " error))
+                    (done)))))))
 
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
@@ -121,8 +151,43 @@
                                          "MERKLE_S3_PREFIX" "test"}]
                      (worker/gc-unreachable! fenced-env "db-a" 0 true))))
           (.then (fn [fenced]
-                   (is (= :heads-changed (:aborted fenced)))
+                   (is (= :roots-changed (:aborted fenced)))
                    (is (= 0 (:deleted fenced)))
                    (is (contains? @objects (block-key orphan))
                        "head mutation fences deletion of a previously marked candidate")
-                   (done)))))))
+                   (let [root (retention/root-node
+                               {:db-id "db-a" :kind :legal-hold :id "case-1"
+                                :manifest-cid orphan :epoch 2})
+                         other-db-root (retention/root-node
+                                        {:db-id "db-b" :kind :release :id "v1"
+                                         :manifest-cid root-a :epoch 1})]
+                     (swap! objects assoc (str prefix "roots/db-a/legal-hold/case-1")
+                            (js/JSON.stringify (clj->js root))
+                            (str prefix "roots/db-b/release/v1")
+                            (js/JSON.stringify (clj->js other-db-root)))
+                     (worker/gc-unreachable! env "db-a" 0 false 1000))))
+          (.then (fn [pinned]
+                   (is (= 2 (:active-retention-roots pinned)))
+                   (is (= 1 (:safe-epoch pinned))
+                       "global GC reports the oldest root across shared blocks")
+                   (is (= 0 (:candidates pinned))
+                       "a legal-hold root keeps an otherwise orphaned manifest live")
+                   (worker/retention-safe-epoch! env "db-a" 1000)))
+          (.then (fn [safe-epoch]
+                   (is (= 2 safe-epoch)
+                       "compaction and GC consume the same active root boundary")
+                   (let [released (-> (retention/root-node
+                                      {:db-id "db-a" :kind :legal-hold :id "case-1"
+                                       :manifest-cid orphan :epoch 2})
+                                     (retention/release-node 1100))]
+                     (swap! objects assoc (str prefix "roots/db-a/legal-hold/case-1")
+                            (js/JSON.stringify (clj->js released)))
+                     (worker/gc-unreachable! env "db-a" 0 false 1200))))
+          (.then (fn [released]
+                   (is (= 1 (:active-retention-roots released)))
+                   (is (= 1 (:safe-epoch released)))
+                   (is (= 1 (:candidates released)))
+                   (done)))
+          (.catch (fn [error]
+                    (is false (str "GC promise rejected: " error))
+                    (done)))))))
