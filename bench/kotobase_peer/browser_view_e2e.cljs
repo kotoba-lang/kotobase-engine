@@ -257,15 +257,23 @@
                            :concurrent {:batches 5 :concurrency 8
                                         :latency (summary concurrency-latencies)
                                         :batch-wall (summary (map :wall-ms concurrent))}
-                           :join {:kind "cost-ordered-three-clause"
+                           :join {:kind "materialized-statistics-three-clause"
+                                  :statistics-scope (get-in bundle ["query-statistics"
+                                                                    "visibility-scope"])
                                   :order (mapv :id
                                                (stats/plan-clause-order
-                                                [{:id :posts :estimated-rows 1000
-                                                  :vars #{'?post}}
-                                                 {:id :authors :estimated-rows 100
-                                                  :vars #{'?author}}
-                                                 {:id :edges :estimated-rows 20
-                                                  :vars #{'?post '?author}}]))
+                                                (mapv (fn [statistic]
+                                                        (let [attribute (get-in statistic ["pattern" 1])]
+                                                          {:id (get {"post/title" :posts
+                                                                     "author/name" :authors
+                                                                     "post-author/window" :edges}
+                                                                    attribute)
+                                                           :estimated-rows (get statistic "rows")
+                                                           :vars (get {"post/title" #{'?post}
+                                                                      "author/name" #{'?author}
+                                                                      "post-author/window" #{'?post '?author}}
+                                                                     attribute)}))
+                                                      (get-in bundle ["query-statistics" "clauses"]))))
                                   :cold (summary (map :ms joins))
                                   :rows (:rows (first joins))
                                   :deduplicated-keys (:deduplicated-keys (first joins))

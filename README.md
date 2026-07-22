@@ -267,6 +267,14 @@ in the planning path as well as execution. Binding-sensitive negation,
 function, rule, and `or` queries deliberately retain source order. The
 compiler plan is inspectable through `datalog-query-plan`.
 
+Query bundles may carry deterministic `query-statistics` entries scoped by an
+explicit visibility identifier. A query uses them only when its
+`:statistics-scope` matches; legacy bundles, missing patterns, and mismatched
+scopes fall back to the visibility-filtered scan estimator. On a 10,000-entity
+JVM fixture this removes planning scans (p50 59.786 ms → 0.078 ms). The real
+encrypted R2/browser receipt is
+`bench/results/2026-07-22-browser-r2-bundle-statistics.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
