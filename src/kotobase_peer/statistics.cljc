@@ -212,23 +212,32 @@
    :arrangement/update-plan nil})
 
 (defn maintain-materialized-delta
-  "M5: Incrementally update materialized arrangement.
+  "M5 low-level datom arrangement update. General Datalog result maintenance
+   lives in kotobase-peer.datalog-materialization.
 
    When new datoms are flushed:
    1. Apply delta (new assertions/retractions) to materialized result
    2. Record which arrangements to update
    3. Attach update to manifest publish (same atomic epoch)
 
-   Returns: updated arrangement with new rows and delta snapshot."
-  [arrangement new-datoms]
-  (let [delta-rows (mapv (fn [{:keys [e a v op]}]
-                          {:e e :a a :v v :op op :delta? true})
-                        new-datoms)]
-    (assoc arrangement
-           :arrangement/materialized? true
-           :arrangement/delta-rows delta-rows
-           :arrangement/last-updated #?(:clj (System/currentTimeMillis)
-                                        :cljs (.now js/Date)))))
+   Returns a deterministic updated arrangement; wall-clock state is forbidden
+   from the pure kernel."
+  ([arrangement new-datoms]
+   (maintain-materialized-delta arrangement new-datoms
+                                (inc (or (:arrangement/epoch arrangement) -1))))
+  ([arrangement new-datoms new-epoch]
+   (when-not (and (integer? new-epoch)
+                  (> new-epoch (or (:arrangement/epoch arrangement) -1)))
+     (throw (ex-info "Arrangement epoch must advance"
+                     {:current (:arrangement/epoch arrangement)
+                      :new new-epoch})))
+   (let [delta-rows (mapv (fn [{:keys [e a v op]}]
+                            {:e e :a a :v v :op op :delta? true})
+                          new-datoms)]
+     (assoc arrangement
+            :arrangement/epoch new-epoch
+            :arrangement/materialized? true
+            :arrangement/delta-rows delta-rows))))
 
 (defn query-with-arrangements
   "M5: Execute query using pre-materialized arrangements when available.
