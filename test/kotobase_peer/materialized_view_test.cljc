@@ -361,3 +361,23 @@
              :segments [(assoc left :ordinal 3)
                         (assoc overlapping :ordinal 4)
                         (assoc right :ordinal 5)]}))))))
+
+(deftest view-blocks-are-bounded-by-encoded-bytes
+  (let [entries [{:key "a" :value (apply str (repeat 128 "a"))}
+                 {:key "b" :value (apply str (repeat 128 "b"))}]
+        single (view/build-view
+                {:view-id :bytes :epoch 1 :entries (take 1 entries)})
+        max-bytes (+ 8 (get-in single [:bundle :node "blocks" 0 "length"]))
+        bounded (view/build-view
+                 {:view-id :bytes :epoch 1 :entries entries
+                  :block-rows 512 :max-block-bytes max-bytes})]
+    (is (= 2 (count (get-in bounded [:bundle :node "blocks"]))))
+    (is (every? #(<= (get % "length") max-bytes)
+                (get-in bounded [:bundle :node "blocks"])))
+    (is (thrown-with-msg?
+         #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+         #"row byte budget exceeded"
+         (view/build-view
+          {:view-id :bytes :epoch 1 :entries (take 1 entries)
+           :max-block-bytes (dec (get-in single
+                                         [:bundle :node "blocks" 0 "length"]))})))))

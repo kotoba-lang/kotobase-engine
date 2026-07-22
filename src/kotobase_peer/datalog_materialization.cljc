@@ -254,7 +254,7 @@
           maintained
                   (mapv (fn [{:keys [view-id query visible? inputs current-result
                              current-result-complete? previous-bundle
-                             previous-epoch block-rows plan-cid]
+                             previous-epoch block-rows max-block-bytes plan-cid]
                       :as spec}]
                   (when-not (and (seq (str view-id)) previous-bundle
                                  (integer? previous-epoch)
@@ -274,7 +274,8 @@
                                 :changes (mapv result->entry (:changes delta))
                                 :previous-bundle previous-bundle
                                 :source-manifest base-cid :plan-cid plan-cid
-                                :block-rows (or block-rows 512)})]
+                                :block-rows (or block-rows 512)
+                                :max-block-bytes max-block-bytes})]
                     {:view-id view-id :maintenance delta :view built}))
                 view-specs)
           atomic (publication/build-plan

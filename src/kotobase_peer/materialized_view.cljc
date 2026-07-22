@@ -146,14 +146,41 @@
                           "nonce" nonce}
              :stored-cid (ipld/cid bytes)))))
 
+(defn- partition-view-rows
+  [view-id epoch block-rows max-block-bytes rows]
+  (letfn [(split [chunk]
+            (let [encoded-bytes
+                  (byte-count (:bytes (encode-block view-id epoch chunk)))]
+              (cond
+                (or (nil? max-block-bytes)
+                    (<= encoded-bytes max-block-bytes))
+                [chunk]
+
+                (= 1 (count chunk))
+                (throw
+                 (ex-info "Materialized-view row byte budget exceeded"
+                          {:key (get (first chunk) "key")
+                           :bytes encoded-bytes
+                           :max-block-bytes max-block-bytes}))
+
+                :else
+                (let [middle (quot (count chunk) 2)]
+                  (into (split (subvec chunk 0 middle))
+                        (split (subvec chunk middle)))))))]
+    (->> (partition-all block-rows rows)
+         (mapcat #(split (vec %)))
+         vec)))
+
 (defn build-view
   "Build a deterministic packed materialized view.
 
   ENTRIES are {:key string :value IPLD-value}; duplicate keys are allowed and
   retain deterministic value ordering. BLOCK-ROWS controls the browser read
-  granularity. The result contains one :object/put for the packed bytes and one
-  :block/put for the small query bundle."
-  [{:keys [view-id epoch entries block-rows source-manifest plan-cid sorted?
+  granularity. MAX-BLOCK-BYTES bounds canonical plaintext DAG-CBOR bytes; an
+  encrypted caller must reserve its envelope/tag overhead separately. The
+  result contains one :object/put for the packed bytes and one :block/put for
+  the small query bundle."
+  [{:keys [view-id epoch entries block-rows max-block-bytes source-manifest plan-cid sorted?
            previous-bundle mode key-id encrypt-block-fn query-statistics
            statistics-scope]
     :or {block-rows 512}}]
@@ -161,6 +188,10 @@
     (throw (ex-info "View epoch must be a non-negative integer" {:epoch epoch})))
   (when-not (and (integer? block-rows) (pos? block-rows))
     (throw (ex-info "View block rows must be positive" {:block-rows block-rows})))
+  (when-not (or (nil? max-block-bytes)
+                (and (integer? max-block-bytes) (pos? max-block-bytes)))
+    (throw (ex-info "View block bytes must be positive"
+                    {:max-block-bytes max-block-bytes})))
   (when-not (= (boolean key-id) (boolean encrypt-block-fn))
     (throw (ex-info "Encrypted views require both key-id and encrypt-block-fn"
                     {:key-id key-id})))
@@ -193,7 +224,8 @@
                     vec))
         blocks (mapv #(store-block (encode-block view-id epoch (vec %))
                                    key-id encrypt-block-fn)
-                     (partition-all block-rows rows))
+                     (partition-view-rows view-id epoch block-rows
+                                          max-block-bytes rows))
         pack-bytes (concat-bytes (map :stored-bytes blocks))
         pack-cid (ipld/cid pack-bytes)
         descriptors (loop [offset 0, blocks blocks, result []]
@@ -255,7 +287,8 @@
   "Build one incremental materialized-view L0 pack. CHANGES are
   {:key string :value value :op :assert|:retract}. The previous bundle link
   pins the older view generation; newest-first merge applies tombstones."
-  [{:keys [view-id epoch changes previous-bundle block-rows source-manifest plan-cid
+  [{:keys [view-id epoch changes previous-bundle block-rows max-block-bytes
+           source-manifest plan-cid
            query-statistics statistics-scope]}]
   (when-not previous-bundle
     (throw (ex-info "View delta requires a previous bundle CID" {})))
@@ -264,6 +297,7 @@
       (throw (ex-info "View delta op must be :assert or :retract" {:op op}))))
   (build-view {:view-id view-id :epoch epoch :entries changes
                :block-rows (or block-rows 512)
+               :max-block-bytes max-block-bytes
                :source-manifest source-manifest :plan-cid plan-cid
                :query-statistics query-statistics :statistics-scope statistics-scope
                :previous-bundle previous-bundle :mode :delta}))
@@ -360,12 +394,13 @@
   "Bridge the peer's existing RisingWave-style `view-rows` result into a
   browser-addressable packed view. Retractions are absent from current-state
   projections; callers pass the pinned source manifest/epoch explicitly."
-  [{:keys [view-id epoch rows block-rows source-manifest plan-cid
+  [{:keys [view-id epoch rows block-rows max-block-bytes source-manifest plan-cid
            query-statistics statistics-scope]}]
   (build-view
    {:view-id view-id
     :epoch epoch
     :block-rows (or block-rows 512)
+    :max-block-bytes max-block-bytes
     :source-manifest source-manifest
     :plan-cid plan-cid
     :query-statistics query-statistics
