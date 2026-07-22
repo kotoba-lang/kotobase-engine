@@ -305,6 +305,15 @@ On cljs, `:async-get-fn` routes these prefixes directly through the asynchronous
 prolly-tree scanner. See
 `bench/results/2026-07-22-persisted-effective-prefix.edn`.
 
+New novelty queue nodes also carry keyed blinded subject tokens. Effective
+writes supply the same `blind-fn` used by the indexed arrangement, so a slice
+walk can reject unrelated tx blocks before fetching or decrypting their
+ciphertext. Nodes written through the legacy `commit!` arity have no tokens and
+remain readable through a conservative fallback. With 30 distinct unfolded
+writes, effective commits averaged 19.5 total block gets instead of fetching
+every novelty ciphertext; the remaining linear cost is the queue-node walk.
+See `bench/results/2026-07-22-novelty-subject-index.edn`.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
@@ -373,7 +382,7 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 180 tests / 465 assertions
+clojure -M:test              # JVM      -- 181 tests / 467 assertions
 npm run test:cljs            # cljs     -- 171 tests / 447 assertions (real shadow-cljs build + node, not nbb)
 ```
 

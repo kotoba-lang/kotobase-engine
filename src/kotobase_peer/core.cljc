@@ -979,11 +979,21 @@
 ;; ── novelty cons-chains (front/back) ────────────────────────────────────────
 
 (defn- novelty-node-cid!
-  "Puts one {\"e\" tx-link \"rest\" rest-link|nil} node, returns its cid
+  "Puts one {\"e\" tx-link \"rest\" rest-link|nil \"subjects\" [...]?} node, returns its cid
   (string, NOT wrapped in a Link -- callers wrap when storing it as a
   value)."
-  [put! tx-cid rest-link]
-  (ipld/put-node! put! {"e" (ipld/link tx-cid) "rest" rest-link}))
+  ([put! tx-cid rest-link] (novelty-node-cid! put! tx-cid rest-link nil))
+  ([put! tx-cid rest-link subject-tokens]
+   (ipld/put-node! put! (cond-> {"e" (ipld/link tx-cid) "rest" rest-link}
+                          (seq subject-tokens) (assoc "subjects" (vec subject-tokens))))))
+
+(defn- walk-novelty-entries [get-fn head-cid]
+  (loop [cid head-cid acc []]
+    (if (nil? cid)
+      acc
+      (let [{:strs [e rest subjects]} (ipld/get-node get-fn cid)]
+        (recur (some-> rest ipld/link-cid)
+               (conj acc {:cid (ipld/link-cid e) :subjects subjects}))))))
 
 (defn- walk-novelty-chain
   "cids in this cons-chain's own head-to-tail order (the caller decides what
@@ -991,11 +1001,7 @@
   O(chain length) -- necessarily, every node has to be fetched to return it.
   nil head-cid -> []."
   [get-fn head-cid]
-  (loop [cid head-cid acc []]
-    (if (nil? cid)
-      acc
-      (let [{:strs [e rest]} (ipld/get-node get-fn cid)]
-        (recur (some-> rest ipld/link-cid) (conj acc (ipld/link-cid e)))))))
+  (mapv :cid (walk-novelty-entries get-fn head-cid)))
 
 (defn- build-novelty-chain!
   "Builds a new cons-chain from `cids` (a vector, in the order you want when
@@ -1005,10 +1011,19 @@
   vector into a walkable chain, cheaply'. O(count cids) puts -- the one-time
   cost either of those two callers pays, never repeated per-entry on a later
   unrelated push."
-  [put! cids]
-  (reduce (fn [rest-link cid] (ipld/link (novelty-node-cid! put! cid rest-link)))
+  [put! entries]
+  (reduce (fn [rest-link entry]
+            (let [{:keys [cid subjects]} (if (map? entry) entry {:cid entry})]
+              (ipld/link (novelty-node-cid! put! cid rest-link subjects))))
           nil
-          (reverse cids)))
+          (reverse entries)))
+
+(defn- novelty-entries [get-fn state]
+  (if (legacy-novelty-state? state)
+    (mapv (fn [link] {:cid (ipld/link-cid link) :subjects nil}) (get state "novelty" []))
+    (let [front (walk-novelty-entries get-fn (some-> (get state "novelty-front") ipld/link-cid))
+          back (walk-novelty-entries get-fn (some-> (get state "novelty-back") ipld/link-cid))]
+      (into front (rseq back)))))
 
 (defn- novelty-cids
   "ALL not-yet-folded tx-block cids, oldest-first (chronological order).
@@ -1016,11 +1031,7 @@
   means touching everything; see take-oldest-novelty for a genuinely bounded
   alternative when only a prefix is needed."
   [get-fn state]
-  (if (legacy-novelty-state? state)
-    (mapv ipld/link-cid (get state "novelty" []))
-    (let [front (walk-novelty-chain get-fn (some-> (get state "novelty-front") ipld/link-cid))
-          back (walk-novelty-chain get-fn (some-> (get state "novelty-back") ipld/link-cid))]
-      (into front (rseq back)))))
+  (mapv :cid (novelty-entries get-fn state)))
 
 (defn- newest-novelty-cid
   "The single most-recently-pushed tx-cid, or nil if novelty is empty. O(1)
@@ -1041,16 +1052,17 @@
   every single push). Migrates a legacy flat-vector novelty into the new
   front chain the first time a push touches it -- O(legacy length), paid
   once, never again for that chain."
-  [put! state tx-cid]
+  ([put! state tx-cid] (push-novelty! put! state tx-cid nil))
+  ([put! state tx-cid subject-tokens]
   (if (legacy-novelty-state? state)
     (let [legacy-cids (mapv ipld/link-cid (get state "novelty" []))]
       {"novelty-front" (build-novelty-chain! put! legacy-cids)
-       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid nil))
+       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid nil subject-tokens))
        "novelty-count" (inc (count legacy-cids))})
     (let [back-link (get state "novelty-back")]
       {"novelty-front" (get state "novelty-front")
-       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid back-link))
-       "novelty-count" (inc (get state "novelty-count" 0))})))
+       "novelty-back" (ipld/link (novelty-node-cid! put! tx-cid back-link subject-tokens))
+       "novelty-count" (inc (get state "novelty-count" 0))}))))
 
 (defn- take-oldest-novelty
   "Returns {\"novelty-front\" .. \"novelty-back\" .. \"novelty-count\" ..
@@ -1177,19 +1189,30 @@
    contract, including the sync-JVM/Promise-cljs platform split (`put-tx-
    block!` is itself a `js/Promise` of the tx CID on cljs; `push-novelty!`
    itself is synchronous on BOTH platforms — it touches only cids/links,
-   no crypto)."
-  [put! get-fn tx-data prev-chain-cid encrypt-fn]
-  (let [quads (mapv ->quad tx-data)
-        state (state-at get-fn prev-chain-cid)]
+   no crypto). Optional `blind-fn` adds keyed subject tokens to the novelty
+   queue node so transaction-slice reads can skip unrelated encrypted blocks;
+   the original arity remains wire-compatible and emits an unindexed node."
+  ([put! get-fn tx-data prev-chain-cid encrypt-fn]
+   (commit! put! get-fn tx-data prev-chain-cid encrypt-fn nil))
+  ([put! get-fn tx-data prev-chain-cid encrypt-fn blind-fn]
+   (let [quads (mapv ->quad tx-data)
+         subjects (->> quads (map :s) distinct sort vec)
+         state (state-at get-fn prev-chain-cid)]
     #?(:clj
-       (let [tx-cid (put-tx-block! put! quads encrypt-fn)
-             new-state (merge (dissoc state "novelty") (push-novelty! put! state tx-cid))]
+       (let [tokens (when blind-fn (mapv blind-fn subjects))
+             tx-cid (put-tx-block! put! quads encrypt-fn)
+             new-state (merge (dissoc state "novelty")
+                              (push-novelty! put! state tx-cid tokens))]
          (cd/commit! put! get-fn new-state prev-chain-cid))
        :cljs
-       (-> (put-tx-block! put! quads encrypt-fn)
-           (.then (fn [tx-cid]
-                    (let [new-state (merge (dissoc state "novelty") (push-novelty! put! state tx-cid))]
-                      (cd/commit! put! get-fn new-state prev-chain-cid))))))))
+       (-> (js/Promise.all
+            #js [(put-tx-block! put! quads encrypt-fn)
+                 (if blind-fn (pmap-async blind-fn subjects) (js/Promise.resolve nil))])
+           (.then (fn [results]
+                    (let [[tx-cid tokens] (vec results)
+                          new-state (merge (dissoc state "novelty")
+                                           (push-novelty! put! state tx-cid tokens))]
+                      (cd/commit! put! get-fn new-state prev-chain-cid)))))))))
 
 (defn commit-with-report!
   "Like `commit!`, but returns a Datomic-shaped tx-report --
@@ -1771,7 +1794,12 @@
    (let [subjects (into #{} (map (comp :s ->quad)) tx-data)
          state (state-at get-fn chain-cid)
          snapshot-cid (indexed-cid state)
-         tx-cids (novelty-cids get-fn state)
+         novelty (novelty-entries get-fn state)
+         matching-entries (fn [subject-tokens]
+                            (filterv (fn [{entry-tokens :subjects}]
+                                       (or (nil? entry-tokens)
+                                           (some subject-tokens entry-tokens)))
+                                     novelty))
          rows->db (fn [rows]
                     (reduce (fn [db {:keys [e a v_edn]}]
                               (qs/assert-quad db {:s e :p a
@@ -1784,33 +1812,39 @@
                                          (apply concat novelty-per-cid))]
                     (reduce (fn [db q] (apply-quad db q ipld/link?)) base relevant)))]
      #?(:clj
-        (let [rows (mapv #(cold-datoms get-fn snapshot-cid
+        (let [subject-tokens (set (map blind-fn subjects))
+              entries (matching-entries subject-tokens)
+              rows (mapv #(cold-datoms get-fn snapshot-cid
                                       {:index :eavt :components [%]}
                                       (constantly true) blind-fn decrypt-fn)
                          subjects)
-              novelty (mapv #(read-tx-block get-fn % decrypt-fn) tx-cids)]
-          (replay rows novelty))
+              novelty-quads (mapv #(read-tx-block get-fn (:cid %) decrypt-fn) entries)]
+          (replay rows novelty-quads))
         :cljs
-        (-> (js/Promise.all
-             #js [(pmap-async
-                   (fn [subject]
-                     (if async-get-fn
-                       (cold-datoms-async async-get-fn snapshot-cid
-                                         {:index :eavt :components [subject]}
-                                         (constantly true) blind-fn decrypt-fn)
-                       (cold-datoms get-fn snapshot-cid
-                                   {:index :eavt :components [subject]}
-                                   (constantly true) blind-fn decrypt-fn)))
-                   subjects)
-                  (pmap-async
-                   (fn [cid]
-                     (if async-get-fn
-                       (read-tx-block-async async-get-fn cid decrypt-fn)
-                       (read-tx-block get-fn cid decrypt-fn)))
-                   tx-cids)])
+        (-> (pmap-async blind-fn subjects)
+            (.then
+             (fn [tokens]
+               (let [entries (matching-entries (set tokens))]
+                 (js/Promise.all
+                  #js [(pmap-async
+                        (fn [subject]
+                          (if async-get-fn
+                            (cold-datoms-async async-get-fn snapshot-cid
+                                              {:index :eavt :components [subject]}
+                                              (constantly true) blind-fn decrypt-fn)
+                            (cold-datoms get-fn snapshot-cid
+                                        {:index :eavt :components [subject]}
+                                        (constantly true) blind-fn decrypt-fn)))
+                        subjects)
+                       (pmap-async
+                        (fn [{:keys [cid]}]
+                          (if async-get-fn
+                            (read-tx-block-async async-get-fn cid decrypt-fn)
+                            (read-tx-block get-fn cid decrypt-fn)))
+                        entries)]))))
             (.then (fn [results]
-                     (let [[rows novelty] (vec results)]
-                       (replay rows novelty)))))))))
+                     (let [[rows novelty-quads] (vec results)]
+                       (replay rows novelty-quads)))))))))
 
 (defn commit-serialized-effective!
   "Correctness-first persisted transactor path. Hydrates the actual CAS head,
@@ -1849,7 +1883,7 @@
             (if (empty? effective-deltas)
               (report current-cid current-cid [] false attempts)
               (let [new-cid (commit! put! get-fn (mapv delta->quad effective-deltas)
-                                     current-cid encrypt-fn)
+                                     current-cid encrypt-fn blind-fn)
                     actual (cas! head-key current-cid new-cid)]
                 (if (= actual new-cid)
                   (report current-cid new-cid effective-deltas true attempts)
@@ -1868,7 +1902,7 @@
                              (if (empty? effective-deltas)
                                (report current-cid current-cid [] false attempts)
                                (-> (commit! put! get-fn (mapv delta->quad effective-deltas)
-                                            current-cid encrypt-fn)
+                                            current-cid encrypt-fn blind-fn)
                                    (.then (fn [new-cid]
                                             (let [actual (cas! head-key current-cid new-cid)]
                                               (if (= actual new-cid)

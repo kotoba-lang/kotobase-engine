@@ -902,6 +902,32 @@
                                             [[:db/add "entity-42" "role" "admin"]])))))))
 
 #?(:clj
+   (deftest transaction-slice-skips-unrelated-indexed-novelty-ciphertexts
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           head (reduce (fn [head i]
+                          (:chain-cid-after
+                           (eng/commit-serialized-effective!
+                            put! get-fn cas! "actors" head
+                            [[(str "entity-" i) "role" "user"]]
+                            test-encrypt-fn test-blind-fn test-decrypt-fn)))
+                        nil (range 20))
+           decrypts (atom 0)
+           counting-decrypt (fn [ciphertext]
+                              (swap! decrypts inc)
+                              (test-decrypt-fn ciphertext))
+           slice (eng/hydrate-transaction-slice
+                  get-fn head [["entity-7" "role" "user"]]
+                  test-blind-fn counting-decrypt)]
+       (is (= #{"user"} (get-in slice [:spo "entity-7" "role"])))
+       (is (= 1 @decrypts)
+           "20 novelty nodes are classified by blind token; only the matching tx ciphertext is opened"))))
+
+#?(:clj
    (deftest commit-serialized-effective-publishes-only-effective-deltas
      (let [{:keys [put! get-fn]} (mem-store)
            heads (atom {})
