@@ -250,8 +250,28 @@
           manifest-1 (lsm/build-manifest {:db-id "db-a" :epoch 1})
           manifest-2 (lsm/build-manifest {:db-id "db-a" :epoch 2
                                           :previous (:cid manifest-1)})
+          view-bundle-node {"format" "kotobase/query-bundle"
+                            "version" 1 "view-id" "kept" "epoch" 2
+                            "source-manifest" (ipld/link (:cid manifest-2))
+                            "pack-cid" (ipld/link (:cid manifest-1))
+                            "count" 0 "blocks" []}
+          view-bundle-bytes (ipld/encode view-bundle-node)
+          view-bundle-cid (ipld/cid view-bundle-bytes)
+          publication-node {"format" "kotobase/epoch-publication"
+                            "version" 1 "db-id" "db-a" "epoch" 2
+                            "base-manifest" (ipld/link (:cid manifest-2))
+                            "statistics" (ipld/link (:cid manifest-1))
+                            "views" {"kept" {"bundle" (ipld/link view-bundle-cid)
+                                               "pack" (ipld/link (:cid manifest-1))
+                                               "count" 0}}}
+          publication-bytes (ipld/encode publication-node)
+          publication-cid (ipld/cid publication-bytes)
           entries (atom {(str prefix "heads/db-a")
-                         {:value (:cid manifest-2) :etag "v-head"}
+                         {:value publication-cid :etag "v-head"}
+                         (str prefix "blocks/" publication-cid)
+                         {:value publication-bytes :etag "v-publication"}
+                         (str prefix "blocks/" view-bundle-cid)
+                         {:value view-bundle-bytes :etag "v-view-bundle"}
                          (str prefix "blocks/" (:cid manifest-1))
                          {:value (:bytes manifest-1) :etag "v-m1"}
                          (str prefix "blocks/" (:cid manifest-2))
@@ -296,7 +316,13 @@
           opts {:db-id "db-a" :owner "murakumo-a" :window-size 2
                 :target-run-rows 16 :min-manifests 2 :l0-threshold 4
                 :lease-ms 100 :now-ms 1000 :token "token-a"}]
-      (-> (worker/claim-compaction-lease! env opts)
+      (-> (worker/resolve-database-head! env "db-a")
+          (.then
+           (fn [resolved]
+             (is (= publication-cid (:head-cid resolved)))
+             (is (= (:cid manifest-2) (:base-cid resolved)))
+             (is (= publication-node (:publication resolved)))
+             (worker/claim-compaction-lease! env opts)))
           (.then
            (fn [first-claim]
              (is (:claimed? first-claim))
@@ -328,8 +354,27 @@
            (fn [result]
              (is (= :published (:outcome result)))
              (is (false? (:lease-fenced? result)))
-             (is (not= (:cid manifest-2)
-                       (:value (get @entries (str prefix "heads/db-a")))))
+             (let [next-head (:value (get @entries (str prefix "heads/db-a")))
+                   next-root (ipld/decode
+                              (:value (get @entries (str prefix "blocks/" next-head))))]
+               (is (not= publication-cid next-head))
+               (is (= "kotobase/epoch-publication" (get next-root "format")))
+               (is (= (get publication-node "statistics")
+                      (get next-root "statistics")))
+               (is (= (get-in publication-node ["views" "kept" "pack"])
+                      (get-in next-root ["views" "kept" "pack"])))
+               (is (not= (:cid manifest-2)
+                         (ipld/link-cid (get next-root "base-manifest"))))
+               (let [next-bundle-cid
+                     (ipld/link-cid
+                      (get-in next-root ["views" "kept" "bundle"]))
+                     next-bundle
+                     (ipld/decode
+                      (:value (get @entries
+                                   (str prefix "blocks/" next-bundle-cid))))]
+                 (is (= (ipld/link-cid (get next-root "base-manifest"))
+                        (ipld/link-cid (get next-bundle
+                                            "source-manifest"))))))
              (is (some #(str/includes? % "/checkpoints/") (keys @entries)))
              (worker/claim-compaction-lease!
               env (assoc opts :owner "murakumo-d" :now-ms 1400 :token "token-d"))))

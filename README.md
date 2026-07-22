@@ -269,6 +269,11 @@ head after an immutable write failure. Direct VersionManifest heads remain
 explicitly readable during migration. The real two-contender R2 drill produced
 one winner and a root whose base/statistics/bundle/pack artifacts were all
 present; see `bench/results/2026-07-23-r2-atomic-derived-publication.edn`.
+Object-store entity readers and compaction now resolve either head format.
+Compaction rewrites only the physical base manifest, deterministically rebases
+each current query bundle's `source-manifest`, preserves statistics/view packs,
+puts those immutable blocks first, and finally CASes a replacement publication
+root. A legacy direct VersionManifest remains a supported migration input.
 
 Rotation uses a keyring resolved from the immutable bundle descriptors rather
 than a client-side current-key constant. During a rollout the host may expose
