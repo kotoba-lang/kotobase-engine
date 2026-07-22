@@ -995,14 +995,6 @@
         (recur (some-> rest ipld/link-cid)
                (conj acc {:cid (ipld/link-cid e) :subjects subjects}))))))
 
-(defn- walk-novelty-chain
-  "cids in this cons-chain's own head-to-tail order (the caller decides what
-  that means: front chains are oldest-first, back chains are newest-first).
-  O(chain length) -- necessarily, every node has to be fetched to return it.
-  nil head-cid -> []."
-  [get-fn head-cid]
-  (mapv :cid (walk-novelty-entries get-fn head-cid)))
-
 (defn- build-novelty-chain!
   "Builds a new cons-chain from `cids` (a vector, in the order you want when
   WALKING the result head-to-tail) and returns a Link to its head, or nil if
@@ -1055,6 +1047,20 @@
         (let [segment (verified-node get-fn cid)]
           (recur (some-> (get segment "rest") ipld/link-cid)
                  (conj segments segment)))))))
+
+(defn- build-novelty-index!
+  "Rebuild the bounded subject directory for chronological ENTRIES. Returns a
+   Link to the newest segment, or nil when empty/incomplete."
+  [put! entries]
+  (when (and (seq entries) (every? (comp seq :subjects) entries))
+    (reduce (fn [rest-link segment]
+              (ipld/link
+               (ipld/put-node!
+                put! {"entries" (mapv (fn [{:keys [cid subjects]}]
+                                         {"e" (ipld/link cid) "subjects" (vec subjects)})
+                                       segment)
+                      "rest" rest-link})))
+            nil (partition-all novelty-index-segment-size entries))))
 
 (defn- novelty-cids
   "ALL not-yet-folded tx-block cids, oldest-first (chronological order).
@@ -1117,22 +1123,28 @@
   [put! get-fn state n]
   (let [legacy? (legacy-novelty-state? state)
         front (if legacy?
-                (mapv ipld/link-cid (get state "novelty" []))
-                (walk-novelty-chain get-fn (some-> (get state "novelty-front") ipld/link-cid)))]
+                (mapv (fn [link] {:cid (ipld/link-cid link) :subjects nil})
+                      (get state "novelty" []))
+                (walk-novelty-entries get-fn (some-> (get state "novelty-front") ipld/link-cid)))]
     (if (>= (count front) n)
-      {:taken (subvec front 0 n)
+      {:taken (mapv :cid (subvec front 0 n))
        "novelty-front" (build-novelty-chain! put! (subvec front n))
        "novelty-back" (if legacy? nil (get state "novelty-back"))
-       "novelty-count" (- (if legacy? (count front) (get state "novelty-count" 0)) n)}
+       "novelty-count" (- (if legacy? (count front) (get state "novelty-count" 0)) n)
+       :remaining-entries (into (subvec front n)
+                                (when-not legacy?
+                                  (rseq (walk-novelty-entries
+                                         get-fn (some-> (get state "novelty-back") ipld/link-cid)))))}
       (let [back-cid (if legacy? nil (some-> (get state "novelty-back") ipld/link-cid))
-            back-oldest-first (vec (rseq (walk-novelty-chain get-fn back-cid)))
+            back-oldest-first (vec (rseq (walk-novelty-entries get-fn back-cid)))
             combined (into front back-oldest-first)
             k (min n (count combined))
             total (if legacy? (count front) (get state "novelty-count" 0))]
-        {:taken (subvec combined 0 k)
+        {:taken (mapv :cid (subvec combined 0 k))
          "novelty-front" (build-novelty-chain! put! (subvec combined k))
          "novelty-back" nil
-         "novelty-count" (- total k)}))))
+         "novelty-count" (- total k)
+         :remaining-entries (subvec combined k)}))))
 
 (defn- quad->wire [{:keys [s p o op]}]
   ;; "op" appears only on non-assert quads — asserts (and every pre-
@@ -2478,8 +2490,11 @@
          bounded? (some? max-novelty)
          take-result (when bounded? (take-oldest-novelty put! get-fn state max-novelty))
          to-fold-cids (if bounded? (:taken take-result) (novelty-cids get-fn state))
+         remaining-index (when bounded?
+                           (build-novelty-index! put! (:remaining-entries take-result)))
          new-novelty-state (if bounded?
-                             (dissoc take-result :taken)
+                             (cond-> (dissoc take-result :taken :remaining-entries)
+                               remaining-index (assoc "novelty-subject-index" remaining-index))
                              {"novelty-front" nil "novelty-back" nil "novelty-count" 0})]
      #?(:clj
         (let [novelty-quads (mapcat #(read-tx-block get-fn % decrypt-fn) to-fold-cids)
@@ -2512,6 +2527,59 @@
                            new-state (cond-> (merge {"indexed" (ipld/link new-snap-cid)} new-novelty-state)
                                        views-link (assoc "views" views-link))]
                        (cd/commit! put! get-fn new-state chain-cid)))))))))
+
+(defn fold-serialized-if-needed!
+  "CAS-safe scheduler primitive: fold only when the actual head's novelty is
+   at least `:threshold`, publish the fold through HeadCAS, and retry from the
+   winning head after contention. Below threshold it performs no block writes
+   and no CAS. OPTS: `:threshold` (default 64), `:max-novelty` (default the
+   threshold, bounding one invocation), and `:max-retries` (default 10).
+   Returns {:committed? :chain-cid-before :chain-cid-after :novelty-before
+   :novelty-after :attempts}. Sync JVM / Promise cljs."
+  ([put! get-fn cas! head-key expected-chain-cid blind-fn encrypt-fn decrypt-fn]
+   (fold-serialized-if-needed! put! get-fn cas! head-key expected-chain-cid
+                               blind-fn encrypt-fn decrypt-fn {}))
+  ([put! get-fn cas! head-key expected-chain-cid blind-fn encrypt-fn decrypt-fn
+    {:keys [threshold max-novelty max-retries]
+     :or {threshold default-fold-threshold max-retries default-max-cas-retries}}]
+   (let [max-novelty (or max-novelty threshold)
+         report (fn [before after novelty-before attempts committed?]
+                  {:committed? committed?
+                   :chain-cid-before before :chain-cid-after after
+                   :novelty-before novelty-before
+                   :novelty-after (novelty-size get-fn after)
+                   :attempts attempts})]
+     #?(:clj
+        (loop [current expected-chain-cid attempts 0]
+          (when (> attempts max-retries)
+            (throw (ex-info "kotobase-peer: fold-serialized-if-needed! exceeded max-cas-retries"
+                            {:head-key head-key :attempts attempts})))
+          (let [size (novelty-size get-fn current)]
+            (if (< size threshold)
+              (report current current size attempts false)
+              (let [next (fold! put! get-fn current ipld/link? max-novelty
+                                blind-fn encrypt-fn decrypt-fn)
+                    actual (cas! head-key current next)]
+                (if (= actual next)
+                  (report current next size attempts true)
+                  (recur actual (inc attempts)))))))
+        :cljs
+        (letfn [(attempt [current attempts]
+                  (if (> attempts max-retries)
+                    (js/Promise.reject
+                     (ex-info "kotobase-peer: fold-serialized-if-needed! exceeded max-cas-retries"
+                              {:head-key head-key :attempts attempts}))
+                    (let [size (novelty-size get-fn current)]
+                      (if (< size threshold)
+                        (js/Promise.resolve (report current current size attempts false))
+                        (-> (fold! put! get-fn current ipld/link? max-novelty
+                                   blind-fn encrypt-fn decrypt-fn)
+                            (.then (fn [next]
+                                     (let [actual (cas! head-key current next)]
+                                       (if (= actual next)
+                                         (report current next size attempts true)
+                                         (attempt actual (inc attempts)))))))))))]
+          (attempt expected-chain-cid 0))))))
 
 (defn verify-chain
   "True iff the chain rooted at `chain-cid` is untampered and its

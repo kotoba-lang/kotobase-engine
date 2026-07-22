@@ -322,6 +322,13 @@ of 64 queue nodes. Thirty accumulating writes averaged 7.37 total block gets,
 down from 19.5 with the per-node directory. See
 `bench/results/2026-07-22-novelty-segment-index.edn`.
 
+Bounded partial folds now preserve both queue-node subject tokens and rebuild
+the remaining segment directory; folding no longer silently drops the pruning
+optimization. `fold-serialized-if-needed!` combines the fold threshold,
+bounded `max-novelty`, and HeadCAS publication into one scheduler primitive.
+Below threshold it writes no blocks and performs no CAS; after contention it
+re-evaluates the actual winning head before deciding or folding.
+
 This is currently a behavior-preserving shadow substrate: existing
 `commit!`/`hot-datoms`/`fold!` remain the live path until read equivalence and
 CLJ/CLJS CID determinism gates pass. New storage work must target the
@@ -390,7 +397,7 @@ entirely chain's job. Neither library needed to change.
 ## Test
 
 ```bash
-clojure -M:test              # JVM      -- 181 tests / 468 assertions
+clojure -M:test              # JVM      -- 183 tests / 479 assertions
 npm run test:cljs            # cljs     -- 171 tests / 447 assertions (real shadow-cljs build + node, not nbb)
 ```
 

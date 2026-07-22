@@ -932,6 +932,77 @@
            "20 entries fit in two metadata segments instead of requiring 20 queue-node reads"))))
 
 #?(:clj
+   (deftest partial-fold-preserves-subject-segment-pruning
+     (let [{:keys [put! get-fn]} (mem-store)
+           heads (atom {})
+           cas! (fn [head-key expected new]
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           head (reduce (fn [head i]
+                          (:chain-cid-after
+                           (eng/commit-serialized-effective!
+                            put! get-fn cas! "actors" head
+                            [[(str "entity-" i) "role" "user"]]
+                            test-encrypt-fn test-blind-fn test-decrypt-fn)))
+                        nil (range 20))
+           folded (eng/fold! put! get-fn head ipld/link? 5
+                             test-blind-fn test-encrypt-fn test-decrypt-fn)
+           reads (atom 0)
+           decrypts (atom 0)
+           counted-get (fn [cid] (swap! reads inc) (get-fn cid))
+           slice (eng/hydrate-transaction-slice
+                  counted-get folded [["entity-10" "role" "user"]]
+                  test-blind-fn
+                  (fn [ciphertext] (swap! decrypts inc) (test-decrypt-fn ciphertext)))]
+       (is (= 15 (eng/novelty-size get-fn folded)))
+       (is (= #{"user"} (get-in slice [:spo "entity-10" "role"])))
+       (is (= 1 @decrypts) "only the matching remaining novelty ciphertext is opened")
+       (is (<= @reads 7) "remaining entries are rebuilt into one verified metadata segment"))))
+
+#?(:clj
+   (deftest fold-serialized-if-needed-enforces-threshold-and-bounded-progress
+     (let [{:keys [put! get-fn store]} (mem-store)
+           heads (atom {})
+           cas-calls (atom 0)
+           cas! (fn [head-key expected new]
+                  (swap! cas-calls inc)
+                  (if (= (get @heads head-key) expected)
+                    (do (swap! heads assoc head-key new) new)
+                    (get @heads head-key)))
+           head3 (reduce (fn [head i]
+                           (:chain-cid-after
+                            (eng/commit-serialized-effective!
+                             put! get-fn cas! "actors" head
+                             [[(str "entity-" i) "role" "user"]]
+                             test-encrypt-fn test-blind-fn test-decrypt-fn)))
+                         nil (range 3))
+           blocks-before (count @store)
+           calls-before @cas-calls
+           below (eng/fold-serialized-if-needed!
+                  put! get-fn cas! "actors" head3
+                  test-blind-fn test-encrypt-fn test-decrypt-fn
+                  {:threshold 4 :max-novelty 2})
+           blocks-after-below (count @store)
+           calls-after-below @cas-calls
+           head4 (:chain-cid-after
+                  (eng/commit-serialized-effective!
+                   put! get-fn cas! "actors" head3
+                   [["entity-3" "role" "user"]]
+                   test-encrypt-fn test-blind-fn test-decrypt-fn))
+           folded (eng/fold-serialized-if-needed!
+                   put! get-fn cas! "actors" head4
+                   test-blind-fn test-encrypt-fn test-decrypt-fn
+                   {:threshold 4 :max-novelty 2})]
+       (is (false? (:committed? below)))
+       (is (= blocks-before blocks-after-below) "below threshold writes no blocks")
+       (is (= calls-before calls-after-below) "below threshold performs no CAS")
+       (is (true? (:committed? folded)))
+       (is (= 4 (:novelty-before folded)))
+       (is (= 2 (:novelty-after folded)) "one scheduler invocation makes bounded progress")
+       (is (= (:chain-cid-after folded) (get @heads "actors"))))))
+
+#?(:clj
    (deftest commit-serialized-effective-publishes-only-effective-deltas
      (let [{:keys [put! get-fn]} (mem-store)
            heads (atom {})
