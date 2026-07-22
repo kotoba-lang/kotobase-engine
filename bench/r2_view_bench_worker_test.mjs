@@ -154,7 +154,11 @@ const gcEnv = {E2E_BEARER_TOKEN: "gc-capability", MERKLE_BUCKET: {
     if (!entry) return null;
     return {etag: entry.etag, async text() { return entry.value; }};
   },
-  async put(key, body) {
+  async put(key, body, options) {
+    const current = gcObjects.get(key);
+    const condition = options?.onlyIf;
+    if (condition?.etagMatches && current?.etag !== condition.etagMatches) return null;
+    if (condition?.etagDoesNotMatch === "*" && current) return null;
     const entry = {value: typeof body === "string" ? body : String(body),
                    etag: `gc-${++gcVersion}`};
     gcObjects.set(key, entry);
@@ -174,11 +178,14 @@ const gcResponse = await worker.fetch(new Request(`${origin}/bench/orphan-gc`, {
 assert.equal(gcResponse.status, 200);
 const gcResult = await gcResponse.json();
 assert.deepEqual({heads: gcResult.heads, reachable: gcResult.reachable,
+                  retentionRoots: gcResult.retentionRoots,
+                  pinnedCandidates: gcResult.pinnedCandidates,
                   dryRunCandidates: gcResult.dryRunCandidates,
                   deleted: gcResult.deleted, liveAfter: gcResult.liveAfter,
                   orphanExistsAfter: gcResult.orphanExistsAfter},
-                 {heads: 2, reachable: 4, dryRunCandidates: 1,
+                 {heads: 2, reachable: 4, retentionRoots: 1, pinnedCandidates: 0,
+                  dryRunCandidates: 1,
                   deleted: 1, liveAfter: 4, orphanExistsAfter: false});
 assert.equal(gcObjects.size, 0, "GC drill objects and heads are deleted in finally");
 
-console.log(JSON.stringify({ tests: 18, assertions: 53, outcome: "succeeded" }));
+console.log(JSON.stringify({ tests: 18, assertions: 55, outcome: "succeeded" }));

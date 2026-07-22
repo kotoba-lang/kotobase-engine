@@ -126,13 +126,15 @@ async function benchmarkR2OrphanGc(env) {
   const prefix = `bench/orphan-gc/${runId}/`;
   const headPrefix = `${prefix}heads/`;
   const blockPrefix = `${prefix}blocks/`;
+  const rootPrefix = `${prefix}roots/`;
+  const rootKey = `${rootPrefix}db-a/legal-hold/case-1`;
   const blocks = {
     "root-a": {links: ["child-a"]}, "child-a": {links: []},
     "root-b": {links: ["child-b"]}, "child-b": {links: []},
     orphan: {links: []},
   };
   const keys = [...Object.keys(blocks).map(cid => `${blockPrefix}${cid}`),
-                `${headPrefix}db-a`, `${headPrefix}db-b`];
+                `${headPrefix}db-a`, `${headPrefix}db-b`, rootKey];
   const started = performance.now();
   try {
     await Promise.all(Object.entries(blocks).map(([cid, node]) =>
@@ -141,34 +143,61 @@ async function benchmarkR2OrphanGc(env) {
       env.MERKLE_BUCKET.put(`${headPrefix}db-a`, "root-a"),
       env.MERKLE_BUCKET.put(`${headPrefix}db-b`, "root-b"),
     ]);
+    const rootPut = await env.MERKLE_BUCKET.put(rootKey, JSON.stringify({
+      format: "kotobase/retention-root", version: 1, kind: "legal-hold",
+      "db-id": "db-a", id: "case-1", "manifest-cid": "orphan", epoch: 1,
+    }));
 
     const readHeads = async () => Promise.all(
       (await listAll(env.MERKLE_BUCKET, headPrefix)).map(async object => {
         const value = await env.MERKLE_BUCKET.get(object.key);
         return {key: object.key, etag: value.etag, value: await value.text()};
       })).then(heads => heads.sort((a, b) => a.key.localeCompare(b.key)));
-    const headsBefore = await readHeads();
-    const reachable = new Set();
-    const mark = async cid => {
-      if (reachable.has(cid)) return;
-      reachable.add(cid);
-      const object = await env.MERKLE_BUCKET.get(`${blockPrefix}${cid}`);
-      if (!object) throw new Error(`missing reachable block: ${cid}`);
-      const node = JSON.parse(await object.text());
-      await Promise.all(node.links.map(mark));
+    const readRoots = async () => Promise.all(
+      (await listAll(env.MERKLE_BUCKET, rootPrefix)).map(async object => {
+        const value = await env.MERKLE_BUCKET.get(object.key);
+        return {key: object.key, etag: value.etag,
+                value: JSON.parse(await value.text())};
+      })).then(roots => roots.sort((a, b) => a.key.localeCompare(b.key)));
+    const audit = async () => {
+      const heads = await readHeads();
+      const roots = await readRoots();
+      const reachable = new Set();
+      const mark = async cid => {
+        if (reachable.has(cid)) return;
+        reachable.add(cid);
+        const object = await env.MERKLE_BUCKET.get(`${blockPrefix}${cid}`);
+        if (!object) throw new Error(`missing reachable block: ${cid}`);
+        const node = JSON.parse(await object.text());
+        await Promise.all(node.links.map(mark));
+      };
+      const activeRoots = roots.filter(root => !root.value["released-at"]);
+      await Promise.all(heads.map(head => mark(head.value)).concat(
+        activeRoots.map(root => mark(root.value["manifest-cid"]))));
+      const listedBlocks = await listAll(env.MERKLE_BUCKET, blockPrefix);
+      const candidates = listedBlocks.map(object => object.key)
+        .filter(key => !reachable.has(key.slice(blockPrefix.length)));
+      return {heads, roots, reachable, candidates};
     };
-    await Promise.all(headsBefore.map(head => mark(head.value)));
-    const listedBlocks = await listAll(env.MERKLE_BUCKET, blockPrefix);
-    const candidates = listedBlocks.map(object => object.key)
-      .filter(key => !reachable.has(key.slice(blockPrefix.length)));
-    const headsAfter = await readHeads();
-    const stable = JSON.stringify(headsBefore) === JSON.stringify(headsAfter);
-    if (!stable) throw new Error("head set changed during GC mark; sweep fenced");
-    await env.MERKLE_BUCKET.delete(candidates);
+    const pinned = await audit();
+    const released = {...pinned.roots[0].value, "released-at": Date.now()};
+    const releasePut = await env.MERKLE_BUCKET.put(rootKey, JSON.stringify(released), {
+      onlyIf: {etagMatches: rootPut.etag},
+    });
+    if (!releasePut) throw new Error("retention root release CAS lost");
+    const collectible = await audit();
+    const snapshotAfter = {heads: await readHeads(), roots: await readRoots()};
+    const stable = JSON.stringify({heads: collectible.heads, roots: collectible.roots}) ===
+      JSON.stringify(snapshotAfter);
+    if (!stable) throw new Error("head/root set changed during GC mark; sweep fenced");
+    await env.MERKLE_BUCKET.delete(collectible.candidates);
     const liveAfter = await listAll(env.MERKLE_BUCKET, blockPrefix);
-    return {backend: "cloudflare-r2", heads: headsBefore.length,
-            reachable: reachable.size, dryRunCandidates: candidates.length,
-            deleted: candidates.length, liveAfter: liveAfter.length,
+    return {backend: "cloudflare-r2", heads: collectible.heads.length,
+            retentionRoots: collectible.roots.length,
+            pinnedCandidates: pinned.candidates.length,
+            reachable: collectible.reachable.size,
+            dryRunCandidates: collectible.candidates.length,
+            deleted: collectible.candidates.length, liveAfter: liveAfter.length,
             orphanExistsAfter: Boolean(await env.MERKLE_BUCKET.get(`${blockPrefix}orphan`)),
             wallMs: performance.now() - started};
   } finally {

@@ -7,6 +7,7 @@
             [goog.object :as gobj]
             [ipld.core :as ipld]
             [kotobase-peer.merkle-lsm :as lsm]
+            [kotobase-peer.retention :as retention]
             [kotobase-peer.object-store.s3-sigv4 :as sigv4]))
 
 (defn- env [e k] (gobj/get e k))
@@ -15,6 +16,9 @@
 (defn block-key [e cid] (str (prefix e) "blocks/" cid))
 (defn object-key [e cid] (str (prefix e) "objects/" cid))
 (defn head-key [e db-id] (str (prefix e) "heads/" db-id))
+(defn retention-root-key [e db-id kind id]
+  (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
+       (name kind) "/" (js/encodeURIComponent id)))
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -221,7 +225,54 @@
                           next
                           (-> (get-head e db-id) (.then :value)))))))))))
 
-(declare manifest-window! index-run-refs load-runs!)
+(defn get-retention-root!
+  "Read one mutable retention-root record and its provider ETag."
+  [e db-id kind id]
+  (if-let [bucket (env e "MERKLE_BUCKET")]
+    (-> (.get bucket (retention-root-key e db-id kind id))
+        (.then
+         (fn [object]
+           (if object
+             (-> (.text object)
+                 (.then (fn [value]
+                          {:root (retention/validate-node
+                                  (js->clj (js/JSON.parse value)))
+                           :etag (gobj/get object "etag")})))
+             {:root nil :etag nil}))))
+    (js/Promise.reject
+     (js/Error. "Retention root registry currently requires an R2 binding"))))
+
+(defn cas-retention-root!
+  "Create or replace ROOT with R2 ETag CAS. ROOT may be root-node output or
+  keyword-keyed options accepted by retention/root-node. A lost renewal or
+  release race returns {:won? false}; it never overwrites the winner."
+  [e root expected-etag]
+  (let [node (if (contains? root "format")
+               (retention/validate-node root)
+               (retention/root-node root))
+        kind (keyword (get node "kind"))
+        db-id (get node "db-id")
+        id (get node "id")]
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (.put bucket (retention-root-key e db-id kind id)
+                (js/JSON.stringify (clj->js node))
+                #js {:onlyIf (if expected-etag
+                               #js {:etagMatches expected-etag}
+                               #js {:etagDoesNotMatch "*"})})
+          (.then (fn [result]
+                   {:won? (boolean result)
+                    :etag (when result (gobj/get result "etag"))
+                    :root (when result node)})))
+      (js/Promise.reject
+       (js/Error. "Retention root registry currently requires an R2 binding")))))
+
+(defn release-retention-root!
+  "CAS a root to an inactive tombstone. Conditional replacement is used instead
+  of delete so a stale reader cannot erase a concurrent lease renewal."
+  [e root expected-etag released-at]
+  (cas-retention-root! e (retention/release-node root released-at) expected-etag))
+
+(declare manifest-window! index-run-refs load-runs! all-r2-retention-roots!)
 
 (defn find-latest-entity!
   "Walk newest-first manifests and return the first EAVT datom set for entity.
@@ -377,6 +428,21 @@
              (-> (get-node! e (ipld/link-cid directory-link))
                  (.then (fn [directory] {:directory directory})))))))))
 
+(defn retention-safe-epoch!
+  "Return the minimum epoch imposed by active R2 retention roots, or nil when
+  no root constrains compaction. NOW-MS is injectable for deterministic hosts."
+  ([e db-id] (retention-safe-epoch! e db-id (js/Date.now)))
+  ([e db-id now-ms]
+   (if-let [bucket (env e "MERKLE_BUCKET")]
+     (-> (all-r2-retention-roots! e bucket)
+         (.then (fn [roots]
+                  (retention/minimum-safe-epoch
+                   (->> roots
+                        (mapv :root)
+                        (filterv #(= db-id (get % "db-id"))))
+                   now-ms))))
+     (js/Promise.resolve nil))))
+
 (defn compact-head!
   "Compact the newest manifest window into range-partitioned L1 runs and
   publish it with R2 CAS. The untouched tail remains linked as :previous.
@@ -384,6 +450,9 @@
   ([e db-id] (compact-head! e db-id 64 4096))
   ([e db-id window-size] (compact-head! e db-id window-size 4096))
   ([e db-id window-size target-run-rows]
+   (-> (retention-safe-epoch! e db-id)
+       (.then #(compact-head! e db-id window-size target-run-rows %))))
+  ([e db-id window-size target-run-rows root-safe-epoch]
    (-> (get-head e db-id)
        (.then
         (fn [{head-cid :value :keys [etag]}]
@@ -393,13 +462,16 @@
                 (.then
                  (fn [{:keys [manifests tail]}]
                    (let [present (filter #(seq (index-run-refs manifests %)) lsm/indexes)
-                         epoch (apply max (map #(get-in % [:node "epoch"]) manifests))]
+                         epoch (apply max (map #(get-in % [:node "epoch"]) manifests))
+                         safe-epoch (if root-safe-epoch
+                                      (min epoch root-safe-epoch)
+                                      epoch)]
                      (-> (reduce
                           (fn [result index]
                             (.then result
                                    (fn [compacted]
                                      (-> (compact-index-ranges!
-                                          e db-id index epoch target-run-rows
+                                          e db-id index safe-epoch target-run-rows
                                           (index-run-refs manifests index))
                                          (.then #(assoc compacted index %))))))
                           (js/Promise.resolve {})
@@ -425,7 +497,7 @@
                                                      :previous directory-previous})
                                          manifest (lsm/build-manifest
                                                    {:db-id db-id :epoch epoch
-                                                    :safe-epoch epoch
+                                                    :safe-epoch safe-epoch
                                                     :previous (when-not inherited tail)
                                                     :indexes (into {}
                                                                    (map (fn [[index runs]]
@@ -486,7 +558,7 @@
        (fn [objects]
          (js/Promise.all
           (clj->js
-           (map (fn [object]
+           (mapv (fn [object]
                   (let [key (gobj/get object "key")]
                     (-> (.get bucket key)
                         (.then (fn [head]
@@ -496,63 +568,116 @@
                                                 {:key key
                                                  :etag (gobj/get head "etag")
                                                  :value value})))))))))
-                objects)))))
+                 objects)))))
       (.then (fn [heads]
                (->> (array-seq heads)
                     (remove nil?)
                     (sort-by :key)
                     vec)))))
 
-(defn gc-unreachable!
-  "Globally mark from EVERY mutable R2 head and optionally sweep unreachable
-  shared blocks older than GRACE-MS. DB-ID is retained for source compatibility
-  but deliberately does not scope marking: block keys are globally deduplicated
-  under one prefix, so marking only one database head could delete another
-  database's live blocks. A second head/ETag snapshot fences detected publish
-  races; GRACE-MS protects newly uploaded blocks. Deletion is explicit for
-  dry-run-first operation."
-  [e _db-id grace-ms delete?]
-  (if-let [bucket (env e "MERKLE_BUCKET")]
-    (-> (all-r2-heads! e bucket)
+(defn- all-r2-retention-roots! [e bucket]
+  (-> (list-r2-blocks! bucket (str (prefix e) "roots/"))
+      (.then
+       (fn [objects]
+         (if (seq objects)
+           (js/Promise.all
+            (clj->js
+             (mapv (fn [object]
+                     (let [key (gobj/get object "key")]
+                       (-> (.get bucket key)
+                           (.then
+                            (fn [stored]
+                              (when stored
+                                (-> (.text stored)
+                                    (.then
+                                     (fn [value]
+                                       {:key key
+                                        :etag (gobj/get stored "etag")
+                                        :root (retention/validate-node
+                                               (js->clj (js/JSON.parse value)))})))))))))
+                   objects)))
+           (js/Promise.resolve #js []))))
+      (.then (fn [roots]
+               (->> (array-seq roots)
+                    (remove nil?)
+                    (sort-by :key)
+                    vec)))))
+
+(defn- gc-root-snapshot! [e bucket]
+  (-> (js/Promise.all #js [(all-r2-heads! e bucket)
+                           (all-r2-retention-roots! e bucket)])
+      (.then (fn [values]
+               {:heads (aget values 0)
+                :roots (aget values 1)}))
+      (.catch (fn [error]
+                (js/Promise.reject
+                 (js/Error. (str "GC root snapshot failed: " error)))))))
+
+(defn- gc-audit! [e bucket {:keys [heads roots]} grace-ms now-ms]
+  (let [active-roots (filterv #(retention/active? (:root %) now-ms) roots)
+        root-cids (concat (map :value heads)
+                          (map #(get-in % [:root "manifest-cid"]) active-roots))]
+    (-> (js/Promise.all
+         #js [(-> (js/Promise.all
+                    (clj->js (map #(reachable-cids! e %) root-cids)))
+                   (.then (fn [sets] (into #{} cat (array-seq sets)))))
+              (list-r2-blocks! bucket (str (prefix e) "blocks/"))])
         (.then
-         (fn [heads-before]
-           (-> (js/Promise.all
-                #js [(-> (js/Promise.all
-                           (clj->js (map #(reachable-cids! e (:value %)) heads-before)))
-                          (.then (fn [sets] (into #{} cat (array-seq sets)))))
-                     (list-r2-blocks! bucket (str (prefix e) "blocks/"))])
-               (.then
-                (fn [result]
-                  (let [reachable (aget result 0)
-                        objects (aget result 1)
-                        cutoff (- (js/Date.now) grace-ms)
-                        candidates
-                        (->> objects
-                             (filter
-                              (fn [object]
-                                (let [key (gobj/get object "key")
-                                      cid (last (str/split key #"/"))
-                                      uploaded (gobj/get object "uploaded")]
-                                  (and (not (contains? reachable cid))
-                                       uploaded
-                                       (< (.getTime uploaded) cutoff)))))
-                             (mapv #(gobj/get % "key")))]
-                    (if (and delete? (seq candidates))
-                      (-> (all-r2-heads! e bucket)
-                          (.then
-                           (fn [heads-after]
-                             (if (= heads-before heads-after)
-                               (-> (.delete bucket (clj->js candidates))
-                                   (.then (fn [_] {:reachable (count reachable)
-                                                  :heads (count heads-before)
-                                                  :candidates (count candidates)
-                                                  :deleted (count candidates)})))
-                               {:reachable (count reachable)
-                                :heads (count heads-before)
-                                :candidates (count candidates)
-                                :deleted 0
-                                :aborted :heads-changed}))))
-                      {:reachable (count reachable) :heads (count heads-before)
-                       :candidates (count candidates) :deleted 0}))))))))
-    (js/Promise.reject
-     (js/Error. "Reachability GC currently requires an R2 listing binding"))))
+         (fn [result]
+           (let [reachable (aget result 0)
+                 cutoff (- now-ms grace-ms)
+                 candidates
+                 (->> (aget result 1)
+                      (filter
+                       (fn [object]
+                         (let [key (gobj/get object "key")
+                               cid (last (str/split key #"/"))
+                               uploaded (gobj/get object "uploaded")]
+                           (and (not (contains? reachable cid))
+                                uploaded
+                                (< (.getTime uploaded) cutoff)))))
+                      (mapv #(gobj/get % "key")))]
+             {:reachable (count reachable)
+              :heads (count heads)
+              :retention-roots (count roots)
+              :active-retention-roots (count active-roots)
+              :safe-epoch (retention/minimum-safe-epoch (mapv :root roots) now-ms)
+              :candidate-keys candidates
+              :candidates (count candidates)})))
+        (.catch (fn [error]
+                  (js/Promise.reject
+                   (js/Error. (str "GC mark audit failed: " error))))))))
+
+(defn gc-unreachable!
+  "Globally mark from every mutable R2 head and every active retention root,
+  then optionally sweep shared blocks older than GRACE-MS. Leased reader and
+  replication roots expire at NOW-MS; legal-hold and release roots remain until
+  CAS-released. A second complete head/root ETag snapshot fences detected
+  publication, renewal, and release races. DB-ID remains for source compatibility."
+  ([e db-id grace-ms delete?]
+   (gc-unreachable! e db-id grace-ms delete? (js/Date.now)))
+  ([e _db-id grace-ms delete? now-ms]
+   (if-let [bucket (env e "MERKLE_BUCKET")]
+     (-> (gc-root-snapshot! e bucket)
+         (.then
+          (fn [snapshot-before]
+            (try
+              (-> (gc-audit! e bucket snapshot-before grace-ms now-ms)
+                  (.then
+                   (fn [{:keys [candidate-keys] :as audit}]
+                     (let [result (dissoc audit :candidate-keys)]
+                       (if (and delete? (seq candidate-keys))
+                         (-> (gc-root-snapshot! e bucket)
+                             (.then
+                              (fn [snapshot-after]
+                                (if (= snapshot-before snapshot-after)
+                                  (-> (.delete bucket (clj->js candidate-keys))
+                                      (.then #(assoc result :deleted
+                                                     (count candidate-keys))))
+                                  (assoc result :deleted 0 :aborted :roots-changed)))))
+                         (assoc result :deleted 0))))))
+              (catch :default error
+                (js/Promise.reject
+                 (js/Error. (str "GC audit setup failed: " error))))))))
+     (js/Promise.reject
+      (js/Error. "Reachability GC currently requires an R2 listing binding")))))
