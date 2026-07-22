@@ -15,6 +15,10 @@
      :cljs
      (js/Uint8Array. (clj->js (mapv #(bit-xor key-byte %) bytes)))))
 
+(defn- slice-bytes [bytes offset length]
+  #?(:clj (java.util.Arrays/copyOfRange ^bytes bytes offset (+ offset length))
+     :cljs (.slice bytes offset (+ offset length))))
+
 (defn- test-encryptor [key-byte]
   (fn [{:keys [plaintext]}]
     {:bytes (xor-bytes plaintext key-byte)
@@ -68,6 +72,30 @@
     (is (= 5 (count (get-in result [:plan :fetches 0 :descriptors]))))
     (is (= (range 10) (map #(get % "id") (:values result))))
     (is (= 5 (:estimated-requests bounded-plan)))))
+
+(deftest non-contiguous-point-batch-deduplicates-blocks-and-filters-overfetch
+  (let [built (view/build-view {:view-id :authors :epoch 1
+                                :block-rows 10 :entries (entries 100)})
+        bundle (get-in built [:bundle :node])
+        requested-keys ["tenant-a/00000001" "tenant-a/00000007"
+                        "tenant-a/00000042" "tenant-a/00000099"]
+        plan (view/batch-point-query-plan {:bundle bundle :keys requested-keys})
+        ranges (mapv #(slice-bytes (:pack-bytes built) (:offset %) (:length %))
+                     (:fetches plan))
+        plaintext-blocks
+        (mapcat (fn [fetch bytes]
+                  (map (fn [descriptor]
+                         (slice-bytes bytes
+                                      (- (get descriptor "offset") (:offset fetch))
+                                      (get descriptor "length")))
+                       (:descriptors fetch)))
+                (:fetches plan) ranges)
+        result (view/finish-logical-blocks-batch-query plan plaintext-blocks)]
+    (is (= 4 (count result)))
+    (is (= (set requested-keys) (set (keys result))))
+    (is (= 3 (count (:descriptors plan))) "two keys share the first block")
+    (is (= 3 (:estimated-requests plan)) "non-adjacent blocks stay bounded")
+    (is (< (:estimated-bytes plan) (get bundle "pack-bytes")))))
 
 (deftest query-blocks-are-cid-verified
   (let [built (view/build-view {:view-id :posts :epoch 1
