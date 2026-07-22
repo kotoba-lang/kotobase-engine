@@ -57,6 +57,52 @@
 (deftest join-frontier-refuses-an-unbounded-variable-clause
   (is (nil? (materialization/clause-lookup '[?e ?a ?v] {}))))
 
+(deftest join-frontier-work-chain-is-byte-bounded-and-canonical
+  (let [bindings (mapv (fn [n] {'?person (str "person-" n)
+                                 '?team (str "team-" (mod n 3))})
+                       (range 24))
+        options {:snapshot :after :remaining [0 2]
+                 :bindings bindings :max-bytes 240}
+        chain-a (materialization/build-frontier-work-chain options)
+        chain-b (materialization/build-frontier-work-chain options)
+        by-cid (into {} (map (juxt :cid :node) (:nodes chain-a)))]
+    (is (= (:head chain-a) (:head chain-b)))
+    (is (= (mapv :cid (:nodes chain-a)) (mapv :cid (:nodes chain-b))))
+    (is (< 1 (count (:nodes chain-a))))
+    (is (every? #(<= #?(:clj (alength ^bytes (:bytes %))
+                        :cljs (.-byteLength (:bytes %)))
+                     240)
+                (:nodes chain-a)))
+    (loop [cid (:head chain-a) decoded []]
+      (if cid
+        (let [work (materialization/decode-frontier-work (get by-cid cid))]
+          (is (= :after (:snapshot work)))
+          (is (= [0 2] (:remaining work)))
+          (recur (:next-work work) (into decoded (:bindings work))))
+        (is (= bindings decoded))))))
+
+(deftest join-frontier-work-can-prepend-an-existing-chain
+  (let [tail (materialization/build-frontier-work-chain
+              {:snapshot :before :remaining [1]
+               :bindings [{'?person "tail"}] :max-bytes 512})
+        head (materialization/build-frontier-work-chain
+              {:snapshot :after :remaining [0]
+               :bindings [{'?person "head"}]
+               :next-work (:head tail) :max-bytes 512})
+        decoded (materialization/decode-frontier-work
+                 (get-in head [:nodes 0 :node]))]
+    (is (= (:head tail) (:next-work decoded)))
+    (is (= [{'?person "head"}] (:bindings decoded)))))
+
+(deftest join-frontier-single-oversized-binding-fails-closed
+  (is (thrown-with-msg?
+       #?(:clj clojure.lang.ExceptionInfo :cljs cljs.core.ExceptionInfo)
+       #"exceeds work byte budget"
+       (materialization/build-frontier-work-chain
+        {:snapshot :after :remaining [0]
+         :bindings [{'?value (apply str (repeat 1024 "x"))}]
+         :max-bytes 128}))))
+
 (deftest retraction-checks-for-an-alternative-derivation
   (let [query {:find '[?team]
                :where '[[?team "member" ?person]

@@ -2,11 +2,19 @@
   "Differential maintenance for Datalog-backed IPLD materialized views."
   (:require [clojure.set :as set]
             [clojure.string :as str]
+            [ipld.core :as ipld]
             [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.core :as peer]
             [kotobase-peer.materialized-view :as view]
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.statistics :as statistics]))
+
+(def frontier-work-format "kotobase/join-frontier-work")
+(def frontier-work-version 1)
+
+(defn- encoded-node [node]
+  (let [bytes (ipld/encode node)]
+    {:node node :bytes bytes :cid (ipld/cid bytes)}))
 
 (defn datalog-var? [value]
   (and (symbol? value) (str/starts-with? (name value) "?")))
@@ -97,6 +105,78 @@
   "Join one frontier state against already MVCC-visible EAV datoms."
   [clause bindings datoms]
   (->> datoms (keep #(unify-datom clause bindings %)) distinct vec))
+
+(defn binding->wire
+  "Canonical IPLD representation of one Datalog binding. Variable map keys are
+  encoded as sorted strings because DAG-CBOR maps cannot portably use symbols."
+  [binding]
+  (->> binding
+       (sort-by (comp name key))
+       (mapv (fn [[variable value]] [(name variable) value]))))
+
+(defn wire->binding
+  "Decode one canonical binding produced by `binding->wire`."
+  [wire]
+  (into {} (map (fn [[variable value]] [(symbol variable) value])) wire))
+
+(defn decode-frontier-work
+  "Validate and decode a join-frontier work node. The returned `:next-work` is
+  a CID or nil; bindings are ordinary symbol-keyed maps again."
+  [node]
+  (when-not (and (= frontier-work-format (get node "format"))
+                 (= frontier-work-version (get node "version"))
+                 (contains? #{"before" "after"} (get node "snapshot"))
+                 (vector? (get node "remaining"))
+                 (every? nat-int? (get node "remaining"))
+                 (vector? (get node "bindings")))
+    (throw (ex-info "Malformed join frontier work node" {:node node})))
+  {:snapshot (keyword (get node "snapshot"))
+   :remaining (get node "remaining")
+   :bindings (mapv wire->binding (get node "bindings"))
+   :next-work (some-> (get node "next-work") ipld/link-cid)})
+
+(defn build-frontier-work-chain
+  "Encode BINDINGS as a deterministic linked work chain whose every node is at
+  most MAX-BYTES. NEXT-WORK may point at an existing pending chain, allowing a
+  host to prepend the next join wave without rewriting old work. One binding
+  that cannot fit fails closed. Returns nodes in traversal/write order plus the
+  new head CID."
+  [{:keys [snapshot remaining bindings next-work max-bytes]}]
+  (when-not (and (contains? #{:before :after} snapshot)
+                 (vector? remaining) (every? nat-int? remaining)
+                 (vector? bindings) (pos-int? max-bytes))
+    (throw (ex-info "Invalid join frontier work chain input"
+                    {:snapshot snapshot :remaining remaining
+                     :bindings-type (type bindings) :max-bytes max-bytes})))
+  (letfn [(build [bindings next-work]
+            (let [node (encoded-node
+                        (cond-> {"format" frontier-work-format
+                                 "version" frontier-work-version
+                                 "snapshot" (name snapshot)
+                                 "remaining" remaining
+                                 "bindings" (mapv binding->wire bindings)}
+                          next-work (assoc "next-work" (ipld/link next-work))))]
+              (cond
+                (<= #?(:clj (alength ^bytes (:bytes node))
+                       :cljs (.-byteLength (:bytes node)))
+                    max-bytes)
+                {:nodes [node] :head (:cid node)}
+
+                (= 1 (count bindings))
+                (throw (ex-info "Join frontier binding exceeds work byte budget"
+                                {:type :frontier-binding-too-large
+                                 :binding (first bindings)
+                                 :max-bytes max-bytes}))
+
+                :else
+                (let [middle (quot (count bindings) 2)
+                      right (build (subvec bindings middle) next-work)
+                      left (build (subvec bindings 0 middle) (:head right))]
+                  {:nodes (into (:nodes left) (:nodes right))
+                   :head (:head left)}))))]
+    (if (seq bindings)
+      (build bindings next-work)
+      {:nodes [] :head next-work})))
 
 (defn frontier-step-plan
   "Choose the most selective lookupable remaining clause for every current
