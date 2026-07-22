@@ -156,6 +156,8 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    if (url.pathname === "/bench/write-cas" && !env.E2E_BEARER_TOKEN)
+      return response({ error: "write benchmark capability is not configured" }, 503);
     if (url.pathname === "/bench/write-cas" && !authorized(request, env))
       return response({ error: "unauthorized" }, 401);
     if (["/e2e/config", "/e2e/bundle", "/e2e/object", "/e2e/key"].includes(url.pathname) &&

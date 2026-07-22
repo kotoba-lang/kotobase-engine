@@ -132,6 +132,9 @@ const casEnv = {E2E_BEARER_TOKEN: "cas-capability", MERKLE_BUCKET: {
   },
   async delete(key) { casObjects.delete(key); },
 }};
+const unconfiguredCas = await worker.fetch(
+  new Request(`${origin}/bench/write-cas`, {method: "POST"}), env);
+assert.equal(unconfiguredCas.status, 503);
 const deniedCas = await worker.fetch(new Request(`${origin}/bench/write-cas`, {method: "POST"}), casEnv);
 assert.equal(deniedCas.status, 401);
 const casResponse = await worker.fetch(new Request(
@@ -143,4 +146,4 @@ assert.equal(casResult.finalHead, 4);
 assert.equal(casResult.lostUpdates, 0);
 assert.equal(casObjects.size, 0, "benchmark objects and head are deleted in finally");
 
-console.log(JSON.stringify({ tests: 16, assertions: 49, outcome: "succeeded" }));
+console.log(JSON.stringify({ tests: 17, assertions: 50, outcome: "succeeded" }));
