@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
+            [kotobase-peer.atomic-publication :as publication]
             [kotobase-peer.compaction :as compaction]
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.retention :as retention]
@@ -241,6 +242,34 @@
       (js/Promise.reject
        (js/Error. "No MERKLE_BUCKET or MERKLE_S3_* backend configured")))))
 
+(defn resolve-database-head!
+  "Resolve a legacy VersionManifest head or an EpochPublication head while
+  retaining the mutable head identity and ETag needed for safe publication."
+  [e db-id]
+  (-> (get-head e db-id)
+      (.then
+       (fn [{head-cid :value :keys [etag]}]
+         (if-not head-cid
+           {:head-cid nil :base-cid nil :etag etag :publication nil}
+           (-> (get-node! e head-cid)
+               (.then
+                (fn [node]
+                  {:head-cid head-cid
+                   :base-cid (publication/base-manifest-cid node head-cid)
+                   :etag etag
+                   :publication (when (publication/publication-node? node)
+                                  node)}))))))))
+
+(defn- load-publication-view-bundles!
+  [e publication-node]
+  (-> (mapv (fn [[view-id descriptor]]
+              (-> (get-node! e (ipld/link-cid (get descriptor "bundle")))
+                  (.then (fn [node] [view-id node]))))
+            (get publication-node "views"))
+      clj->js
+      js/Promise.all
+      (.then #(into {} (array-seq %)))))
+
 (defn compare-and-exchange-head!
   "Adapt the asynchronous R2/S3 ETag API to kotobase-peer.core's CAS result
    contract: return NEXT on success; on a lost race, return the actual winning
@@ -352,17 +381,17 @@
                          (index-run-refs [{:node manifest}] :eavt)
                          (some-> (get manifest "previous") ipld/link-cid)
                          depth)))))))]
-     (-> (get-head e db-id)
-         (.then (fn [{:keys [value]}] (scan value 0)))))))
+     (-> (resolve-database-head! e db-id)
+         (.then (fn [{:keys [base-cid]}] (scan base-cid 0)))))))
 
 (defn find-entities!
   "Return {entity [EAVT rows]} for every entity whose id starts with PREFIX.
   A checkpoint directory replaces the compacted portion of the manifest walk."
   ([e db-id prefix] (find-entities! e db-id prefix 256))
   ([e db-id prefix max-depth]
-   (-> (get-head e db-id)
+   (-> (resolve-database-head! e db-id)
        (.then
-        (fn [{head-cid :value}]
+        (fn [{head-cid :base-cid}]
           (letfn [(collect [cid remaining refs]
                     (cond
                       (nil? cid) (js/Promise.resolve refs)
@@ -487,12 +516,12 @@
    (-> (retention-safe-epoch! e db-id)
        (.then #(compact-head! e db-id window-size target-run-rows %))))
   ([e db-id window-size target-run-rows root-safe-epoch]
-   (-> (get-head e db-id)
+   (-> (resolve-database-head! e db-id)
        (.then
-        (fn [{head-cid :value :keys [etag]}]
+        (fn [{:keys [head-cid base-cid etag publication]}]
           (if-not head-cid
             false
-            (-> (manifest-window! e head-cid window-size)
+            (-> (manifest-window! e base-cid window-size)
                 (.then
                  (fn [{:keys [manifests tail]}]
                    (let [present (filter #(seq (index-run-refs manifests %)) lsm/indexes)
@@ -545,13 +574,38 @@
                                                      "target-run-rows" target-run-rows
                                                      "output-run-count"
                                                      (reduce + (map count (vals compacted)))}})
-                                         effects (concat (:effects directory)
-                                                         (:effects manifest))]
-                                     (-> (put-blocks! e effects)
+                                         base-effects (concat (:effects directory)
+                                                              (:effects manifest))]
+                                     (-> (if publication
+                                           (load-publication-view-bundles!
+                                            e publication)
+                                           (js/Promise.resolve nil))
                                          (.then
-                                          (fn [_]
-                                            (cas-head! e db-id (:cid manifest)
-                                                       etag)))))))))))))))))))))
+                                          (fn [view-bundle-nodes]
+                                            (let [rebase
+                                                  (when publication
+                                                    (publication/rebase-plan
+                                                     {:db-id db-id
+                                                      :expected head-cid
+                                                      :publication-node publication
+                                                      :base-manifest manifest
+                                                      :view-bundle-nodes
+                                                      view-bundle-nodes}))
+                                                  effects
+                                                  (concat base-effects
+                                                          (when rebase
+                                                            (butlast
+                                                             (:effects rebase))))
+                                                  next-head
+                                                  (if rebase
+                                                    (get-in rebase
+                                                            [:result :publication])
+                                                    (:cid manifest))]
+                                              (-> (put-blocks! e effects)
+                                                  (.then
+                                                   (fn [_]
+                                                     (cas-head! e db-id next-head
+                                                                etag)))))))))))))))))))))))))
 
 (defn get-compaction-lease!
   "Read and validate the mutable per-database compaction lease."
@@ -578,7 +632,12 @@
   (when-not (and (pos-int? min-manifests) (pos-int? l0-threshold))
     (throw (ex-info "Compaction pressure thresholds must be positive"
                     {:min-manifests min-manifests :l0-threshold l0-threshold})))
-  (-> (manifest-window! e head-cid min-manifests)
+  (-> (get-node! e head-cid)
+      (.then
+       (fn [head-node]
+         (manifest-window! e
+                           (publication/base-manifest-cid head-node head-cid)
+                           min-manifests)))
       (.then
        (fn [{:keys [manifests tail]}]
          (let [l0-count (reduce

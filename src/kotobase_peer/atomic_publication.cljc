@@ -108,3 +108,61 @@
     (= "kotobase/version-manifest" (get node "format")) self-cid
     :else (throw (ex-info "Unknown database head format"
                           {:format (get node "format")}))))
+
+(defn rebase-plan
+  "Replace an EpochPublication's physical base manifest after semantics-
+  preserving compaction. Statistics and derived view links remain pinned to
+  the same logical epoch; the root block precedes one final HeadCAS."
+  [{:keys [db-id expected publication-node base-manifest view-bundle-nodes]}]
+  (let [manifest-node (:node base-manifest)
+        manifest-cid (:cid base-manifest)]
+    (when-not (publication-node? publication-node)
+      (throw (ex-info "Rebase requires an EpochPublication" {})))
+    (when-not (and (= "kotobase/version-manifest" (get manifest-node "format"))
+                   (= (str db-id) (get publication-node "db-id"))
+                   (= (str db-id) (get manifest-node "db-id"))
+                   (= (get publication-node "epoch") (get manifest-node "epoch")))
+      (throw (ex-info "Compacted base must preserve publication database and epoch"
+                      {:db-id db-id
+                       :publication-epoch (get publication-node "epoch")
+                       :manifest-epoch (get manifest-node "epoch")})))
+    (let [view-directory (get publication-node "views")
+          bundle-ids (set (keys view-directory))]
+      (when-not (= bundle-ids (set (keys view-bundle-nodes)))
+        (throw (ex-info "Rebase requires every publication view bundle"
+                        {:expected bundle-ids
+                         :actual (set (keys view-bundle-nodes))})))
+      (let [bundles
+            (into (sorted-map)
+                  (map (fn [[view-id bundle-node]]
+                         (when-not (and (= "kotobase/query-bundle"
+                                           (get bundle-node "format"))
+                                        (= view-id (get bundle-node "view-id"))
+                                        (= (get publication-node "epoch")
+                                           (get bundle-node "epoch")))
+                           (throw (ex-info "Invalid publication view bundle"
+                                           {:view-id view-id})))
+                         [view-id
+                          (encoded (assoc bundle-node
+                                          "source-manifest"
+                                          (ipld/link manifest-cid)))]))
+                  view-bundle-nodes)
+            rebased-directory
+            (into (sorted-map)
+                  (map (fn [[view-id descriptor]]
+                         [view-id (assoc descriptor "bundle"
+                                         (ipld/link (get-in bundles
+                                                            [view-id :cid])))]))
+                  view-directory)
+            root (encoded (assoc publication-node
+                                 "base-manifest" (ipld/link manifest-cid)
+                                 "views" rebased-directory))]
+      {:result {:db-id (str db-id)
+                :epoch (get publication-node "epoch")
+                :publication (:cid root)
+                :base-manifest manifest-cid}
+       :publication root
+       :view-bundles bundles
+       :effects (vec (concat (map (comp block-put val) bundles)
+                             [(block-put root)
+                              (head-cas db-id expected (:cid root))]))}))))

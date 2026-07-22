@@ -56,6 +56,37 @@
            (publication/base-manifest-cid
             (get-in base [:manifest :node]) (get-in base [:manifest :cid]))))))
 
+(deftest compaction-rebases-only-the-physical-base
+  (let [{:keys [base cards statistics]} (fixture)
+        published (publication/build-plan
+                   {:db-id "tenant-a" :expected nil :base-plan base
+                    :statistics statistics :views [cards]})
+        compacted (lsm/build-manifest
+                   {:db-id "tenant-a" :epoch 7 :safe-epoch 7
+                    :statistics {"operation" "compaction"}})
+        rebased (publication/rebase-plan
+                 {:db-id "tenant-a"
+                  :expected (get-in published [:publication :cid])
+                  :publication-node (get-in published [:publication :node])
+                  :base-manifest compacted
+                  :view-bundle-nodes
+                  {"people/cards" (get-in cards [:bundle :node])}})
+        before (get-in published [:publication :node])
+        after (get-in rebased [:publication :node])]
+    (is (= (:cid compacted)
+           (ipld/link-cid (get after "base-manifest"))))
+    (is (= (get before "statistics") (get after "statistics")))
+    (is (= (get-in before ["views" "people/cards" "pack"])
+           (get-in after ["views" "people/cards" "pack"])))
+    (is (= (:cid compacted)
+           (ipld/link-cid
+            (get-in rebased [:view-bundles "people/cards" :node
+                             "source-manifest"]))))
+    (is (= [:block/put :block/put :head/cas]
+           (mapv :effect/type (:effects rebased))))
+    (is (= (get-in published [:publication :cid])
+           (get-in rebased [:effects 2 :expected])))))
+
 (deftest epoch-source-and-id-mismatches-fail-before-effects
   (let [{:keys [base cards statistics]} (fixture)]
     (testing "statistics cannot lag the base snapshot"
