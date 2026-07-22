@@ -1,0 +1,30 @@
+{:date "2026-07-23"
+ :backend :cloudflare-r2
+ :execution {:mode "wrangler remote preview"
+             :bucket "kotobase-merkle-lsm"
+             :scope "isolated bench/compaction-scheduler UUID prefix"
+             :cleanup "lease and token-scoped checkpoints deleted in finally"}
+ :result {:first-claimed true
+          :active-contender-fenced true
+          :renewed true
+          :stale-renewal-fenced true
+          :expired-lease-reclaimed true
+          :reclaim-attempt 2
+          :checkpointed true
+          :stale-finish-fenced true
+          :completed true
+          :final-owner "murakumo-b"
+          :final-status "completed"
+          :operations 10
+          :p50-ms 91
+          :p95-ms 138
+          :measured-r2-wall-ms 935
+          :remote-worker-request-ms 1613}
+ :safety {:deterministic-task-id true
+          :r2-etag-cas true
+          :active-lease-not-stolen true
+          :expired-attempt-reclaim true
+          :stale-worker-fenced true
+          :immutable-token-checkpoint true
+          :isolated-prefix-cleaned true}
+ :interpretation "The real R2 protocol admitted one worker, fenced an active contender and stale ETags, reclaimed the lease after expiry with a monotonic attempt, durably checkpointed the successor, and allowed only the successor to publish terminal scheduler state."}

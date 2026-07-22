@@ -205,6 +205,72 @@ async function benchmarkR2OrphanGc(env) {
   }
 }
 
+async function benchmarkR2CompactionLease(env) {
+  const runId = crypto.randomUUID();
+  const prefix = `bench/compaction-scheduler/${runId}/`;
+  const leaseKey = `${prefix}lease`;
+  const checkpointKey = token => `${prefix}checkpoints/task-a/${token}`;
+  const keys = [leaseKey, checkpointKey("worker-a"), checkpointKey("worker-b")];
+  const timings = [];
+  const timed = async operation => {
+    const started = performance.now();
+    const value = await operation();
+    timings.push(performance.now() - started);
+    return value;
+  };
+  const readLease = async () => {
+    const object = await env.MERKLE_BUCKET.get(leaseKey);
+    return object ? {etag: object.etag, value: JSON.parse(await object.text())} : null;
+  };
+  const claim = async (owner, token, now, leaseMs) => {
+    const current = await timed(readLease);
+    if (current?.value.status === "running" && current.value["expires-at"] > now)
+      return {claimed: false, reason: "leased", current};
+    const lease = {format: "kotobase/compaction-lease", version: 1,
+      "task-id": "task-a", "db-id": "db-a", "expected-head": "head-a",
+      owner, token, attempt: (current?.value.attempt || 0) + 1,
+      "acquired-at": now, "expires-at": now + leaseMs, status: "running"};
+    const result = await timed(() => env.MERKLE_BUCKET.put(
+      leaseKey, JSON.stringify(lease), {onlyIf: current
+        ? {etagMatches: current.etag} : {etagDoesNotMatch: "*"}}));
+    return result ? {claimed: true, lease, etag: result.etag}
+                  : {claimed: false, reason: "cas-lost"};
+  };
+  try {
+    const first = await claim("murakumo-a", "worker-a", 1000, 100);
+    const contender = await claim("murakumo-b", "worker-b", 1001, 100);
+    const renewedLease = {...first.lease, "expires-at": 1150};
+    const renewed = await timed(() => env.MERKLE_BUCKET.put(
+      leaseKey, JSON.stringify(renewedLease), {onlyIf: {etagMatches: first.etag}}));
+    const staleRenewal = await timed(() => env.MERKLE_BUCKET.put(
+      leaseKey, JSON.stringify({...first.lease, "expires-at": 1200}),
+      {onlyIf: {etagMatches: first.etag}}));
+    const reclaimed = await claim("murakumo-b", "worker-b", 1150, 100);
+    const checkpoint = await timed(() => env.MERKLE_BUCKET.put(
+      checkpointKey("worker-b"), JSON.stringify({task: "task-a", token: "worker-b",
+        attempt: reclaimed.lease.attempt, outcome: "published"}),
+      {onlyIf: {etagDoesNotMatch: "*"}}));
+    const staleFinish = await timed(() => env.MERKLE_BUCKET.put(
+      leaseKey, JSON.stringify({...first.lease, status: "completed"}),
+      {onlyIf: {etagMatches: renewed.etag}}));
+    const completedLease = {...reclaimed.lease, status: "completed"};
+    const completed = await timed(() => env.MERKLE_BUCKET.put(
+      leaseKey, JSON.stringify(completedLease),
+      {onlyIf: {etagMatches: reclaimed.etag}}));
+    const stored = await readLease();
+    return {backend: "cloudflare-r2", firstClaimed: first.claimed,
+      contenderFenced: contender.reason === "leased", renewed: Boolean(renewed),
+      staleRenewalFenced: !staleRenewal, reclaimed: reclaimed.claimed,
+      reclaimAttempt: reclaimed.lease.attempt, checkpointed: Boolean(checkpoint),
+      staleFinishFenced: !staleFinish, completed: Boolean(completed),
+      finalOwner: stored.value.owner, finalStatus: stored.value.status,
+      operations: timings.length, p50Ms: percentile(timings, 0.5),
+      p95Ms: percentile(timings, 0.95), wallMs: timings.reduce((a, b) => a + b, 0)};
+  } finally {
+    await env.MERKLE_BUCKET.delete(keys);
+  }
+}
+
 const BENCH_PAGE = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Kotobase Browser Range Benchmark</title></head>
@@ -251,10 +317,10 @@ const E2E_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    if (["/bench/write-cas", "/bench/orphan-gc"].includes(url.pathname) &&
+    if (["/bench/write-cas", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
         !env.E2E_BEARER_TOKEN)
       return response({ error: "write benchmark capability is not configured" }, 503);
-    if (["/bench/write-cas", "/bench/orphan-gc"].includes(url.pathname) &&
+    if (["/bench/write-cas", "/bench/orphan-gc", "/bench/compaction-lease"].includes(url.pathname) &&
         !authorized(request, env))
       return response({ error: "unauthorized" }, 401);
     if (["/e2e/config", "/e2e/bundle", "/e2e/object", "/e2e/key"].includes(url.pathname) &&
@@ -349,6 +415,9 @@ export default {
     }
     if (request.method === "POST" && url.pathname === "/bench/orphan-gc") {
       return response(await benchmarkR2OrphanGc(env));
+    }
+    if (request.method === "POST" && url.pathname === "/bench/compaction-lease") {
+      return response(await benchmarkR2CompactionLease(env));
     }
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(BENCH_PAGE, { headers: {

@@ -163,6 +163,21 @@ reports the effective minimum safe epoch, and fences sweep when either a head
 or registry ETag changes. `compact-head!` uses the same minimum epoch, so a
 pinned snapshot is protected from both version pruning and physical block GC.
 
+Production compaction is scheduled with one deterministic task CID per
+database head and compaction bounds. The R2 host claims a per-database lease
+with ETag CAS, fences active contenders, renews only running leases, reclaims
+expired attempts, and writes immutable token-scoped checkpoints. Scheduling
+first reads a bounded manifest/L0 pressure window, so an already compacted
+database is not compacted forever. Hosts use `run-compaction-batch!` for bounded
+concurrency; HeadCAS remains the publication authority if a lease expires while
+work is still running, and unreachable speculative output is collected by the
+shared-prefix reachability GC. The authenticated `/bench/compaction-lease`
+drill uses an isolated UUID prefix and removes every lease/checkpoint in
+`finally`. A 2026-07-23 real-R2 run proved active-contender and stale-ETag
+fencing, renewal, expiry reclaim at attempt 2, immutable checkpointing, and
+terminal completion in 935 ms of measured R2 operations (p50 91 ms, p95 138
+ms; remote Worker request 1613 ms).
+
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
 Run `clojure -M:view-bench 100000 512` for the browser/no-local-disk serving
