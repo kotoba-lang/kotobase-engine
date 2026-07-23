@@ -243,6 +243,14 @@ ms; remote Worker request 1613 ms).
 
 Run `clojure -M:merkle-bench 1000 100000 10000000` for the ADR scale sweep;
 `MERKLE_BENCH_WRITERS` selects simulated concurrent flushers (default 32).
+For release evidence, prefer `npm run bench:merkle-scale`, which runs each
+size in an isolated JVM, defaults to one writer and a 2 GiB heap, and enables
+the resource gate. `KOTOBASE_SCALE_SIZES=100000,10000000`,
+`KOTOBASE_SCALE_MAX_HEAP`, and `KOTOBASE_SCALE_WRITERS` define the sweep.
+Every result includes flush p50/p95/p99, compaction and total wall time,
+process CPU, sampled peak heap, object counts/bytes, and read/write
+amplification. Missing metrics, lost rows, threshold breaches, or OOM make the
+runner nonzero; a smaller successful tier cannot mask a failed larger tier.
 Run `clojure -M:view-bench 100000 512` for the browser/no-local-disk serving
 gate. It builds an immutable materialized-view pack, then executes deterministic
 point and bounded-range queries through the same sparse-index selection, byte
