@@ -179,14 +179,23 @@ const gcEnv = {E2E_BEARER_TOKEN: "gc-capability", MERKLE_BUCKET: {
   async get(key) {
     const entry = gcObjects.get(key);
     if (!entry) return null;
-    return {etag: entry.etag, async text() { return entry.value; }};
+    return {etag: entry.etag,
+      async text() { return new TextDecoder().decode(entry.value); },
+      async arrayBuffer() {
+        return entry.value.buffer.slice(entry.value.byteOffset,
+          entry.value.byteOffset + entry.value.byteLength);
+      }};
   },
   async put(key, body, options) {
     const current = gcObjects.get(key);
     const condition = options?.onlyIf;
     if (condition?.etagMatches && current?.etag !== condition.etagMatches) return null;
     if (condition?.etagDoesNotMatch === "*" && current) return null;
-    const entry = {value: typeof body === "string" ? body : String(body),
+    const entry = {value: typeof body === "string"
+      ? new TextEncoder().encode(body)
+      : new Uint8Array(body instanceof ArrayBuffer ? body : body.buffer,
+        body instanceof ArrayBuffer ? 0 : body.byteOffset,
+        body instanceof ArrayBuffer ? body.byteLength : body.byteLength).slice(),
                    etag: `gc-${++gcVersion}`};
     gcObjects.set(key, entry);
     return entry;
@@ -209,10 +218,19 @@ assert.deepEqual({heads: gcResult.heads, reachable: gcResult.reachable,
                   pinnedCandidates: gcResult.pinnedCandidates,
                   dryRunCandidates: gcResult.dryRunCandidates,
                   deleted: gcResult.deleted, liveAfter: gcResult.liveAfter,
-                  orphanExistsAfter: gcResult.orphanExistsAfter},
+                  inventoryPasses: gcResult.inventoryPasses,
+                  candidatesStable: gcResult.candidatesStable,
+                  backedUp: gcResult.backedUp,
+                  restored: gcResult.restored,
+                  restoredCidVerified: gcResult.restoredCidVerified,
+                  inventoryCidPresent: typeof gcResult.inventoryCid === "string",
+                  orphanExistsAfterRestore: gcResult.orphanExistsAfterRestore},
                  {heads: 2, reachable: 4, retentionRoots: 1, pinnedCandidates: 0,
                   dryRunCandidates: 1,
-                  deleted: 1, liveAfter: 4, orphanExistsAfter: false});
+                  deleted: 1, liveAfter: 5, inventoryPasses: 2,
+                  candidatesStable: true, backedUp: 1, restored: 1,
+                  restoredCidVerified: true, inventoryCidPresent: true,
+                  orphanExistsAfterRestore: true});
 assert.equal(gcObjects.size, 0, "GC drill objects and heads are deleted in finally");
 
 const schedulerResponse = await worker.fetch(new Request(`${origin}/bench/compaction-lease`, {

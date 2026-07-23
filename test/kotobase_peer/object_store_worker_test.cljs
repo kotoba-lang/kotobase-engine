@@ -585,6 +585,17 @@
                            (if (string? value)
                              #js {:text (fn [] (js/Promise.resolve value))}
                              (bytes-object value))))))
+               :put (fn [key value opts]
+                      (let [conditional? (= "*" (some-> opts .-onlyIf
+                                                         .-etagDoesNotMatch))]
+                        (if (and conditional? (contains? @objects key))
+                          (js/Promise.resolve nil)
+                          (do
+                            (swap! objects assoc key
+                                   (if (instance? js/ArrayBuffer value)
+                                     (js/Uint8Array. value)
+                                     value))
+                            (js/Promise.resolve #js {:key key})))))
                :list (fn [opts]
                        (let [wanted (.-prefix opts)
                              listed (->> (keys @objects)
@@ -612,11 +623,45 @@
           (.then (fn [sweep]
                    (is (= 1 (:deleted sweep)))
                    (is (= 2 (:inventory-passes sweep)))
+                   (is (= 1 (:backed-up sweep)))
+                   (is (string? (:backup-inventory sweep)))
                    (is (nil? (get @objects (block-key orphan))))
                    (is (every? #(contains? @objects (block-key %))
                                [root-a child-a root-b child-b
                                 checkpoint resumable-child ingress-workload])
                        "other heads and resumable checkpoint graphs survive")
+                   (-> (worker/restore-gc-inventory!
+                        env (:backup-inventory sweep))
+                       (.then (fn [restored]
+                                (is (= 1 (:restored restored)))
+                                (is (= orphan
+                                       (ipld/cid
+                                        (get @objects (block-key orphan)))))
+                                (worker/restore-gc-inventory!
+                                 env (:backup-inventory sweep))))
+                       (.then (fn [replayed]
+                                (is (= 1 (:already-present replayed)))
+                                (let [backup-key
+                                      (worker/gc-backup-object-key env orphan)
+                                      good-backup (get @objects backup-key)]
+                                  (swap! objects dissoc (block-key orphan))
+                                  (swap! objects assoc backup-key
+                                         (ipld/encode {"corrupt" true}))
+                                  (-> (worker/restore-gc-inventory!
+                                       env (:backup-inventory sweep))
+                                      (.then
+                                       (fn [_]
+                                         (is false
+                                             "corrupt backup must not restore")))
+                                      (.catch
+                                       (fn [error]
+                                         (is (str/includes?
+                                              (str error) "CID mismatch"))
+                                         (is (nil? (get @objects
+                                                       (block-key orphan))))
+                                         (swap! objects assoc backup-key
+                                                good-backup))))))))))
+          (.then (fn [_]
                    (let [second-orphan-bytes (ipld/encode {"orphan" 2})
                          second-orphan (ipld/cid second-orphan-bytes)
                          block-list-calls (atom 0)

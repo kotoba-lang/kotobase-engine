@@ -165,10 +165,23 @@ Only byte-for-byte equal candidate key vectors are deleted; a head/root change
 or candidate appearing/disappearing aborts the sweep. The grace period protects
 fresh blocks written before a concurrent head publication. Publishers must
 upload their immutable blocks before HeadCAS.
-The authenticated `/bench/orphan-gc` drill uses an isolated prefix and
-cleans it in `finally`; the 2026-07-22 real-R2 run marked 2 heads and 4 live
-blocks, found/deleted exactly 1 orphan, retained all 4 live blocks, and took
-571 ms.
+Before deletion, every candidate is copied sequentially to immutable
+`gc-backups/objects/<content-cid>` storage and a DAG-CBOR inventory is written
+under `gc-backups/inventories/<inventory-cid>`. The delete receipt includes that
+inventory CID and deletion does not begin unless all objects and the inventory
+have been stored. `restore-gc-inventory!` verifies the inventory CID, restricts
+destinations to GC-managed block/scheduler namespaces, verifies every content
+CID, and uses put-if-absent so it cannot overwrite newer mutable state. Repeated
+restore is idempotent only when the existing bytes have the expected CID.
+`MERKLE_GC_BACKUP_BUCKET` may bind a separate R2 bucket; otherwise backup uses
+`MERKLE_BUCKET`. Backup retention is explicit—GC never automatically deletes
+these inventories or their content-addressed objects.
+The authenticated `/bench/orphan-gc` drill uses an isolated prefix and cleans
+it in `finally`. The 2026-07-23 real-R2 run marked 2 heads and 4 live blocks,
+confirmed the same one-candidate inventory twice, backed up and deleted the
+orphan, restored it by inventory CID, and verified its content CID in 1,446 ms.
+See `bench/results/2026-07-23-r2-gc-backup-restore.edn`; this is a correctness
+drill rather than a production latency percentile.
 
 `kotobase-peer.retention` defines the pure retention-root contract. Active
 reader and replication roots are leases with an explicit millisecond expiry;
