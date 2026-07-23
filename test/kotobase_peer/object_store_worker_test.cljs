@@ -371,6 +371,94 @@
                       (is false (str "subblock prefix page rejected: " error))
                       (done))))))))
 
+(deftest prefix-pages-fetch-required-independent-runs-in-bounded-waves
+  (async done
+    (let [datoms-for (fn [numbers]
+                       (mapv (fn [n]
+                               {:e (str "team-" (.padStart (str n) 4 "0"))
+                                :a "member" :v "alice"})
+                             numbers))
+          plan-a (lsm/flush-plan
+                  {:db-id "db-wave" :epoch 1 :target-run-rows 4096
+                   :datoms (datoms-for (range 0 260 2))})
+          plan-b (lsm/flush-plan
+                  {:db-id "db-wave" :epoch 2 :target-run-rows 4096
+                   :previous (get-in plan-a [:manifest :cid])
+                   :expected (get-in plan-a [:manifest :cid])
+                   :datoms (datoms-for (range 1 260 2))})
+          effects (filter #(= :block/put (:effect/type %))
+                          (concat (:effects plan-a) (:effects plan-b)))
+          blocks (into {} (map (fn [{:keys [cid bytes]}]
+                                 [(str "wave/blocks/" cid) bytes])) effects)
+          head-cid (get-in plan-b [:manifest :cid])
+          refs [(first (get-in plan-a [:manifest :node "indexes" "aevt" "l0"]))
+                (first (get-in plan-b [:manifest :node "indexes" "aevt" "l0"]))]
+          data-cids (set (mapcat (fn [ref]
+                                  (map #(str "wave/blocks/"
+                                             (ipld/link-cid (get % "cid")))
+                                       (get ref "blocks")))
+                                refs))
+          gets (atom [])
+          active (atom 0)
+          max-active (atom 0)
+          bucket
+          #js {:get
+               (fn [key]
+                 (swap! gets conj key)
+                 (let [value (if (= key "wave/heads/db-wave")
+                               head-cid (get blocks key))
+                       response
+                       (when value
+                         #js {:etag "stable"
+                              :text (fn [] (js/Promise.resolve value))
+                              :arrayBuffer
+                              (fn []
+                                (js/Promise.resolve
+                                 (.slice (.-buffer value) (.-byteOffset value)
+                                         (+ (.-byteOffset value)
+                                            (.-byteLength value)))))})]
+                   (if (contains? data-cids key)
+                     (js/Promise.
+                      (fn [resolve _]
+                        (let [current (swap! active inc)]
+                          (swap! max-active max current)
+                          (js/setTimeout
+                           (fn [] (swap! active dec) (resolve response)) 5))))
+                     (js/Promise.resolve response))))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "wave"}]
+      (-> (worker/find-index-prefix-page!
+           env "db-wave" :aevt [["member"]]
+           {:limit 64 :block-get-concurrency 2})
+          (.then
+           (fn [page]
+             (is (= 64 (count (:rows page))))
+             (is (= 2 (:scanned-runs page)))
+             (is (= 2 (:scanned-blocks page)))
+             (is (= 2 (:fetched-blocks page)))
+             (is (= 2 (:max-concurrent-block-gets page)))
+             (is (= 2 @max-active)
+                 "only independently selected runs overlap in one GET wave")
+             (is (= 2 (count (filter data-cids @gets)))
+                 "parallelism does not add a speculative successor GET")
+             (reset! gets [])
+             (reset! max-active 0)
+             (worker/find-index-prefix-page!
+              env "db-wave" :aevt [["member"]]
+              {:limit 64 :block-get-concurrency 1})))
+          (.then
+           (fn [page]
+             (is (= 64 (count (:rows page))))
+             (is (= 1 (:max-concurrent-block-gets page)))
+             (is (= 1 @max-active)
+                 "a concurrency cap of one is enforced by observed GETs")
+             (is (= 2 (count (filter data-cids @gets)))
+                 "serial and parallel waves fetch the same required blocks")
+             (done)))
+          (.catch
+           (fn [error]
+             (is false (str "independent run wave rejected: " error))
+             (done)))))))
+
 (deftest atomic-publication-persists-everything-before-head-cas
   (async done
     (let [entries (atom {})
