@@ -1,0 +1,23 @@
+{:date "2026-07-23"
+ :backend :cloudflare-r2
+ :bucket "kotobase-merkle-lsm"
+ :scope "isolated bench/orphan-gc UUID prefix"
+ :worker-version "9ce80925-9bff-42dc-b9fb-daee14d59f58"
+ :cleanup {:isolated-prefix :deleted-in-finally
+           :temporary-worker :deleted}
+ :result {:heads 2
+          :retention-roots 1
+          :pinned-candidates 0
+          :reachable 4
+          :dry-run-candidates 1
+          :inventory-passes 2
+          :candidates-stable true
+          :backed-up 1
+          :inventory-cid "cc19055eca4749716f19ad7f102c21082c23f2007217885feb5056093d1f27df"
+          :deleted 1
+          :restored 1
+          :restored-cid-verified true
+          :live-after-restore 5
+          :orphan-exists-after-restore true
+          :wall-ms 1446}
+ :claim "A real R2 isolated-prefix drill independently reproduced the candidate inventory, wrote content-addressed backup plus inventory before deletion, deleted one orphan, restored it by inventory CID, and verified the restored content CID. This is a correctness drill, not a production latency percentile."}

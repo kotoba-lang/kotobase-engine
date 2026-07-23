@@ -226,6 +226,17 @@ async function listAll(bucket, prefix) {
   return objects;
 }
 
+async function objectBytes(object) {
+  if (typeof object.arrayBuffer === "function")
+    return new Uint8Array(await object.arrayBuffer());
+  return new TextEncoder().encode(await object.text());
+}
+
+async function sha256Hex(bytes) {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+  return [...digest].map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
 async function benchmarkR2OrphanGc(env) {
   const runId = crypto.randomUUID();
   const prefix = `bench/orphan-gc/${runId}/`;
@@ -291,22 +302,71 @@ async function benchmarkR2OrphanGc(env) {
     });
     if (!releasePut) throw new Error("retention root release CAS lost");
     const collectible = await audit();
-    const snapshotAfter = {heads: await readHeads(), roots: await readRoots()};
-    const stable = JSON.stringify({heads: collectible.heads, roots: collectible.roots}) ===
-      JSON.stringify(snapshotAfter);
-    if (!stable) throw new Error("head/root set changed during GC mark; sweep fenced");
+    const confirmed = await audit();
+    const rootsStable = JSON.stringify({heads: collectible.heads, roots: collectible.roots}) ===
+      JSON.stringify({heads: confirmed.heads, roots: confirmed.roots});
+    const candidatesStable = JSON.stringify(collectible.candidates) ===
+      JSON.stringify(confirmed.candidates);
+    if (!rootsStable || !candidatesStable)
+      throw new Error("head/root or candidate inventory changed; sweep fenced");
+
+    const backupEntries = [];
+    for (const key of collectible.candidates) {
+      const object = await env.MERKLE_BUCKET.get(key);
+      if (!object) throw new Error(`candidate disappeared before backup: ${key}`);
+      const bytes = await objectBytes(object);
+      const contentCid = await sha256Hex(bytes);
+      const backupKey = `${prefix}gc-backups/objects/${contentCid}`;
+      await env.MERKLE_BUCKET.put(backupKey, bytes, {onlyIf: {etagDoesNotMatch: "*"}});
+      keys.push(backupKey);
+      backupEntries.push({key, "content-cid": contentCid, bytes: bytes.byteLength});
+    }
+    const inventoryBytes = new TextEncoder().encode(JSON.stringify({
+      format: "kotobase/gc-backup-inventory", version: 1, prefix,
+      candidates: backupEntries,
+    }));
+    const inventoryCid = await sha256Hex(inventoryBytes);
+    const inventoryKey = `${prefix}gc-backups/inventories/${inventoryCid}`;
+    await env.MERKLE_BUCKET.put(inventoryKey, inventoryBytes,
+      {onlyIf: {etagDoesNotMatch: "*"}});
+    keys.push(inventoryKey);
     await env.MERKLE_BUCKET.delete(collectible.candidates);
+
+    const storedInventory = await env.MERKLE_BUCKET.get(inventoryKey);
+    const restoredInventoryBytes = await objectBytes(storedInventory);
+    if (await sha256Hex(restoredInventoryBytes) !== inventoryCid)
+      throw new Error("backup inventory CID mismatch");
+    const inventory = JSON.parse(new TextDecoder().decode(restoredInventoryBytes));
+    let restored = 0;
+    for (const entry of inventory.candidates) {
+      const backup = await env.MERKLE_BUCKET.get(
+        `${prefix}gc-backups/objects/${entry["content-cid"]}`);
+      const bytes = await objectBytes(backup);
+      if (await sha256Hex(bytes) !== entry["content-cid"])
+        throw new Error(`backup content CID mismatch: ${entry.key}`);
+      const written = await env.MERKLE_BUCKET.put(entry.key, bytes,
+        {onlyIf: {etagDoesNotMatch: "*"}});
+      if (!written) throw new Error(`restore destination already exists: ${entry.key}`);
+      restored += 1;
+    }
+    const restoredOrphan = await env.MERKLE_BUCKET.get(`${blockPrefix}orphan`);
+    const restoredCidVerified = restoredOrphan &&
+      await sha256Hex(await objectBytes(restoredOrphan)) === backupEntries[0]["content-cid"];
     const liveAfter = await listAll(env.MERKLE_BUCKET, blockPrefix);
     return {backend: "cloudflare-r2", heads: collectible.heads.length,
             retentionRoots: collectible.roots.length,
             pinnedCandidates: pinned.candidates.length,
             reachable: collectible.reachable.size,
             dryRunCandidates: collectible.candidates.length,
-            deleted: collectible.candidates.length, liveAfter: liveAfter.length,
-            orphanExistsAfter: Boolean(await env.MERKLE_BUCKET.get(`${blockPrefix}orphan`)),
+            inventoryPasses: 2, candidatesStable,
+            backedUp: backupEntries.length, inventoryCid,
+            deleted: collectible.candidates.length, restored,
+            restoredCidVerified, liveAfter: liveAfter.length,
+            orphanExistsAfterRestore: Boolean(restoredOrphan),
             wallMs: performance.now() - started};
   } finally {
-    await env.MERKLE_BUCKET.delete(keys);
+    const remaining = await listAll(env.MERKLE_BUCKET, prefix);
+    await env.MERKLE_BUCKET.delete(remaining.map(object => object.key));
   }
 }
 

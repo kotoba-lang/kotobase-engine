@@ -41,6 +41,10 @@
 (defn retention-root-key [e db-id kind id]
   (str (prefix e) "roots/" (js/encodeURIComponent db-id) "/"
        (name kind) "/" (js/encodeURIComponent id)))
+(defn gc-backup-object-key [e cid]
+  (str (prefix e) "gc-backups/objects/" cid))
+(defn gc-inventory-key [e cid]
+  (str (prefix e) "gc-backups/inventories/" cid))
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -1613,6 +1617,207 @@
                   (js/Promise.reject
                    (js/Error. (str "GC mark audit failed: " error))))))))
 
+(defn- gc-backup-bucket [e]
+  (or (env e "MERKLE_GC_BACKUP_BUCKET") (env e "MERKLE_BUCKET")))
+
+(defn- stored-bytes! [stored]
+  (if (gobj/get stored "arrayBuffer")
+    (-> (.arrayBuffer stored) (.then #(js/Uint8Array. %)))
+    (-> (.text stored) (.then #(.encode (js/TextEncoder.) %)))))
+
+(defn- restorable-gc-key? [e key]
+  (some #(str/starts-with? key %)
+        [(str (prefix e) "blocks/")
+         (str (prefix e) "scheduler/resumable/")
+         (str (prefix e) "scheduler/ingress/")]))
+
+(defn- verify-gc-entry-bytes! [e key expected-cid bytes]
+  (let [actual (str (ipld/cid bytes))
+        block-prefix (str (prefix e) "blocks/")]
+    (when-not (= expected-cid actual)
+      (throw (ex-info "GC backup content CID mismatch"
+                      {:key key :expected expected-cid :actual actual})))
+    (when (and (str/starts-with? key block-prefix)
+               (not= (subs key (count block-prefix)) actual))
+      (throw (ex-info "GC block key does not match its content CID"
+                      {:key key :actual actual})))
+    bytes))
+
+(defn- put-immutable-gc-backup! [bucket key expected-cid bytes]
+  (-> (.put bucket key bytes #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+      (.then
+       (fn [written]
+         (if written
+           true
+           (-> (.get bucket key)
+               (.then
+                (fn [existing]
+                  (if-not existing
+                    (js/Promise.reject
+                     (ex-info "GC backup put lost without existing winner"
+                              {:key key :cid expected-cid}))
+                    (-> (stored-bytes! existing)
+                        (.then
+                         (fn [existing-bytes]
+                           (let [actual (str (ipld/cid existing-bytes))]
+                             (when-not (= expected-cid actual)
+                               (throw
+                                (ex-info "GC immutable backup CID conflict"
+                                         {:key key :expected expected-cid
+                                          :actual actual})))
+                             false)))))))))))))
+
+(defn- backup-one-candidate! [e primary backup-bucket key]
+  (when-not (restorable-gc-key? e key)
+    (throw (ex-info "GC candidate is outside restorable namespaces"
+                    {:key key})))
+  (-> (.get primary key)
+      (.then
+       (fn [stored]
+         (if-not stored
+           (js/Promise.reject
+            (ex-info "GC candidate disappeared before backup" {:key key}))
+           (-> (stored-bytes! stored)
+               (.then
+                (fn [bytes]
+                  (let [content-cid (str (ipld/cid bytes))]
+                    (verify-gc-entry-bytes! e key content-cid bytes)
+                    (-> (put-immutable-gc-backup!
+                         backup-bucket
+                         (gc-backup-object-key e content-cid)
+                         content-cid bytes)
+                        (.then
+                         (fn [_]
+                           {"key" key
+                            "content-cid" content-cid
+                            "bytes" (.-byteLength bytes)}))))))))))))
+
+(defn- backup-and-delete-candidates!
+  [e primary result candidates now-ms]
+  (if-let [backup-bucket (gc-backup-bucket e)]
+    (-> (reduce
+         (fn [pending key]
+           (.then pending
+                  (fn [entries]
+                    (-> (backup-one-candidate! e primary backup-bucket key)
+                        (.then #(conj entries %))))))
+         (js/Promise.resolve [])
+         candidates)
+        (.then
+         (fn [entries]
+           (let [node {"format" "kotobase/gc-backup-inventory"
+                       "version" 1
+                       "prefix" (prefix e)
+                       "created-at" now-ms
+                       "candidates" entries}
+                 bytes (ipld/encode node)
+                 cid (str (ipld/cid bytes))]
+             (-> (put-immutable-gc-backup!
+                  backup-bucket (gc-inventory-key e cid) cid bytes)
+                 (.then
+                  (fn [_]
+                    (-> (.delete primary (clj->js candidates))
+                        (.then
+                         #(assoc result
+                                 :deleted (count candidates)
+                                 :inventory-passes 2
+                                 :backup-inventory cid
+                                 :backed-up (count entries)))))))))))
+    (js/Promise.reject
+     (js/Error. "GC delete requires MERKLE_BUCKET or MERKLE_GC_BACKUP_BUCKET"))))
+
+(defn- validate-gc-inventory [e cid node]
+  (let [entries (get node "candidates")]
+    (when-not (and (= "kotobase/gc-backup-inventory" (get node "format"))
+                   (= 1 (get node "version"))
+                   (= (prefix e) (get node "prefix"))
+                   (integer? (get node "created-at"))
+                   (vector? entries)
+                   (every? (fn [entry]
+                             (and (map? entry)
+                                  (string? (get entry "key"))
+                                  (restorable-gc-key? e (get entry "key"))
+                                  (string? (get entry "content-cid"))
+                                  (integer? (get entry "bytes"))
+                                  (not (neg? (get entry "bytes")))))
+                           entries))
+      (throw (ex-info "Invalid GC backup inventory" {:cid cid :node node})))
+    node))
+
+(defn- restore-existing-gc-entry! [e primary counts key content-cid]
+  (-> (.get primary key)
+      (.then
+       (fn [existing]
+         (if-not existing
+           (js/Promise.reject
+            (ex-info "GC restore CAS lost without winner" {:key key}))
+           (-> (stored-bytes! existing)
+               (.then
+                (fn [existing-bytes]
+                  (verify-gc-entry-bytes! e key content-cid existing-bytes)
+                  (update counts :already-present inc)))))))))
+
+(defn- restore-one-gc-entry!
+  [e primary backup-bucket counts entry]
+  (let [key (get entry "key")
+        content-cid (get entry "content-cid")]
+    (-> (.get backup-bucket (gc-backup-object-key e content-cid))
+        (.then
+         (fn [stored]
+           (if-not stored
+             (js/Promise.reject
+              (ex-info "GC backup object not found"
+                       {:key key :cid content-cid}))
+             (stored-bytes! stored))))
+        (.then
+         (fn [bytes]
+           (verify-gc-entry-bytes! e key content-cid bytes)
+           (-> (.put primary key bytes
+                     #js {:onlyIf #js {:etagDoesNotMatch "*"}})
+               (.then
+                (fn [written]
+                  (if written
+                    (update counts :restored inc)
+                    (restore-existing-gc-entry!
+                     e primary counts key content-cid))))))))))
+
+(defn- load-gc-inventory! [e backup-bucket inventory-cid]
+  (-> (.get backup-bucket (gc-inventory-key e inventory-cid))
+      (.then
+       (fn [stored]
+         (if-not stored
+           (js/Promise.reject
+            (ex-info "GC backup inventory not found" {:cid inventory-cid}))
+           (stored-bytes! stored))))
+      (.then
+       (fn [inventory-bytes]
+         (when-not (= inventory-cid (str (ipld/cid inventory-bytes)))
+           (throw (ex-info "GC inventory CID mismatch" {:cid inventory-cid})))
+         (validate-gc-inventory
+          e inventory-cid (ipld/decode inventory-bytes))))))
+
+(defn restore-gc-inventory!
+  "Restore a backed-up GC inventory without overwriting newer state. Every
+  backup object is CID-verified; existing destination bytes must match exactly."
+  [e inventory-cid]
+  (let [primary (env e "MERKLE_BUCKET")
+        backup-bucket (gc-backup-bucket e)]
+    (if-not (and primary backup-bucket)
+      (js/Promise.reject
+       (js/Error. "GC restore requires MERKLE_BUCKET and a backup bucket"))
+      (-> (load-gc-inventory! e backup-bucket inventory-cid)
+          (.then
+           (fn [inventory]
+             (reduce
+              (fn [pending entry]
+                (.then pending
+                       (fn [counts]
+                         (restore-one-gc-entry!
+                          e primary backup-bucket counts entry))))
+              (js/Promise.resolve {:inventory inventory-cid
+                                   :restored 0 :already-present 0})
+              (get inventory "candidates"))))))))
+
 (defn- delete-confirmed-inventory!
   [e bucket snapshot-before result first-candidates grace-ms now-ms]
   (-> (gc-root-snapshot! e bucket)
@@ -1637,11 +1842,8 @@
                                   :aborted :inventory-changed)
 
                            :else
-                           (-> (.delete bucket (clj->js first-candidates))
-                               (.then
-                                #(assoc result
-                                        :deleted (count first-candidates)
-                                        :inventory-passes 2)))))))))))))))
+                           (backup-and-delete-candidates!
+                            e bucket result first-candidates now-ms)))))))))))))
 
 (defn gc-unreachable!
   "Globally mark from every mutable R2 head, resumable execution checkpoint,
