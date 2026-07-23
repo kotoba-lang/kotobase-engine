@@ -1044,6 +1044,15 @@
                            (:value
                             (get @entries
                                  (str prefix "heads/restored")))))
+                    (worker/step-database-restore!
+                     env (:inventory @backup-receipt) "restored"
+                     {:owner "replay-worker"
+                      :token "replay-token"
+                      :now-ms 12000
+                      :lease-ms 1000})))
+                 (.then
+                  (fn [terminal]
+                    (is (= :completed (:phase terminal)))
                     (worker/restore-database!
                      env (:inventory backup) "restored")))
                  (.then

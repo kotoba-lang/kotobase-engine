@@ -3685,6 +3685,81 @@
       (js/Promise.reject
        (js/Error. "Resumable database restore requires an R2 binding")))))
 
+(defn step-database-restore!
+  "Advance at most one durable restore phase. Callers repeat this operation
+  until :phase is :completed. Page work is invocation-bounded; verification is
+  a separate phase and remains explicitly identified until its visited set is
+  externalized."
+  [e inventory-cid target-db-id
+   {:keys [owner token now-ms lease-ms]
+    :or {lease-ms 60000}}]
+  (-> (prepare-database-restore-task!
+       e inventory-cid target-db-id)
+      (.then
+       (fn [{:keys [task]}]
+         (-> (claim-database-restore!
+              e {:task task
+                 :owner owner
+                 :token token
+                 :now-ms now-ms
+                 :lease-ms lease-ms})
+             (.then
+              (fn [claim]
+                (if-not (:claimed? claim)
+                  (assoc claim
+                         :phase
+                         (case (:reason claim)
+                           :terminal :completed
+                           :leased :leased
+                           :target-head-conflict :conflict
+                           :conflict))
+                  (let [status
+                        (get-in claim [:checkpoint "status"])
+                        next-page
+                        (get-in claim [:checkpoint "next-page"])
+                        page-count
+                        (get-in task [:node "page-count"])]
+                    (case status
+                      "ready-to-publish"
+                      (-> (complete-database-restore! e claim)
+                          (.then #(assoc % :phase
+                                         (if (:completed? %)
+                                           :completed
+                                           :publish-fenced))))
+
+                      "running"
+                      (cond
+                        (< next-page page-count)
+                        (-> (run-database-restore-page! e claim)
+                            (.then #(assoc %
+                                           :phase :page-restored
+                                           :next-page
+                                           (get-in %
+                                                   [:checkpoint
+                                                    "next-page"])
+                                           :page-count page-count)))
+
+                        (= next-page page-count)
+                        (-> (verify-and-mark-database-restore-ready!
+                             e claim)
+                            (.then #(assoc %
+                                           :phase
+                                           (if (:ready? %)
+                                             :ready-to-publish
+                                             :verification-fenced))))
+
+                        :else
+                        (js/Promise.reject
+                         (ex-info
+                          "Database restore cursor exceeds inventory"
+                          {:next-page next-page
+                           :page-count page-count})))
+
+                      (js/Promise.reject
+                       (ex-info
+                        "Invalid claimed database restore status"
+                        {:status status}))))))))))))
+
 (defn restore-database!
   "Restore every immutable block from INVENTORY-CID and create TARGET-DB-ID's
   mutable head. An existing equal head is idempotent; a different head fences
