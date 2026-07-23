@@ -394,6 +394,7 @@
            :descriptor
            (cond-> {"cid" (ipld/link (:cid page))
                     "count" (count refs)
+                    "row-count" (reduce + 0 (map #(get % "count" 0) refs))
                     "encoded-bytes" (byte-count (:bytes page))}
              (seq refs)
              (assoc "logical-min"
@@ -589,6 +590,13 @@
                                     (ipld/link? (get % "cid"))
                                     (or (not paged?)
                                         (and (pos-int? (get % "count"))
+                                             (or (nil? (get % "row-count"))
+                                                 (and
+                                                  (integer?
+                                                   (get % "row-count"))
+                                                  (not
+                                                   (neg?
+                                                    (get % "row-count")))))
                                              (<= (get % "count")
                                                  (get directory "page-refs"))
                                              (or (nil? page-bytes)
