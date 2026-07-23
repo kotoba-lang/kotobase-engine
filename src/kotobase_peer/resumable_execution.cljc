@@ -8,7 +8,7 @@
 
 (def format-version 1)
 (def kinds #{:join-frontier :bundle-compaction})
-(def statuses #{:running :completed :failed})
+(def statuses #{:running :completed :failed :cancelled})
 
 (defn- encoded [node]
   (let [bytes (ipld/encode node)]
@@ -131,12 +131,18 @@
 
 (defn finish
   "Create an immutable terminal checkpoint. RESULT-CID, when present, pins the
-  completed output; errors are data supplied by the host without a wall clock."
+  completed output; errors are data supplied by the host without a wall clock.
+  Cancellation is a terminal, result-free state whose reason remains canonical
+  data in the checkpoint."
   [{:keys [task checkpoint token attempt status result-cid error]}]
   (let [current (validate-checkpoint checkpoint task token attempt)]
     (when-not (and (= "running" (get current "status"))
-                   (contains? #{:completed :failed} status)
-                   (if (= :completed status) result-cid (some? error)))
+                   (contains? #{:completed :failed :cancelled} status)
+                   (case status
+                     :completed (some? result-cid)
+                     :failed (some? error)
+                     :cancelled (some? error)
+                     false))
       (throw (ex-info "Invalid resumable execution finish"
                       {:current-status (get current "status")
                        :status status :result-cid result-cid})))

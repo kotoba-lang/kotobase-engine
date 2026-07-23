@@ -1923,11 +1923,14 @@
                    (.then
                     (fn [{current :pointer :keys [etag]}]
                       (if (and current
-                               (= "running" (get current "status"))
-                               (> (get current "expires-at" 0) now-ms))
-                        {:claimed? false :reason :leased
-                         :owner (get current "owner")
-                         :expires-at (get current "expires-at")}
+                               (not= "running" (get current "status")))
+                        {:claimed? false :reason :terminal
+                         :status (keyword (get current "status"))}
+                        (if (and current
+                                 (> (get current "expires-at" 0) now-ms))
+                          {:claimed? false :reason :leased
+                           :owner (get current "owner")
+                           :expires-at (get current "expires-at")}
                         (let [attempt (inc (or (get current "attempt") 0))
                               checkpoint
                               (resumable/initial-checkpoint
@@ -1964,7 +1967,7 @@
                                            :checkpoint (:node checkpoint)
                                            :etag (gobj/get result "etag")}
                                           {:claimed? false
-                                           :reason :cas-lost}))))))))))))))))
+                                           :reason :cas-lost})))))))))))))))))
       (js/Promise.reject
        (js/Error. "Resumable execution currently requires an R2 binding")))))
 
@@ -2075,6 +2078,74 @@
                                   :reason :pointer-fenced}))))))))))))
       (js/Promise.reject
        (js/Error. "Resumable execution currently requires an R2 binding")))))
+
+(defn cancel-resumable-execution!
+  "Atomically fence a running resumable task with a terminal cancelled
+  checkpoint. The pointer ETag, rather than a lease token supplied by the
+  operator, arbitrates cancellation against an in-flight advance. Repeating a
+  successful cancellation is idempotent; completed and failed results are
+  never overwritten."
+  [e db-id task-id reason]
+  (when-not (and (string? db-id) (seq db-id)
+                 (string? task-id) (seq task-id)
+                 (string? reason) (seq reason))
+    (throw (ex-info "Invalid resumable cancellation"
+                    {:db-id db-id :task-id task-id :reason reason})))
+  (if-let [bucket (env e "MERKLE_BUCKET")]
+    (-> (get-resumable-pointer! e db-id task-id)
+        (.then
+         (fn [{:keys [pointer checkpoint etag]}]
+           (cond
+             (nil? pointer)
+             {:cancelled? false :reason :not-found}
+
+             (= "cancelled" (get pointer "status"))
+             {:cancelled? true :idempotent? true
+              :pointer pointer :checkpoint checkpoint :etag etag}
+
+             (not= "running" (get pointer "status"))
+             {:cancelled? false :reason :terminal
+              :status (keyword (get pointer "status"))}
+
+             :else
+             (let [task-cid (ipld/link-cid (get checkpoint "task"))]
+               (-> (get-node! e task-cid)
+                   (.then
+                    (fn [task-node]
+                      (let [task {:cid task-cid :node task-node}
+                            terminal
+                            (resumable/finish
+                             {:task task :checkpoint checkpoint
+                              :token (get pointer "token")
+                              :attempt (get pointer "attempt")
+                              :status :cancelled
+                              :error {"reason" reason}})
+                            next-pointer
+                            (assoc pointer
+                                   "checkpoint" (str (:cid terminal))
+                                   "status" "cancelled")]
+                        (-> (put-block! e (:cid terminal) (:bytes terminal))
+                            (.then
+                             (fn [_]
+                               (-> (.put
+                                    bucket
+                                    (resumable-pointer-key e db-id task-id)
+                                    (js/JSON.stringify
+                                     (clj->js next-pointer))
+                                    #js {:onlyIf
+                                         #js {:etagMatches etag}})
+                                   (.then
+                                    (fn [result]
+                                      (if result
+                                        {:cancelled? true
+                                         :idempotent? false
+                                         :pointer next-pointer
+                                         :checkpoint (:node terminal)
+                                         :etag (gobj/get result "etag")}
+                                        {:cancelled? false
+                                         :reason :pointer-fenced}))))))))))))))))
+    (js/Promise.reject
+     (js/Error. "Resumable execution currently requires an R2 binding"))))
 
 (defn reachable-cids!
   "Walk decoded IPLD links from ROOT-CID and return a Promise<set<CID>>."

@@ -1256,19 +1256,30 @@
              (is (:advanced? advanced))
              (is (= 1 (get-in advanced [:checkpoint "next-ordinal"])))
              (is (= {"offset" 2} (get-in advanced [:checkpoint "cursor"])))
-             (worker/get-resumable-pointer! env "db-r" (str (:cid task)))))
+             (worker/cancel-resumable-execution!
+              env "db-r" (str (:cid task)) "operator-request")))
           (.then
-           (fn [loaded]
-             (is (= 1 (get-in loaded [:checkpoint "next-ordinal"])))
-             (worker/finish-resumable-execution!
-              env (assoc loaded :task task :status :completed
-                         :result-cid workload))))
+           (fn [cancelled]
+             (is (:cancelled? cancelled))
+             (is (false? (:idempotent? cancelled)))
+             (is (= "cancelled"
+                    (get-in cancelled [:checkpoint "status"])))
+             (is (= {"reason" "operator-request"}
+                    (get-in cancelled [:checkpoint "error"])))
+             (worker/cancel-resumable-execution!
+              env "db-r" (str (:cid task)) "operator-request")))
           (.then
-           (fn [finished]
-             (is (:finished? finished))
-             (is (= "completed" (get-in finished
-                                         [:checkpoint "status"])))
+           (fn [cancelled]
+             (is (:cancelled? cancelled))
+             (is (:idempotent? cancelled))
              (is (some #(str/includes? % "/blocks/") (keys @entries)))
+             (worker/claim-resumable-execution!
+              env (assoc claim-opts :owner "worker-c"
+                         :token "token-c" :now-ms 1200))))
+          (.then
+           (fn [terminal]
+             (is (= :terminal (:reason terminal)))
+             (is (= :cancelled (:status terminal)))
              (swap! entries assoc (str prefix "heads/db-r")
                     {:value "head-2" :etag "v-head-2"})
              (worker/claim-resumable-execution!
