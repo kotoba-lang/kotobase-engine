@@ -3685,6 +3685,34 @@
       (js/Promise.reject
        (js/Error. "Resumable database restore requires an R2 binding")))))
 
+(defn release-database-restore-lease!
+  "Relinquish a non-terminal phase after its checkpoint is durable. The ETag
+  CAS prevents an old owner from shortening a successor's lease."
+  [e {:keys [pointer etag] :as state} now-ms]
+  (let [target-db-id (get pointer "target-db-id")
+        task-id (get pointer "task-id")
+        released-pointer
+        (-> pointer
+            (assoc "expires-at" now-ms)
+            (dissoc "owner"))]
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (.put bucket
+                (database-restore-pointer-key
+                 e target-db-id task-id)
+                (js/JSON.stringify (clj->js released-pointer))
+                #js {:onlyIf #js {:etagMatches etag}})
+          (.then
+           (fn [result]
+             (if result
+               (assoc state
+                      :lease-released? true
+                      :pointer released-pointer
+                      :etag (gobj/get result "etag"))
+               {:lease-released? false
+                :reason :pointer-fenced}))))
+      (js/Promise.reject
+       (js/Error. "Resumable database restore requires an R2 binding")))))
+
 (defn step-database-restore!
   "Advance at most one durable restore phase. Callers repeat this operation
   until :phase is :completed. Page work is invocation-bounded; verification is
@@ -3731,22 +3759,40 @@
                       (cond
                         (< next-page page-count)
                         (-> (run-database-restore-page! e claim)
-                            (.then #(assoc %
-                                           :phase :page-restored
-                                           :next-page
-                                           (get-in %
-                                                   [:checkpoint
-                                                    "next-page"])
-                                           :page-count page-count)))
+                            (.then
+                             (fn [advanced]
+                               (if-not (:advanced? advanced)
+                                 (assoc advanced
+                                        :phase :page-fenced)
+                                 (-> (release-database-restore-lease!
+                                      e advanced
+                                      (or now-ms (js/Date.now)))
+                                     (.then
+                                      #(assoc %
+                                              :phase :page-restored
+                                              :next-page
+                                              (get-in %
+                                                      [:checkpoint
+                                                       "next-page"])
+                                              :page-count
+                                              page-count)))))))
 
                         (= next-page page-count)
                         (-> (verify-and-mark-database-restore-ready!
                              e claim)
-                            (.then #(assoc %
-                                           :phase
-                                           (if (:ready? %)
-                                             :ready-to-publish
-                                             :verification-fenced))))
+                            (.then
+                             (fn [ready]
+                               (if-not (:ready? ready)
+                                 (assoc ready
+                                        :phase
+                                        :verification-fenced)
+                                 (-> (release-database-restore-lease!
+                                      e ready
+                                      (or now-ms (js/Date.now)))
+                                     (.then
+                                      #(assoc %
+                                              :phase
+                                              :ready-to-publish)))))))
 
                         :else
                         (js/Promise.reject
