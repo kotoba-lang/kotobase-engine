@@ -45,6 +45,8 @@
   (str (prefix e) "gc-backups/objects/" cid))
 (defn gc-inventory-key [e cid]
   (str (prefix e) "gc-backups/inventories/" cid))
+(defn database-backup-inventory-key [e cid]
+  (str (prefix e) "database-backups/inventories/" cid))
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -2596,6 +2598,285 @@
               (js/Promise.resolve {:inventory inventory-cid
                                    :restored 0 :already-present 0})
               (get inventory "candidates"))))))))
+
+(defn- ensure-backup-retention-root!
+  [e db-id backup-id head-cid epoch]
+  (-> (get-retention-root! e db-id :backup backup-id)
+      (.then
+       (fn [{existing :root :keys [etag]}]
+         (cond
+           (and existing
+                (= head-cid (get existing "manifest-cid"))
+                (= epoch (get existing "epoch"))
+                (nil? (get existing "released-at")))
+           {:root existing :etag etag :idempotent? true}
+
+           existing
+           (js/Promise.reject
+            (ex-info "Database backup id already pins another snapshot"
+                     {:db-id db-id :backup-id backup-id
+                      :existing-head (get existing "manifest-cid")
+                      :requested-head head-cid}))
+
+           :else
+           (.then
+            (cas-retention-root!
+             e {:db-id db-id :kind :backup :id backup-id
+                :manifest-cid head-cid :epoch epoch}
+             nil)
+            (fn [created]
+              (if (:won? created)
+                (assoc created :idempotent? false)
+                (ensure-backup-retention-root!
+                 e db-id backup-id head-cid epoch)))))))))
+
+(defn- backup-reachable-blocks!
+  [e primary backup-bucket cids]
+  (reduce
+   (fn [pending wave]
+     (.then
+      pending
+      (fn [entries]
+        (-> (js/Promise.all
+             (clj->js
+              (mapv #(backup-one-candidate!
+                      e primary backup-bucket (block-key e %))
+                    wave)))
+            (.then #(into entries (array-seq %)))))))
+   (js/Promise.resolve [])
+   (partition-all 4 cids)))
+
+(defn backup-database!
+  "Pin one immutable database snapshot, copy every reachable IPLD block into
+  the immutable backup namespace, and publish a content-addressed inventory.
+  BACKUP-ID is durable and idempotent for exactly one head CID."
+  ([e db-id backup-id]
+   (backup-database! e db-id backup-id (js/Date.now)))
+  ([e db-id backup-id now-ms]
+   (let [primary (env e "MERKLE_BUCKET")
+         backup-bucket (gc-backup-bucket e)]
+     (when-not (and (string? db-id) (seq db-id)
+                    (string? backup-id) (seq backup-id)
+                    (<= (count backup-id) 256)
+                    (integer? now-ms) (not (neg? now-ms)))
+       (throw (ex-info "Invalid database backup request"
+                       {:db-id db-id :backup-id backup-id :now-ms now-ms})))
+     (if-not (and primary backup-bucket)
+       (js/Promise.reject
+        (js/Error. "Database backup requires MERKLE_BUCKET and a backup bucket"))
+       (-> (resolve-database-head! e db-id)
+           (.then
+            (fn [{:keys [head-cid base-cid]}]
+              (if-not head-cid
+                (js/Promise.reject
+                 (ex-info "Database head not found" {:db-id db-id}))
+                (-> (get-node! e base-cid)
+                    (.then
+                     (fn [manifest]
+                       (let [epoch (get manifest "epoch")]
+                         (when-not (and (integer? epoch) (not (neg? epoch)))
+                           (throw
+                            (ex-info "Database manifest has no valid epoch"
+                                     {:db-id db-id :base-cid base-cid})))
+                         (-> (ensure-backup-retention-root!
+                              e db-id backup-id head-cid epoch)
+                             (.then
+                              (fn [root]
+                                (-> (reachable-cids! e head-cid)
+                                    (.then
+                                     (fn [reachable]
+                                       (let [cids (vec (sort reachable))]
+                                         (-> (backup-reachable-blocks!
+                                              e primary backup-bucket cids)
+                                             (.then
+                                              (fn [entries]
+                                                (let [node
+                                                      {"format"
+                                                       "kotobase/database-backup-inventory"
+                                                       "version" 1
+                                                       "source-prefix" (prefix e)
+                                                       "db-id" db-id
+                                                       "backup-id" backup-id
+                                                       "head-cid" head-cid
+                                                       "base-cid" base-cid
+                                                       "epoch" epoch
+                                                       "blocks" cids}
+                                                      bytes (ipld/encode node)
+                                                      cid (str (ipld/cid bytes))]
+                                                  (-> (put-immutable-gc-backup!
+                                                       backup-bucket
+                                                       (database-backup-inventory-key
+                                                        e cid)
+                                                       cid bytes)
+                                                      (.then
+                                                       (fn [_]
+                                                         {:inventory cid
+                                                          :head-cid head-cid
+                                                          :base-cid base-cid
+                                                          :epoch epoch
+                                                          :observed-at now-ms
+                                                          :blocks (count entries)
+                                                          :bytes
+                                                          (reduce
+                                                           + 0
+                                                           (map #(get % "bytes")
+                                                                entries))
+                                                          :retention-root
+                                                          (:root root)
+                                                          :idempotent?
+                                                          (:idempotent?
+                                                           root)}))))))))))))))))))))))))))
+
+(defn- validate-database-backup-inventory [e cid node]
+  (let [blocks (get node "blocks")]
+    (when-not
+     (and (= "kotobase/database-backup-inventory" (get node "format"))
+          (= 1 (get node "version"))
+          (= (prefix e) (get node "source-prefix"))
+          (string? (get node "db-id"))
+          (string? (get node "backup-id"))
+          (string? (get node "head-cid"))
+          (string? (get node "base-cid"))
+          (integer? (get node "epoch"))
+          (vector? blocks)
+          (= blocks (vec (sort (distinct blocks))))
+          (every? #(and (string? %) (re-matches #"b[a-z2-7]+" %)) blocks)
+          (some #{(get node "head-cid")} blocks)
+          (some #{(get node "base-cid")} blocks))
+      (throw (ex-info "Invalid database backup inventory"
+                      {:cid cid :node node})))
+    node))
+
+(defn- load-database-backup-inventory!
+  [e backup-bucket inventory-cid]
+  (-> (.get backup-bucket
+            (database-backup-inventory-key e inventory-cid))
+      (.then
+       (fn [stored]
+         (if-not stored
+           (js/Promise.reject
+            (ex-info "Database backup inventory not found"
+                     {:cid inventory-cid}))
+           (stored-bytes! stored))))
+      (.then
+       (fn [bytes]
+         (when-not (= inventory-cid (str (ipld/cid bytes)))
+           (throw
+            (ex-info "Database backup inventory CID mismatch"
+                     {:cid inventory-cid})))
+         (validate-database-backup-inventory
+          e inventory-cid (ipld/decode bytes))))))
+
+(defn- restore-database-blocks!
+  [e primary backup-bucket inventory-cid cids]
+  (reduce
+   (fn [pending wave]
+     (.then
+      pending
+      (fn [counts]
+        (-> (js/Promise.all
+             (clj->js
+              (mapv
+               (fn [cid]
+                 (restore-one-gc-entry!
+                  e primary backup-bucket
+                  {:restored 0 :already-present 0}
+                  {"key" (block-key e cid) "content-cid" cid}))
+               wave)))
+            (.then
+             (fn [wave-counts]
+               (reduce
+                (fn [total item]
+                  (-> total
+                      (update :restored + (:restored item))
+                      (update :already-present + (:already-present item))))
+                counts
+                (array-seq wave-counts))))))))
+   (js/Promise.resolve
+    {:inventory inventory-cid :restored 0 :already-present 0})
+   (partition-all 4 cids)))
+
+(defn- publish-restored-head!
+  [e target-db-id head-cid counts]
+  (-> (get-head e target-db-id)
+      (.then
+       (fn [{current :value}]
+         (cond
+           (= current head-cid)
+           (assoc counts :head-cid head-cid
+                  :head-created? false :idempotent? true)
+
+           current
+           (js/Promise.reject
+            (ex-info "Database restore target head exists"
+                     {:target-db-id target-db-id
+                      :actual current :expected head-cid}))
+
+           :else
+           (-> (cas-head! e target-db-id head-cid nil)
+               (.then
+                (fn [won?]
+                  (if won?
+                    (assoc counts :head-cid head-cid
+                           :head-created? true :idempotent? false)
+                    (-> (get-head e target-db-id)
+                        (.then
+                         (fn [{winner :value}]
+                           (if (= winner head-cid)
+                             (assoc counts :head-cid head-cid
+                                    :head-created? false :idempotent? true)
+                             (js/Promise.reject
+                              (ex-info "Database restore head CAS fenced"
+                                       {:target-db-id target-db-id
+                                        :actual winner
+                                        :expected head-cid})))))))))))))))
+
+(defn- verify-restored-database!
+  [e inventory-cid inventory target-db-id cids result]
+  (-> (reachable-cids! e (get inventory "head-cid"))
+      (.then
+       (fn [reachable]
+         (when-not (= (set cids) reachable)
+           (throw
+            (ex-info "Restored database reachability mismatch"
+                     {:inventory inventory-cid
+                      :expected (count cids)
+                      :actual (count reachable)})))
+         (assoc result
+                :verified-reachable (count reachable)
+                :source-db-id (get inventory "db-id")
+                :target-db-id target-db-id)))))
+
+(defn restore-database!
+  "Restore every immutable block from INVENTORY-CID and create TARGET-DB-ID's
+  mutable head. An existing equal head is idempotent; a different head fences
+  the restore and is never overwritten."
+  [e inventory-cid target-db-id]
+  (let [primary (env e "MERKLE_BUCKET")
+        backup-bucket (gc-backup-bucket e)]
+    (when-not (and (string? inventory-cid)
+                   (re-matches #"b[a-z2-7]+" inventory-cid)
+                   (string? target-db-id) (seq target-db-id))
+      (throw (ex-info "Invalid database restore request"
+                      {:inventory-cid inventory-cid
+                       :target-db-id target-db-id})))
+    (if-not (and primary backup-bucket)
+      (js/Promise.reject
+       (js/Error. "Database restore requires MERKLE_BUCKET and a backup bucket"))
+      (-> (load-database-backup-inventory!
+           e backup-bucket inventory-cid)
+          (.then
+           (fn [inventory]
+             (let [head-cid (get inventory "head-cid")
+                   cids (get inventory "blocks")]
+               (-> (restore-database-blocks!
+                    e primary backup-bucket inventory-cid cids)
+                   (.then
+                    #(publish-restored-head!
+                      e target-db-id head-cid %))
+                   (.then
+                    #(verify-restored-database!
+                      e inventory-cid inventory target-db-id cids %))))))))))
 
 (defn- delete-confirmed-inventory!
   [e bucket snapshot-before result first-candidates grace-ms now-ms]

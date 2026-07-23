@@ -760,6 +760,145 @@
              (is false (str "safe-epoch oracle rejected: " error))
              (done)))))))
 
+(deftest database-backup-restores-head-and-reachable-cid-graph
+  (async done
+    (let [prefix "database-restore/"
+          manifest (lsm/build-manifest {:db-id "source" :epoch 7})
+          source-head (:cid manifest)
+          backup-receipt (atom nil)
+          entries
+          (atom {(str prefix "heads/source")
+                 {:value source-head :etag "etag-1"}
+                 (str prefix "blocks/" source-head)
+                 {:value (:bytes manifest) :etag "etag-2"}})
+          version (atom 2)
+          bytes-object
+          (fn [value etag]
+            #js {:etag etag
+                 :text
+                 (fn []
+                   (js/Promise.resolve
+                    (if (string? value)
+                      value
+                      (.decode (js/TextDecoder.) value))))
+                 :arrayBuffer
+                 (fn []
+                   (let [bytes (if (string? value)
+                                 (.encode (js/TextEncoder.) value)
+                                 value)]
+                     (js/Promise.resolve
+                      (.slice (.-buffer bytes)
+                              (.-byteOffset bytes)
+                              (+ (.-byteOffset bytes)
+                                 (.-byteLength bytes))))))})
+          bucket
+          #js {:get
+               (fn [key]
+                 (let [{:keys [value etag]} (get @entries key)]
+                   (js/Promise.resolve
+                    (when value (bytes-object value etag)))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       condition (some-> opts .-onlyIf)
+                       matches (some-> condition .-etagMatches)
+                       absent (some-> condition .-etagDoesNotMatch)
+                       won? (cond
+                              matches (= matches (:etag current))
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if-not won?
+                     (js/Promise.resolve nil)
+                     (let [etag (str "etag-" (swap! version inc))
+                           bytes (cond
+                                   (string? value) value
+                                   (instance? js/Uint8Array value) value
+                                   (instance? js/ArrayBuffer value)
+                                   (js/Uint8Array. value)
+                                   :else value)]
+                       (swap! entries assoc key {:value bytes :etag etag})
+                       (js/Promise.resolve #js {:etag etag})))))
+               :list
+               (fn [opts]
+                 (let [wanted (.-prefix opts)]
+                   (js/Promise.resolve
+                    #js {:objects
+                         (clj->js
+                          (mapv (fn [key] #js {:key key})
+                                (filter #(str/starts-with? % wanted)
+                                        (keys @entries))))
+                         :truncated false})))
+               :delete
+               (fn [keys]
+                 (doseq [key (js->clj keys)]
+                   (swap! entries dissoc key))
+                 (js/Promise.resolve nil))}
+          env #js {"MERKLE_BUCKET" bucket
+                   "MERKLE_S3_PREFIX" "database-restore"}]
+      (-> (worker/backup-database! env "source" "daily-7" 7000)
+          (.then
+           (fn [backup]
+             (is (= source-head (:head-cid backup)))
+             (is (= 7 (:epoch backup)))
+             (is (= 1 (:blocks backup)))
+             (is (= "backup"
+                    (get-in backup [:retention-root "kind"])))
+             (is (= source-head
+                    (get-in backup [:retention-root "manifest-cid"])))
+             (reset! backup-receipt backup)
+             (worker/backup-database! env "source" "daily-7" 8000)))
+          (.then
+           (fn [replayed-backup]
+             (let [backup @backup-receipt]
+               (is (:idempotent? replayed-backup))
+               (is (= (:inventory backup)
+                      (:inventory replayed-backup))
+                   "created time is receipt metadata, not inventory identity")
+             (swap! entries dissoc
+                    (str prefix "heads/source")
+                    (str prefix "blocks/" source-head))
+             (-> (worker/restore-database!
+                  env (:inventory backup) "restored")
+                 (.then
+                  (fn [restored]
+                    (is (= 1 (:restored restored)))
+                    (is (:head-created? restored))
+                    (is (= 1 (:verified-reachable restored)))
+                    (is (= source-head
+                           (:value
+                            (get @entries
+                                 (str prefix "heads/restored")))))
+                    (worker/resolve-database-head! env "restored")))
+                 (.then
+                  (fn [resolved]
+                    (is (= source-head (:head-cid resolved)))
+                    (worker/restore-database!
+                     env (:inventory backup) "restored")))
+                 (.then
+                  (fn [replayed]
+                    (is (:idempotent? replayed))
+                    (is (= 1 (:already-present replayed)))
+                    (swap! entries assoc
+                           (str prefix "heads/conflict")
+                           {:value "bafyreiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            :etag "conflict"})
+                    (-> (worker/restore-database!
+                         env (:inventory backup) "conflict")
+                        (.then
+                         (fn [_]
+                           (is false
+                               "a different target head must fence restore")))
+                        (.catch
+                         (fn [error]
+                           (is (str/includes?
+                                (str error) "target head exists")))))))))))
+          (.then (fn [_] (done)))
+          (.catch
+           (fn [error]
+             (is false (str "database restore rejected: " error
+                            "\n" (.-stack error)))
+             (done)))))))
+
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
     (let [child-a-bytes (ipld/encode {"value" "a"})
