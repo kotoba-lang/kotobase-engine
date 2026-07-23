@@ -3072,7 +3072,13 @@
                       (.-byteLength bytes))
                    (= (get descriptor "first") (first entries))
                    (= (get descriptor "last") (peek entries))
-                   (every? valid-database-backup-entry? entries))
+                   (every? valid-database-backup-entry? entries)
+                   (= (normalized-database-backup-entries entries)
+                      (vec
+                       (sort
+                        (distinct
+                         (normalized-database-backup-entries
+                          entries))))))
                (throw
                 (ex-info "Invalid database backup inventory page"
                          {:cid cid :descriptor descriptor})))
@@ -3094,7 +3100,7 @@
    (js/Promise.resolve [])
    (partition-all 4 (get inventory "pages"))))
 
-(defn- load-database-backup-inventory!
+(defn- load-database-backup-inventory-root!
   [e backup-bucket inventory-cid]
   (-> (.get backup-bucket
             (database-backup-inventory-key e inventory-cid))
@@ -3114,15 +3120,23 @@
          (let [inventory
                (validate-database-backup-inventory
                 e inventory-cid (ipld/decode bytes))]
-           (if (= 1 (get inventory "version"))
-             inventory
-             (-> (materialize-database-backup-pages!
-                  e backup-bucket inventory)
-                 (.then
-                  (fn [entries]
-                    (validate-materialized-database-backup-entries
-                     inventory-cid inventory entries)
-                    (assoc inventory "entries" entries))))))))))
+           inventory)))))
+
+(defn- load-database-backup-inventory!
+  [e backup-bucket inventory-cid]
+  (-> (load-database-backup-inventory-root!
+       e backup-bucket inventory-cid)
+      (.then
+       (fn [inventory]
+         (if (= 1 (get inventory "version"))
+           inventory
+           (-> (materialize-database-backup-pages!
+                e backup-bucket inventory)
+               (.then
+                (fn [entries]
+                  (validate-materialized-database-backup-entries
+                   inventory-cid inventory entries)
+                  (assoc inventory "entries" entries)))))))))
 
 (defn- restore-database-entries!
   [e primary backup-bucket inventory-cid entries]
@@ -3238,6 +3252,38 @@
                               :etag (gobj/get object "etag")})))))))))))
     (js/Promise.reject
      (js/Error. "Resumable database restore requires an R2 binding"))))
+
+(defn prepare-database-restore-task!
+  "Load only the immutable inventory root and derive a deterministic v2 restore
+  task. No inventory page or primary object is read here."
+  [e inventory-cid target-db-id]
+  (let [backup-bucket (gc-backup-bucket e)]
+    (when-not
+     (and backup-bucket
+          (string? inventory-cid)
+          (re-matches #"b[a-z2-7]+" inventory-cid)
+          (string? target-db-id)
+          (seq target-db-id))
+      (throw (ex-info "Invalid resumable database restore request"
+                      {:inventory-cid inventory-cid
+                       :target-db-id target-db-id})))
+    (-> (load-database-backup-inventory-root!
+         e backup-bucket inventory-cid)
+        (.then
+         (fn [inventory]
+           (when-not (= 2 (get inventory "version"))
+             (throw
+              (ex-info "Resumable database restore requires inventory v2"
+                       {:inventory-cid inventory-cid
+                        :version (get inventory "version")})))
+           {:task
+            (database-restore/restore-task
+             {:inventory-cid inventory-cid
+              :target-db-id target-db-id
+              :head-cid (get inventory "head-cid")
+              :entry-count (get inventory "entry-count")
+              :page-count (count (get inventory "pages"))})
+            :inventory inventory})))))
 
 (defn claim-database-restore!
   "Claim or reclaim one deterministic inventory restore. A missing target head
@@ -3418,6 +3464,193 @@
                                  {:advanced? false
                                   :reason
                                   :pointer-fenced}))))))))))))
+      (js/Promise.reject
+       (js/Error. "Resumable database restore requires an R2 binding")))))
+
+(defn run-database-restore-page!
+  "Restore exactly checkpoint.next-page, then CAS the durable checkpoint
+  pointer. At most one bounded inventory page and four entry payloads are in
+  flight; a lost pointer CAS leaves only idempotent create-only writes."
+  [e {:keys [task pointer checkpoint] :as claim}]
+  (let [primary (env e "MERKLE_BUCKET")
+        backup-bucket (gc-backup-bucket e)
+        inventory-cid
+        (str (ipld/link-cid (get-in task [:node "inventory"])))
+        target-db-id (get-in task [:node "target-db-id"])
+        page-ordinal (get checkpoint "next-page")]
+    (if-not (and primary backup-bucket)
+      (js/Promise.reject
+       (js/Error.
+        "Resumable database restore requires primary and backup buckets"))
+      (-> (load-database-backup-inventory-root!
+           e backup-bucket inventory-cid)
+          (.then
+           (fn [inventory]
+             (let [pages (get inventory "pages")
+                   descriptor (get pages page-ordinal)
+                   expected-head
+                   (str
+                    (ipld/link-cid (get-in task [:node "head"])))]
+               (when-not
+                (and (= 2 (get inventory "version"))
+                     (= target-db-id
+                        (get pointer "target-db-id"))
+                     (= expected-head
+                        (get inventory "head-cid"))
+                     (= (get-in task [:node "entry-count"])
+                        (get inventory "entry-count"))
+                     (= (get-in task [:node "page-count"])
+                        (count pages))
+                     descriptor)
+                 (throw
+                  (ex-info "Database restore task/inventory mismatch"
+                           {:inventory inventory-cid
+                            :target-db-id target-db-id
+                            :page-ordinal page-ordinal})))
+               (-> (load-database-backup-page!
+                    e backup-bucket descriptor)
+                   (.then
+                    (fn [entries]
+                      (-> (restore-database-entries!
+                           e primary backup-bucket
+                           inventory-cid entries)
+                          (.then
+                           (fn [counts]
+                             (advance-database-restore-checkpoint!
+                              e
+                              (merge
+                               claim
+                               {:page-ordinal page-ordinal
+                                :page-cid
+                                (get descriptor "cid")
+                                :entry-count (count entries)
+                                :restored (:restored counts)
+                                :already-present
+                                (:already-present counts)
+                                :first-entry
+                                [(get (first entries) "namespace")
+                                 (get (first entries) "cid")]
+                                :last-entry
+                                [(get (peek entries) "namespace")
+                                 (get (peek entries) "cid")]})))))))))))))))
+
+(defn mark-database-restore-ready!
+  "Persist the verified all-pages barrier before exposing the target head."
+  [e {:keys [task pointer checkpoint etag verified-reachable
+             now-ms lease-ms]
+      :or {lease-ms 60000}}]
+  (let [target-db-id (get pointer "target-db-id")
+        task-id (get pointer "task-id")
+        ready
+        (database-restore/ready-to-publish
+         {:task task
+          :checkpoint checkpoint
+          :token (get pointer "token")
+          :attempt (get pointer "attempt")
+          :verified-reachable verified-reachable})
+        now-ms (or now-ms (js/Date.now))]
+    (when-not
+     (and (= task-id (str (:cid task)))
+          (= (get pointer "checkpoint")
+             (str (ipld/cid (ipld/encode checkpoint)))))
+      (throw
+       (ex-info "Database restore ready pointer/checkpoint mismatch"
+                {:task-id task-id
+                 :checkpoint (get pointer "checkpoint")})))
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (get-head e target-db-id)
+          (.then
+           (fn [{current-head :value}]
+             (if current-head
+               {:ready? false :reason :target-head-published
+                :current-head current-head}
+               (-> (put-block! e (:cid ready) (:bytes ready))
+                   (.then
+                    (fn [_]
+                      (let [next-pointer
+                            (assoc pointer
+                                   "checkpoint" (str (:cid ready))
+                                   "expires-at" (+ now-ms lease-ms)
+                                   "status" "ready-to-publish")]
+                        (-> (.put
+                             bucket
+                             (database-restore-pointer-key
+                              e target-db-id task-id)
+                             (js/JSON.stringify (clj->js next-pointer))
+                             #js {:onlyIf #js {:etagMatches etag}})
+                            (.then
+                             (fn [result]
+                               (if result
+                                 {:ready? true
+                                  :task task
+                                  :pointer next-pointer
+                                  :checkpoint (:node ready)
+                                  :etag (gobj/get result "etag")}
+                                 {:ready? false
+                                  :reason
+                                  :pointer-fenced}))))))))))))
+      (js/Promise.reject
+       (js/Error. "Resumable database restore requires an R2 binding")))))
+
+(defn complete-database-restore!
+  "Publish the target head by CAS, then terminally CAS the restore pointer.
+  Repeating after a crash between those writes observes the equal head and is
+  idempotent."
+  [e {:keys [task pointer checkpoint etag]}]
+  (let [target-db-id (get pointer "target-db-id")
+        task-id (get pointer "task-id")
+        expected-head
+        (str (ipld/link-cid (get-in task [:node "head"])))]
+    (when-not
+     (and (= task-id (str (:cid task)))
+          (= (get pointer "checkpoint")
+             (str (ipld/cid (ipld/encode checkpoint))))
+          (= "ready-to-publish" (get checkpoint "status")))
+      (throw
+       (ex-info "Database restore completion is not ready"
+                {:task-id task-id
+                 :checkpoint (get pointer "checkpoint")
+                 :status (get checkpoint "status")})))
+    (if-let [bucket (env e "MERKLE_BUCKET")]
+      (-> (publish-restored-head!
+           e target-db-id expected-head
+           {:restored (get checkpoint "restored")
+            :already-present (get checkpoint "already-present")})
+          (.then
+           (fn [head-result]
+             (let [terminal
+                   (database-restore/complete
+                    {:task task
+                     :checkpoint checkpoint
+                     :token (get pointer "token")
+                     :attempt (get pointer "attempt")
+                     :observed-head (:head-cid head-result)})]
+               (-> (put-block! e (:cid terminal) (:bytes terminal))
+                   (.then
+                    (fn [_]
+                      (let [next-pointer
+                            (assoc pointer
+                                   "checkpoint" (str (:cid terminal))
+                                   "status" "completed")]
+                        (-> (.put
+                             bucket
+                             (database-restore-pointer-key
+                              e target-db-id task-id)
+                             (js/JSON.stringify (clj->js next-pointer))
+                             #js {:onlyIf #js {:etagMatches etag}})
+                            (.then
+                             (fn [result]
+                               (if result
+                                 (merge
+                                  head-result
+                                  {:completed? true
+                                   :pointer next-pointer
+                                   :checkpoint (:node terminal)
+                                   :etag (gobj/get result "etag")})
+                                 {:completed? false
+                                  :reason :pointer-fenced
+                                  :head-published? true
+                                  :head-cid expected-head}))))))))))))
       (js/Promise.reject
        (js/Error. "Resumable database restore requires an R2 binding")))))
 

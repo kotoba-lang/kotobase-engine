@@ -883,6 +883,7 @@
           manifest (lsm/build-manifest {:db-id "source" :epoch 7})
           source-head (:cid manifest)
           backup-receipt (atom nil)
+          restore-ready (atom nil)
           entries
           (atom {(str prefix "heads/source")
                  {:value source-head :etag "etag-1"}
@@ -974,12 +975,84 @@
              (swap! entries dissoc
                     (str prefix "heads/source")
                     (str prefix "blocks/" source-head))
-             (-> (worker/restore-database!
+             (-> (worker/prepare-database-restore-task!
                   env (:inventory backup) "restored")
                  (.then
+                  (fn [{:keys [task]}]
+                    (worker/claim-database-restore!
+                     env {:task task
+                          :owner "restore-worker"
+                          :token "restore-token"
+                          :now-ms 9000
+                          :lease-ms 1000})))
+                 (.then
+                  (fn [claim]
+                    (is (:claimed? claim))
+                    (worker/run-database-restore-page! env claim)))
+                 (.then
+                  (fn [advanced]
+                    (is (:advanced? advanced))
+                    (is (= 1
+                           (get-in advanced
+                                   [:checkpoint "next-page"])))
+                    (is (= 1
+                           (get-in advanced
+                                   [:checkpoint
+                                    "processed-entries"])))
+                    (is (contains?
+                         @entries
+                         (str prefix "blocks/" source-head)))
+                    (worker/mark-database-restore-ready!
+                     env (assoc advanced
+                                :verified-reachable 1
+                                :now-ms 9050
+                                :lease-ms 1000))))
+                 (.then
+                  (fn [ready]
+                    (is (:ready? ready))
+                    (is (= "ready-to-publish"
+                           (get-in ready
+                                   [:checkpoint "status"])))
+                    (reset! restore-ready ready)
+                    (worker/complete-database-restore!
+                     env (assoc ready :etag "forced-pointer-cas-loss"))))
+                 (.then
+                  (fn [interrupted]
+                    (is (false? (:completed? interrupted)))
+                    (is (:head-published? interrupted))
+                    (worker/claim-database-restore!
+                     env {:task (:task @restore-ready)
+                          :owner "recovery-worker"
+                          :token "recovery-token"
+                          :now-ms 11000
+                          :lease-ms 1000})))
+                 (.then
+                  (fn [recovered]
+                    (is (:claimed? recovered))
+                    (is (:head-published? recovered))
+                    (is (= "ready-to-publish"
+                           (get-in recovered
+                                   [:checkpoint "status"])))
+                    (worker/complete-database-restore!
+                     env recovered)))
+                 (.then
+                  (fn [completed]
+                    (is (:completed? completed))
+                    (is (= "completed"
+                           (get-in completed
+                                   [:checkpoint "status"])))
+                    (is (= source-head
+                           (:value
+                            (get @entries
+                                 (str prefix "heads/restored")))))
+                    (worker/restore-database!
+                     env (:inventory backup) "restored")))
+                 (.then
                   (fn [restored]
-                    (is (= 1 (:restored restored)))
-                    (is (:head-created? restored))
+                    (is (= 0 (:restored restored)))
+                    (is (= 1 (:already-present restored)))
+                    (is (false? (:head-created? restored)))
+                    (is (:idempotent? restored))
                     (is (= 1 (:verified-reachable restored)))
                     (is (= source-head
                            (:value
