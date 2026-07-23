@@ -29,7 +29,11 @@
         terminal (resume/finish
                   {:task task-a :checkpoint (:checkpoint advanced)
                    :token "token-a" :attempt 1 :status :completed
-                   :result-cid (workload-cid)})]
+                   :result-cid (workload-cid)})
+        cancelled (resume/finish
+                   {:task task-a :checkpoint initial
+                    :token "token-a" :attempt 1 :status :cancelled
+                    :error {"reason" "operator-request"}})]
     (is (= (:cid task-a) (:cid task-b)))
     (is (= 0 (get-in initial [:node "next-ordinal"])))
     (is (= 1 (get-in advanced [:checkpoint :node "next-ordinal"])))
@@ -38,6 +42,9 @@
            (ipld/link-cid
             (get-in advanced [:checkpoint :node "spill-head"]))))
     (is (= "completed" (get-in terminal [:node "status"])))
+    (is (= "cancelled" (get-in cancelled [:node "status"])))
+    (is (= {"reason" "operator-request"}
+           (get-in cancelled [:node "error"])))
     (testing "attempt, token, and ordinal mismatches fail closed"
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                    (resume/advance
