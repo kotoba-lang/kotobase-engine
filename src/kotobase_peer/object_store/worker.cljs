@@ -1352,14 +1352,21 @@
                       (if-not (lsm/paged-range-directory? source)
                         {:directory source :source-directory source}
                         (->
-                         (js/Promise.all
-                          (clj->js
-                           (mapv
-                            (fn [index]
-                              (-> (load-directory-index-refs!
-                                   e db-id source index nil)
-                                  (.then #(vector index %))))
-                            lsm/indexes)))
+                         ;; Indexes are deliberately sequential: each leaf
+                         ;; loader already permits four concurrent GETs, so
+                         ;; Promise.all over indexes would silently raise the
+                         ;; aggregate provider concurrency to twelve.
+                         (reduce
+                          (fn [result index]
+                            (.then
+                             result
+                             (fn [pairs]
+                               (->
+                                (load-directory-index-refs!
+                                 e db-id source index nil)
+                                (.then #(conj pairs [index %]))))))
+                          (js/Promise.resolve [])
+                          (sort lsm/indexes))
                          (.then
                           (fn [pairs]
                             {:source-directory source
@@ -1373,7 +1380,7 @@
                                     (into {}
                                           (map (fn [[index refs]]
                                                  [(name index) refs]))
-                                          (array-seq pairs)))}))))))))))))))
+                                          pairs))}))))))))))))))
 
 (defn retention-safe-epoch-oracle!
   "Return the explicit clock-skew-conservative R2 retention decision consumed
