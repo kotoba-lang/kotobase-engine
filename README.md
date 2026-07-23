@@ -145,6 +145,11 @@ its continuation without fetching the run root or replaying earlier data.
 Continuation reads are demand-only: a block is fetched after its descriptor is
 known to overlap the cursor and current page cutoff. This avoids speculative
 successor GETs and keeps physical reads attributable to returned page work.
+Required heads from independent runs are fetched in bounded waves, ordered by
+logical minimum. `:block-get-concurrency` caps each wave (default 4), each run
+contributes at most one block to a wave, and the cutoff is recomputed before
+the next wave. Successor blocks from one run are therefore never prefetched in
+the same wave.
 With an explicit `:remainder-max-bytes` budget, a page may return the decoded
 current block as `:block-remainder`. A resumable host can persist that bounded
 value beside the logical cursor and supply it to the next page, avoiding a

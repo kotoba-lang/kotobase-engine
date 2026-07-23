@@ -640,11 +640,14 @@
   only LIMIT+1 logical-key candidates survive between reads.
   AFTER is the opaque logical-key cursor returned by the previous page."
   [e db-id index prefixes
-   {:keys [after limit max-depth head-cid block-remainder remainder-max-bytes]
-    :or {limit 256 max-depth 256 block-remainder [] remainder-max-bytes 0}}]
+   {:keys [after limit max-depth head-cid block-remainder remainder-max-bytes
+           block-get-concurrency]
+    :or {limit 256 max-depth 256 block-remainder [] remainder-max-bytes 0
+         block-get-concurrency 4}}]
   (let [prefixes (vec (distinct (map vec prefixes)))]
     (when-not (and (lsm/indexes index) (seq prefixes) (pos-int? limit)
                    (pos-int? max-depth)
+                   (pos-int? block-get-concurrency)
                    (nat-int? remainder-max-bytes)
                    (valid-block-remainder? block-remainder)
                    (or (zero? remainder-max-bytes)
@@ -658,6 +661,7 @@
                       {:index index :prefixes prefixes :after after
                        :limit limit :max-depth max-depth
                        :head-cid head-cid
+                       :block-get-concurrency block-get-concurrency
                        :remainder-max-bytes remainder-max-bytes})))
     (-> (if head-cid
           (resolve-database-snapshot! e head-cid)
@@ -740,47 +744,80 @@
                                                     (lsm/visible-page-add-run
                                                      candidates rows query-epoch after
                                                      limit matches-prefix?)))))
-                                       (fold-blocks [state descriptors]
-                                         (let [remaining
-                                               (drop-while
-                                                #(skip-block? (:candidates state) %)
-                                                descriptors)]
-                                           (if (empty? remaining)
+                                       (fold-block-waves [state queues]
+                                         (let [planned
+                                               (->> queues
+                                                    (keep-indexed
+                                                     (fn [queue-index descriptors]
+                                                       (when-let [remaining
+                                                                  (seq
+                                                                   (drop-while
+                                                                    #(skip-block?
+                                                                      (:candidates state) %)
+                                                                    descriptors))]
+                                                         {:queue-index queue-index
+                                                         :descriptor (first remaining)
+                                                          :remaining (vec (rest remaining))})))
+                                                    (sort-by (fn [{:keys [queue-index descriptor]}]
+                                                               [(get descriptor "logical-min")
+                                                                queue-index]))
+                                                    (take block-get-concurrency)
+                                                    vec)]
+                                           (if (empty? planned)
                                              (js/Promise.resolve state)
-                                             (let [descriptor (first remaining)]
-                                               (-> (load-block! descriptor)
-                                                   (.then
-                                                    (fn [loaded]
-                                                      (fold-blocks
-                                                       (fold-loaded-block state loaded)
-                                                       (rest remaining)))))))))
-                                       (fold-ref [pending ref]
+                                             (-> (mapv #(load-block! (:descriptor %))
+                                                       planned)
+                                                 clj->js js/Promise.all
+                                                 (.then
+                                                  (fn [loaded]
+                                                    (let [loaded (vec (array-seq loaded))
+                                                          next-queues
+                                                          (reduce
+                                                           (fn [current
+                                                                {:keys [queue-index remaining]}]
+                                                             (assoc current queue-index remaining))
+                                                           queues planned)
+                                                          next-state
+                                                          (-> (reduce fold-loaded-block state loaded)
+                                                              (update
+                                                               :max-concurrent-block-gets max
+                                                               (count (filter #(nth % 2) loaded))))]
+                                                      (fold-block-waves
+                                                       next-state next-queues))))))))
+                                       (fold-legacy-ref [pending ref]
                                          (.then
                                           pending
                                           (fn [state]
-                                            (if-let [blocks (seq (get ref "blocks"))]
-                                              (fold-blocks
-                                               (update state :scanned-runs inc)
-                                               (sort-by #(get % "ordinal") blocks))
-                                              (-> (load-run! e ref)
-                                                  (.then
-                                                   (fn [run]
-                                                     (-> state
-                                                         (assoc :candidates
-                                                                (lsm/visible-page-add-run
-                                                                 (:candidates state)
-                                                                 (:rows run)
-                                                                 query-epoch after limit
-                                                                 matches-prefix?))
-                                                         (update :scanned-runs inc)
-                                                         (update :scanned-blocks inc)
-                                                         (update :fetched-blocks inc)))))))))]
-                                 (-> (reduce fold-ref
-                                             (js/Promise.resolve
-                                              {:candidates {} :scanned-runs 0
-                                               :scanned-blocks 0 :fetched-blocks 0
-                                               :loaded-blocks {}})
-                                             selected)
+                                            (-> (load-run! e ref)
+                                                (.then
+                                                 (fn [run]
+                                                   (-> state
+                                                       (assoc :candidates
+                                                              (lsm/visible-page-add-run
+                                                               (:candidates state)
+                                                               (:rows run)
+                                                               query-epoch after limit
+                                                               matches-prefix?))
+                                                       (update :scanned-runs inc)
+                                                       (update :scanned-blocks inc)
+                                                       (update :fetched-blocks inc))))))))]
+                                 (let [block-refs (filterv #(seq (get % "blocks")) selected)
+                                       legacy-refs (filterv #(not (seq (get % "blocks"))) selected)
+                                       initial {:candidates {} :scanned-runs 0
+                                                :scanned-blocks 0 :fetched-blocks 0
+                                                :max-concurrent-block-gets 0
+                                                :loaded-blocks {}}]
+                                   (-> (reduce fold-legacy-ref
+                                               (js/Promise.resolve initial)
+                                               legacy-refs)
+                                     (.then
+                                      (fn [state]
+                                        (fold-block-waves
+                                         (update state :scanned-runs + (count block-refs))
+                                         (mapv #(vec (sort-by (fn [descriptor]
+                                                               (get descriptor "ordinal"))
+                                                             (get % "blocks")))
+                                               block-refs))))
                                      (.then
                                       (fn [state]
                                         (let [result (lsm/visible-page-result
@@ -789,11 +826,13 @@
                                                  :scanned-runs (:scanned-runs state)
                                                  :scanned-blocks (:scanned-blocks state)
                                                  :fetched-blocks (:fetched-blocks state)
+                                                 :max-concurrent-block-gets
+                                                 (:max-concurrent-block-gets state)
                                                  :block-remainder
                                                  (bounded-block-remainder
                                                   (:loaded-blocks state)
                                                   (:cursor result)
-                                                  remainder-max-bytes)))))))))))))))))))))
+                                                  remainder-max-bytes))))))))))))))))))))))
 
 (defn- manifest-window!
   [e head-cid limit]
