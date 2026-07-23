@@ -3,6 +3,7 @@
             [clojure.string :as str]
             [goog.object :as gobj]
             [ipld.core :as ipld]
+            [kotobase-peer.database-restore :as database-restore]
             [kotobase-peer.merkle-lsm :as lsm]
             [kotobase-peer.object-store.worker :as worker]
             [kotobase-peer.resumable-execution :as resumable]
@@ -113,6 +114,122 @@
           (.catch
            (fn [error]
              (is false (str "MVCC entity read rejected: " error))
+             (done)))))))
+
+(deftest database-restore-pointer-reclaims-page-progress-with-etag-cas
+  (async done
+    (let [prefix "restore-state/"
+          entries (atom {})
+          version (atom 0)
+          bucket
+          #js {:get
+               (fn [key]
+                 (let [{:keys [value etag]} (get @entries key)]
+                   (js/Promise.resolve
+                    (when value
+                      #js {:etag etag
+                           :text (fn [] (js/Promise.resolve value))
+                           :arrayBuffer
+                           (fn []
+                             (let [bytes
+                                   (if (string? value)
+                                     (.encode (js/TextEncoder.) value)
+                                     value)]
+                               (js/Promise.resolve
+                                (.slice (.-buffer bytes)
+                                        (.-byteOffset bytes)
+                                        (+ (.-byteOffset bytes)
+                                           (.-byteLength bytes))))))}))))
+               :put
+               (fn [key value opts]
+                 (let [current (get @entries key)
+                       condition (when opts (.-onlyIf opts))
+                       matches (when condition (.-etagMatches condition))
+                       absent (when condition
+                                (.-etagDoesNotMatch condition))
+                       won? (cond
+                              matches (= matches (:etag current))
+                              (= "*" absent) (nil? current)
+                              :else true)]
+                   (if-not won?
+                     (js/Promise.resolve nil)
+                     (let [etag (str "v" (swap! version inc))]
+                       (swap! entries assoc key
+                              {:value value :etag etag})
+                       (js/Promise.resolve #js {:etag etag})))))}
+          env #js {"MERKLE_BUCKET" bucket
+                   "MERKLE_S3_PREFIX" "restore-state"}
+          head (ipld/cid (ipld/encode {"head" 1}))
+          task (database-restore/restore-task
+                {:inventory-cid
+                 (ipld/cid (ipld/encode {"inventory" 1}))
+                 :target-db-id "target"
+                 :head-cid head
+                 :entry-count 2
+                 :page-count 2})
+          claim-opts {:task task :owner "worker-a" :token "token-a"
+                      :now-ms 1000 :lease-ms 100}]
+      (-> (worker/claim-database-restore! env claim-opts)
+          (.then
+           (fn [claim]
+             (is (:claimed? claim))
+             (is (= 1 (get-in claim [:pointer "attempt"])))
+             (worker/advance-database-restore-checkpoint!
+              env (merge claim
+                         {:page-ordinal 0
+                          :page-cid
+                          (ipld/cid (ipld/encode {"page" 0}))
+                          :entry-count 1
+                          :restored 1
+                          :already-present 0
+                          :first-entry ["blocks" "cid-a"]
+                          :last-entry ["blocks" "cid-a"]
+                          :now-ms 1020
+                          :lease-ms 100}))))
+          (.then
+           (fn [advanced]
+             (is (:advanced? advanced))
+             (is (= 1
+                    (get-in advanced [:checkpoint "next-page"])))
+             (worker/claim-database-restore!
+              env (assoc claim-opts
+                         :owner "worker-b"
+                         :token "token-b"
+                         :now-ms 1201))))
+          (.then
+           (fn [reclaimed]
+             (is (:claimed? reclaimed))
+             (is (= 2 (get-in reclaimed [:pointer "attempt"])))
+             (is (= 1
+                    (get-in reclaimed [:checkpoint "next-page"])))
+             (is (= 1
+                    (get-in reclaimed
+                            [:checkpoint "processed-entries"])))
+             (swap! entries assoc
+                    (str prefix "heads/conflict")
+                    {:value "different" :etag "conflict"})
+             (worker/claim-database-restore!
+              env (assoc claim-opts
+                         :task
+                         (database-restore/restore-task
+                          {:inventory-cid
+                           (ipld/cid (ipld/encode {"inventory" 1}))
+                           :target-db-id "conflict"
+                           :head-cid head
+                           :entry-count 2
+                           :page-count 2})
+                         :owner "worker-c"
+                         :token "token-c"
+                         :now-ms 1300))))
+          (.then
+           (fn [conflict]
+             (is (= :target-head-conflict (:reason conflict)))
+             (done)))
+          (.catch
+           (fn [error]
+             (is false
+                 (str "database restore pointer rejected: " error
+                      "\n" (.-stack error)))
              (done)))))))
 
 (deftest checkpoint-compaction-streams-physical-blocks-with-a-bounded-working-set

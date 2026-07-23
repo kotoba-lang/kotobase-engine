@@ -34,19 +34,25 @@
                       :entry-count 1 :restored 0 :already-present 1
                       :first-entry ["objects" "cid-c"]
                       :last-entry ["objects" "cid-c"]})
+        reclaimed (restore/reclaim-checkpoint
+                   {:task task :checkpoint second-page
+                    :old-token "attempt-token" :old-attempt 1
+                    :new-token "reclaimed-token" :new-attempt 2})
         ready (restore/ready-to-publish
-               {:task task :checkpoint second-page
-                :token "attempt-token" :attempt 1
+               {:task task :checkpoint reclaimed
+                :token "reclaimed-token" :attempt 2
                 :verified-reachable 3})
         completed (restore/complete
                    {:task task :checkpoint ready
-                    :token "attempt-token" :attempt 1
+                    :token "reclaimed-token" :attempt 2
                     :observed-head (str head)})]
     (is (= "running" (get-in initial [:node "status"])))
     (is (= 1 (get-in first-page [:node "next-page"])))
     (is (= 3 (get-in second-page [:node "processed-entries"])))
     (is (= 2 (get-in second-page [:node "restored"])))
     (is (= 1 (get-in second-page [:node "already-present"])))
+    (is (= 2 (get-in reclaimed [:node "attempt"])))
+    (is (= 2 (get-in reclaimed [:node "next-page"])))
     (is (= "ready-to-publish" (get-in ready [:node "status"])))
     (is (= "completed" (get-in completed [:node "status"])))
     (testing "page replay, token mismatch, incomplete verification and wrong head fail closed"
@@ -76,6 +82,11 @@
                     {:task task :checkpoint second-page
                      :token "attempt-token" :attempt 1
                      :verified-reachable 2})))
+      (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
+                   (restore/reclaim-checkpoint
+                    {:task task :checkpoint second-page
+                     :old-token "attempt-token" :old-attempt 1
+                     :new-token "reclaimed-token" :new-attempt 3})))
       (is (thrown? #?(:clj clojure.lang.ExceptionInfo :cljs js/Error)
                    (restore/complete
                     {:task task :checkpoint ready

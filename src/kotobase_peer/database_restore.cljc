@@ -77,6 +77,25 @@
                        :token token :attempt attempt})))
     node))
 
+(defn reclaim-checkpoint
+  "Move an expired non-terminal attempt to a fresh token/attempt without
+  discarding its durable page cursor. The host must ETag-CAS the pointer from
+  the old checkpoint to this CID, so the old owner is fenced."
+  [{:keys [task checkpoint old-token old-attempt new-token new-attempt]}]
+  (let [current (validate-checkpoint
+                 task checkpoint old-token old-attempt)]
+    (when-not
+     (and (contains? #{"running" "ready-to-publish"}
+                     (get current "status"))
+          (string? new-token) (seq new-token)
+          (= (inc old-attempt) new-attempt))
+      (throw (ex-info "Invalid database restore reclaim"
+                      {:status (get current "status")
+                       :old-attempt old-attempt
+                       :new-attempt new-attempt})))
+    (encoded
+     (assoc current "token" new-token "attempt" new-attempt))))
+
 (defn advance-page
   "Commit the outcome of exactly the next inventory page. The host must perform
   CID verification and create-only writes before publishing this checkpoint."
