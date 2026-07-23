@@ -1,0 +1,40 @@
+{:date "2026-07-23"
+ :feature :merkle-resource-scale-gate
+ :runtime {:kind :jvm :max-heap "2g" :writers 1 :isolated-process true}
+ :fixture {:datoms 100000 :batch-rows 1000 :target-run-rows 4096}
+ :timing-ms
+ {:total 237181.279417
+  :flush-p50 1602.807417
+  :flush-p95 3013.093875
+  :flush-p99 3348.372667
+  :compaction 73871.241958
+  :cpu 103640.40800000001}
+ :resource
+ {:heap-before-bytes 7257880
+  :peak-heap-bytes 852369128
+  :peak-heap-delta-bytes 845111248
+  :cpu-ms-per-datom 1.03640408
+  :throughput-per-sec 421.6184356784125}
+ :storage
+ {:input-runs 100
+  :flush-objects 900
+  :flush-object-bytes 17806271
+  :compacted-runs 25
+  :compact-objects 807
+  :compact-object-bytes 17765203
+  :read-amplification 4.0
+  :write-amplification 1.997693621533672
+  :bytes-per-datom 355.71474}
+ :correctness {:input-datoms 100000 :compacted-datoms 100000 :lost 0}
+ :gate {:passed true :failures []}
+ :larger-tiers
+ {:million :not-run
+  :ten-million :not-run
+  :reason
+  "The 100k in-memory pure compaction already peaks at 852 MB. The 10M
+   production gate must exercise the host's object-backed streaming compactor,
+   not silently raise the JVM heap for this all-runs-resident oracle."}
+ :claim
+ "The first resource-complete 100k gate passes its declared JVM bounds and
+ preserves every row, but it also proves that the pure in-memory oracle is not
+ the 10M production path. This receipt does not claim Worker or R2 scale."}
