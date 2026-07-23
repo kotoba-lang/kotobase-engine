@@ -153,6 +153,8 @@
         pages (get (:pages directory) "eavt")]
     (is (= 2 (get root "version")))
     (is (= [2 2 1] (mapv #(get-in % [:node "count"]) pages)))
+    (is (= 5
+           (reduce + (map #(get-in % [:descriptor "row-count"]) pages))))
     (is (= 3 (count (lsm/range-directory-page-descriptors root :eavt))))
     (is (= 4 (count (:effects directory)))
         "three leaves and one root are immutable block puts")
