@@ -206,8 +206,14 @@ the database-restore grace, double-snapshot fence, backup-before-delete, and
 CID-verified restore path. The 10,000-entry synthetic gate kept 158 checkpoint
 samples between 421 and 448 bytes; see
 `bench/results/2026-07-23-external-restore-verification-10k.edn`. This removes
-the resumable verifier's O(total entries) process memory, but inventory root
-descriptors and backup-side graph discovery remain separate scale gaps.
+the resumable verifier's O(total entries) process memory. Database backup
+inventory v3 also replaces the v2 root's O(page count) descriptor vector with
+a CID-addressed 64-way directory tree. Restore by ordinal fetches one directory
+node per level; verification fetches at most one node per namespace/CID target
+per level. v1/v2 remain readable. A 1,048,832-entry synthetic shape used 4,097 data pages, 68 directory
+nodes, height 3, a 728-byte top node, and a 20,812-byte largest directory node;
+see `bench/results/2026-07-24-database-inventory-v3-tree.edn`. Backup-side graph
+discovery remains a separate process-local scale gap.
 
 The authenticated `/bench/orphan-gc` drill uses an isolated prefix and cleans
 it in `finally`. The 2026-07-23 real-R2 run marked 2 heads and 4 live blocks,

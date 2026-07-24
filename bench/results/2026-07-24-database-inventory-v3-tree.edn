@@ -1,0 +1,24 @@
+{:schema 1
+ :benchmark :database-backup-inventory-v3-tree
+ :recorded-at "2026-07-24"
+ :mode :deterministic-synthetic
+ :page-entry-limit 256
+ :directory-fanout 64
+ :data-pages 4097
+ :represented-entries 1048832
+ :directory-height 3
+ :directory-nodes 68
+ :top-node-children 2
+ :top-node-bytes 728
+ :maximum-directory-node-bytes 20812
+ :directory-node-byte-limit 65536
+ :claims
+ ["The inventory root stores one top directory descriptor instead of every data-page descriptor."
+  "Ordinal restore requires at most one directory node per tree level; sparse lookup requires at most one per namespace/CID target per level."
+  "Every directory node is content-addressed, has at most 64 children, and is fail-closed at 65,536 encoded bytes."
+  "Inventory v1 and v2 remain readable; new database backups publish v3."]
+ :limitations
+ ["This is deterministic in-process structure and byte-bound evidence, not live R2 latency or operation-cost evidence."
+  "Backup graph discovery still holds a process-local seen set."
+  "The legacy synchronous restore path may still materialize all entries."
+  "Verification still uses one external marker object per content CID."]}
