@@ -1295,6 +1295,96 @@
                      (into (:nodes incremental) (:nodes finalized)))))
         "incremental publication effects are byte-identical")))
 
+(deftest gc-fences-active-database-backup-and-sweeps-completed-work
+  (async done
+    (let [prefix "test/"
+          active-prefix
+          (str prefix "scheduler/database-backup/db/active/")
+          completed-prefix
+          (str prefix "scheduler/database-backup/db/completed/")
+          active-current (str active-prefix "current")
+          active-frontier (str active-prefix "frontier/cid-active")
+          completed-current (str completed-prefix "current")
+          completed-frontier (str completed-prefix "frontier/cid-done")
+          completed-entry (str completed-prefix "entries/blocks/cid-done")
+          objects
+          (atom
+           {active-current
+            (js/JSON.stringify
+             (clj->js {"format" "kotobase/resumable-database-backup"
+                       "version" 1
+                       "db-id" "db"
+                       "backup-id" "active"
+                       "head-cid" "cid-active"
+                       "status" "traversing"}))
+            active-frontier "active-marker"
+            completed-current
+            (js/JSON.stringify
+             (clj->js {"format" "kotobase/resumable-database-backup"
+                       "version" 1
+                       "db-id" "db"
+                       "backup-id" "completed"
+                       "head-cid" "cid-done"
+                       "status" "completed"}))
+            completed-frontier "done-marker"
+            completed-entry ""})
+          uploaded-at
+          (fn [key]
+            (js/Date. (if (str/starts-with? key active-prefix) 9500 0)))
+          bucket
+          #js {:get
+               (fn [key]
+                 (js/Promise.resolve
+                  (when-let [value (get @objects key)]
+                    #js {:etag (str "etag:" key)
+                         :text (fn [] (js/Promise.resolve value))})))
+               :put
+               (fn [key value opts]
+                 (let [conditional?
+                       (= "*" (some-> opts .-onlyIf .-etagDoesNotMatch))]
+                   (if (and conditional? (contains? @objects key))
+                     (js/Promise.resolve nil)
+                     (do (swap! objects assoc key value)
+                         (js/Promise.resolve #js {:key key})))))
+               :list
+               (fn [opts]
+                 (let [wanted (.-prefix opts)
+                       listed
+                       (->> (keys @objects)
+                            (filter #(str/starts-with? % wanted))
+                            (mapv
+                             (fn [key]
+                               #js {:key key
+                                    :uploaded (uploaded-at key)})))]
+                   (js/Promise.resolve
+                    #js {:objects (clj->js listed)
+                         :truncated false})))
+               :delete
+               (fn [keys]
+                 (doseq [key (js->clj keys)]
+                   (swap! objects dissoc key))
+                 (js/Promise.resolve nil))}
+          env #js {"MERKLE_BUCKET" bucket "MERKLE_S3_PREFIX" "test"}]
+      (-> (worker/gc-unreachable! env "db" 1000 false 10000)
+          (.then
+           (fn [audit]
+             (is (= 2 (:database-backup-roots audit)))
+             (is (= 1 (:active-database-backup-roots audit)))
+             (is (= 3 (:stale-database-backup-work audit)))
+             (is (= 3 (:candidates audit)))
+             (worker/gc-unreachable! env "db" 1000 true 10000)))
+          (.then
+           (fn [sweep]
+             (is (= 3 (:deleted sweep)))
+             (is (= 3 (:backed-up sweep)))
+             (is (contains? @objects active-current))
+             (is (contains? @objects active-frontier))
+             (is (nil? (get @objects completed-current)))
+             (is (nil? (get @objects completed-frontier)))
+             (is (nil? (get @objects completed-entry)))
+             (done)))
+          (.catch done)))))
+
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
     (let [child-a-bytes (ipld/encode {"value" "a"})
