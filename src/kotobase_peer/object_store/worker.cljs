@@ -62,6 +62,8 @@
 
 (def database-backup-page-entries 256)
 (def database-backup-page-bytes (* 64 1024))
+(def database-backup-directory-fanout 64)
+(def database-backup-directory-bytes (* 64 1024))
 
 (defn- b2-config [e]
   (when (every? #(seq (env e %))
@@ -2907,8 +2909,72 @@
               "last" (backup-inventory-entry (peek (vec page-entries)))}})))
        vec))
 
+(defn- inventory-tree-child-descriptor
+  [{:keys [descriptor]}]
+  {"kind" "page"
+   "cid" (get descriptor "cid")
+   "encoded-bytes" (get descriptor "encoded-bytes")
+   "first-page" (get descriptor "ordinal")
+   "page-count" 1
+   "entry-count" (get descriptor "count")
+   "first" (get descriptor "first")
+   "last" (get descriptor "last")})
+
+(defn database-backup-inventory-tree
+  "Build a deterministic bounded-fan-out tree over immutable data page
+  descriptors. The returned root descriptor is constant-size regardless of
+  total page count; every directory node is independently CID-addressed."
+  [pages]
+  (when-not (seq pages)
+    (throw (ex-info "Database backup inventory tree requires pages" {})))
+  (loop [level 0
+         children (mapv inventory-tree-child-descriptor pages)
+         nodes []]
+    (let [built
+          (mapv
+           (fn [node-children]
+             (let [node {"format"
+                         "kotobase/database-backup-inventory-directory"
+                         "version" 1
+                         "level" level
+                         "children" (vec node-children)}
+                   bytes (ipld/encode node)
+                   encoded-bytes (.-byteLength bytes)
+                   first-child (first node-children)
+                   last-child (peek (vec node-children))]
+               (when (> encoded-bytes database-backup-directory-bytes)
+                 (throw
+                  (ex-info
+                   "Database backup inventory directory exceeds byte limit"
+                   {:level level
+                    :children (count node-children)
+                    :encoded-bytes encoded-bytes
+                    :maximum database-backup-directory-bytes})))
+               {:cid (str (ipld/cid bytes))
+                :bytes bytes
+                :node node
+                :descriptor
+                {"kind" "directory"
+                 "cid" (str (ipld/cid bytes))
+                 "encoded-bytes" encoded-bytes
+                 "level" level
+                 "first-page" (get first-child "first-page")
+                 "page-count"
+                 (reduce + 0 (map #(get % "page-count") node-children))
+                 "entry-count"
+                 (reduce + 0 (map #(get % "entry-count") node-children))
+                 "first" (get first-child "first")
+                 "last" (get last-child "last")}}))
+           (partition-all database-backup-directory-fanout children))
+          all-nodes (into nodes built)]
+      (if (= 1 (count built))
+        {:root (get-in (first built) [:descriptor])
+         :nodes all-nodes
+         :height (inc level)}
+        (recur (inc level) (mapv :descriptor built) all-nodes)))))
+
 (defn- publish-database-backup-pages!
-  [e backup-bucket pages]
+  [e backup-bucket objects]
   (reduce
    (fn [pending wave]
      (.then
@@ -2922,7 +2988,7 @@
               backup-bucket (database-backup-page-key e cid) cid bytes))
            wave))))))
    (js/Promise.resolve nil)
-   (partition-all 4 pages)))
+   (partition-all 4 objects)))
 
 (defn backup-database!
   "Pin one immutable database snapshot, copy every reachable IPLD block into
@@ -2972,10 +3038,13 @@
                                              pages
                                              (database-backup-inventory-pages
                                               inventory-entries)
+                                             tree
+                                             (database-backup-inventory-tree
+                                              pages)
                                              node
                                              {"format"
                                               "kotobase/database-backup-inventory"
-                                              "version" 2
+                                              "version" 3
                                               "source-prefix" (prefix e)
                                               "db-id" db-id
                                               "backup-id" backup-id
@@ -2987,12 +3056,19 @@
                                               database-backup-page-entries
                                               "page-byte-limit"
                                               database-backup-page-bytes
-                                              "pages"
-                                              (mapv :descriptor pages)}
+                                              "directory-fanout"
+                                              database-backup-directory-fanout
+                                              "directory-byte-limit"
+                                              database-backup-directory-bytes
+                                              "page-count" (count pages)
+                                              "directory-height"
+                                              (:height tree)
+                                              "page-tree" (:root tree)}
                                              bytes (ipld/encode node)
                                              cid (str (ipld/cid bytes))]
                                          (-> (publish-database-backup-pages!
-                                              e backup-bucket pages)
+                                              e backup-bucket
+                                              (into pages (:nodes tree)))
                                              (.then
                                               (fn [_]
                                                 (put-immutable-gc-backup!
@@ -3009,6 +3085,10 @@
                                                           :observed-at now-ms
                                                           :inventory-pages
                                                           (count pages)
+                                                          :inventory-directory-pages
+                                                          (count (:nodes tree))
+                                                          :inventory-directory-height
+                                                          (:height tree)
                                                           :inventory-root-bytes
                                                           (.-byteLength bytes)
                                                           :maximum-page-bytes
@@ -3080,11 +3160,27 @@
        (valid-database-backup-entry? (get descriptor "first"))
        (valid-database-backup-entry? (get descriptor "last"))))
 
+(defn- valid-database-backup-tree-descriptor?
+  [descriptor]
+  (and (map? descriptor)
+       (= "directory" (get descriptor "kind"))
+       (string? (get descriptor "cid"))
+       (re-matches #"b[a-z2-7]+" (get descriptor "cid"))
+       (pos-int? (get descriptor "encoded-bytes"))
+       (<= (get descriptor "encoded-bytes")
+           database-backup-directory-bytes)
+       (nat-int? (get descriptor "level"))
+       (nat-int? (get descriptor "first-page"))
+       (pos-int? (get descriptor "page-count"))
+       (pos-int? (get descriptor "entry-count"))
+       (valid-database-backup-entry? (get descriptor "first"))
+       (valid-database-backup-entry? (get descriptor "last"))))
+
 (defn- validate-database-backup-inventory [e cid node]
   (let [version (get node "version")
         common?
         (and (= "kotobase/database-backup-inventory" (get node "format"))
-             (contains? #{1 2} version)
+             (contains? #{1 2 3} version)
              (= (prefix e) (get node "source-prefix"))
              (string? (get node "db-id"))
              (string? (get node "backup-id"))
@@ -3117,6 +3213,28 @@
                  (get node "page-byte-limit")))
           (throw (ex-info "Invalid paged database backup inventory"
                           {:cid cid :node node})))
+        node)
+
+      3
+      (let [root (get node "page-tree")]
+        (when-not
+         (and (valid-database-backup-tree-descriptor? root)
+              (= 0 (get root "first-page"))
+              (= (get node "page-count") (get root "page-count"))
+              (= (get node "entry-count") (get root "entry-count"))
+              (= (get node "directory-height")
+                 (inc (get root "level")))
+              (= database-backup-page-entries
+                 (get node "page-entry-limit"))
+              (= database-backup-page-bytes
+                 (get node "page-byte-limit"))
+              (= database-backup-directory-fanout
+                 (get node "directory-fanout"))
+              (= database-backup-directory-bytes
+                 (get node "directory-byte-limit")))
+          (throw
+           (ex-info "Invalid hierarchical database backup inventory"
+                    {:cid cid :node node})))
         node))))
 
 (defn- load-database-backup-page!
@@ -3160,21 +3278,177 @@
                          {:cid cid :descriptor descriptor})))
              entries))))))
 
+(defn- tree-page-descriptor?
+  [descriptor]
+  (and (map? descriptor)
+       (= "page" (get descriptor "kind"))
+       (string? (get descriptor "cid"))
+       (re-matches #"b[a-z2-7]+" (get descriptor "cid"))
+       (pos-int? (get descriptor "encoded-bytes"))
+       (<= (get descriptor "encoded-bytes") database-backup-page-bytes)
+       (nat-int? (get descriptor "first-page"))
+       (= 1 (get descriptor "page-count"))
+       (pos-int? (get descriptor "entry-count"))
+       (<= (get descriptor "entry-count") database-backup-page-entries)
+       (valid-database-backup-entry? (get descriptor "first"))
+       (valid-database-backup-entry? (get descriptor "last"))))
+
+(defn- tree-page->page-descriptor
+  [descriptor]
+  {"cid" (get descriptor "cid")
+   "ordinal" (get descriptor "first-page")
+   "count" (get descriptor "entry-count")
+   "encoded-bytes" (get descriptor "encoded-bytes")
+   "first" (get descriptor "first")
+   "last" (get descriptor "last")})
+
+(defn- ordered-tree-children?
+  [children]
+  (and
+   (seq children)
+   (every?
+    true?
+    (map-indexed
+     (fn [index child]
+       (or (zero? index)
+           (let [previous (get children (dec index))]
+             (and
+              (= (get child "first-page")
+                 (+ (get previous "first-page")
+                    (get previous "page-count")))
+              (neg?
+               (compare
+                [(get-in previous ["last" "namespace"])
+                 (get-in previous ["last" "cid"])]
+                [(get-in child ["first" "namespace"])
+                 (get-in child ["first" "cid"])]))))))
+     children))))
+
+(defn- load-database-backup-directory!
+  [e backup-bucket descriptor]
+  (let [cid (get descriptor "cid")]
+    (-> (.get backup-bucket (database-backup-page-key e cid))
+        (.then
+         (fn [stored]
+           (if-not stored
+             (js/Promise.reject
+              (ex-info "Database backup inventory directory not found"
+                       {:cid cid}))
+             (stored-bytes! stored))))
+        (.then
+         (fn [bytes]
+           (when-not (= cid (str (ipld/cid bytes)))
+             (throw
+              (ex-info "Database backup inventory directory CID mismatch"
+                       {:cid cid})))
+           (let [node (ipld/decode bytes)
+                 level (get node "level")
+                 children (get node "children")
+                 child-valid?
+                 (if (zero? level)
+                   tree-page-descriptor?
+                   #(and (valid-database-backup-tree-descriptor? %)
+                         (= (dec level) (get % "level"))))]
+             (when-not
+              (and (= "kotobase/database-backup-inventory-directory"
+                      (get node "format"))
+                   (= 1 (get node "version"))
+                   (= (get descriptor "level") level)
+                   (vector? children)
+                   (<= 1 (count children)
+                       database-backup-directory-fanout)
+                   (= (get descriptor "encoded-bytes")
+                      (.-byteLength bytes))
+                   (every? child-valid? children)
+                   (ordered-tree-children? children)
+                   (= (get descriptor "first-page")
+                      (get-in children [0 "first-page"]))
+                   (= (get descriptor "page-count")
+                      (reduce + 0 (map #(get % "page-count") children)))
+                   (= (get descriptor "entry-count")
+                      (reduce + 0 (map #(get % "entry-count") children)))
+                   (= (get descriptor "first")
+                      (get-in children [0 "first"]))
+                   (= (get descriptor "last")
+                      (get-in children [(dec (count children)) "last"])))
+               (throw
+                (ex-info "Invalid database backup inventory directory"
+                         {:cid cid :descriptor descriptor})))
+             children))))))
+
+(defn- resolve-database-backup-page-descriptor!
+  [e backup-bucket root page-ordinal]
+  (letfn [(descend [descriptor]
+            (-> (load-database-backup-directory!
+                 e backup-bucket descriptor)
+                (.then
+                 (fn [children]
+                   (if-let [child
+                            (first
+                             (filter
+                              #(<= (get % "first-page")
+                                   page-ordinal
+                                   (dec
+                                    (+ (get % "first-page")
+                                       (get % "page-count"))))
+                              children))]
+                     (if (= "page" (get child "kind"))
+                       (tree-page->page-descriptor child)
+                       (descend child))
+                     (js/Promise.reject
+                      (ex-info "Database backup inventory page ordinal not found"
+                               {:ordinal page-ordinal})))))))]
+    (descend root)))
+
+(defn- collect-database-backup-page-descriptors!
+  [e backup-bucket root]
+  (letfn [(collect [descriptor]
+            (-> (load-database-backup-directory!
+                 e backup-bucket descriptor)
+                (.then
+                 (fn [children]
+                   (if (zero? (get descriptor "level"))
+                     (mapv tree-page->page-descriptor children)
+                     (reduce
+                      (fn [pending wave]
+                        (.then
+                         pending
+                         (fn [pages]
+                           (-> (js/Promise.all
+                                (clj->js (mapv collect wave)))
+                               (.then
+                                #(into pages
+                                       (mapcat identity
+                                               (array-seq %))))))))
+                      (js/Promise.resolve [])
+                      (partition-all 4 children)))))))]
+    (collect root)))
+
 (defn- materialize-database-backup-pages!
   [e backup-bucket inventory]
-  (reduce
-   (fn [pending wave]
-     (.then
-      pending
-      (fn [entries]
-        (-> (js/Promise.all
-             (clj->js
-              (mapv #(load-database-backup-page!
-                      e backup-bucket %)
-                    wave)))
-            (.then #(into entries (mapcat identity (array-seq %))))))))
-   (js/Promise.resolve [])
-   (partition-all 4 (get inventory "pages"))))
+  (let [descriptors
+        (if (= 2 (get inventory "version"))
+          (js/Promise.resolve (get inventory "pages"))
+          (collect-database-backup-page-descriptors!
+           e backup-bucket (get inventory "page-tree")))]
+    (-> descriptors
+        (.then
+         (fn [pages]
+           (reduce
+            (fn [pending wave]
+              (.then
+               pending
+               (fn [entries]
+                 (-> (js/Promise.all
+                      (clj->js
+                       (mapv #(load-database-backup-page!
+                               e backup-bucket %)
+                             wave)))
+                     (.then
+                      #(into entries
+                             (mapcat identity (array-seq %))))))))
+            (js/Promise.resolve [])
+            (partition-all 4 pages)))))))
 
 (defn- load-database-backup-inventory-root!
   [e backup-bucket inventory-cid]
@@ -3213,6 +3487,12 @@
                   (validate-materialized-database-backup-entries
                    inventory-cid inventory entries)
                   (assoc inventory "entries" entries)))))))))
+
+(defn- database-backup-inventory-page-count
+  [inventory]
+  (if (= 2 (get inventory "version"))
+    (count (get inventory "pages"))
+    (get inventory "page-count")))
 
 (defn- restore-database-entries!
   [e primary backup-bucket inventory-cid entries]
@@ -3330,7 +3610,7 @@
      (js/Error. "Resumable database restore requires an R2 binding"))))
 
 (defn prepare-database-restore-task!
-  "Load only the immutable inventory root and derive a deterministic v2 restore
+  "Load only the immutable inventory root and derive a deterministic paged restore
   task. No inventory page or primary object is read here."
   [e inventory-cid target-db-id]
   (let [backup-bucket (gc-backup-bucket e)]
@@ -3347,9 +3627,9 @@
          e backup-bucket inventory-cid)
         (.then
          (fn [inventory]
-           (when-not (= 2 (get inventory "version"))
+           (when-not (contains? #{2 3} (get inventory "version"))
              (throw
-              (ex-info "Resumable database restore requires inventory v2"
+              (ex-info "Resumable database restore requires a paged inventory"
                        {:inventory-cid inventory-cid
                         :version (get inventory "version")})))
            {:task
@@ -3358,7 +3638,8 @@
               :target-db-id target-db-id
               :head-cid (get inventory "head-cid")
               :entry-count (get inventory "entry-count")
-              :page-count (count (get inventory "pages"))})
+              :page-count
+              (database-backup-inventory-page-count inventory)})
             :inventory inventory})))))
 
 (defn claim-database-restore!
@@ -3560,6 +3841,13 @@
       (js/Promise.reject
        (js/Error. "Resumable database restore requires an R2 binding")))))
 
+(defn- database-backup-page-descriptor!
+  [e backup-bucket inventory page-ordinal]
+  (if (= 2 (get inventory "version"))
+    (js/Promise.resolve (get-in inventory ["pages" page-ordinal]))
+    (resolve-database-backup-page-descriptor!
+     e backup-bucket (get inventory "page-tree") page-ordinal)))
+
 (defn run-database-restore-page!
   "Restore exactly checkpoint.next-page, then CAS the durable checkpoint
   pointer. At most one bounded inventory page and four entry payloads are in
@@ -3579,13 +3867,11 @@
            e backup-bucket inventory-cid)
           (.then
            (fn [inventory]
-             (let [pages (get inventory "pages")
-                   descriptor (get pages page-ordinal)
-                   expected-head
+             (let [expected-head
                    (str
                     (ipld/link-cid (get-in task [:node "head"])))]
                (when-not
-                (and (= 2 (get inventory "version"))
+                (and (contains? #{2 3} (get inventory "version"))
                      (= target-db-id
                         (get pointer "target-db-id"))
                      (= expected-head
@@ -3593,73 +3879,120 @@
                      (= (get-in task [:node "entry-count"])
                         (get inventory "entry-count"))
                      (= (get-in task [:node "page-count"])
-                        (count pages))
-                     descriptor)
+                        (database-backup-inventory-page-count inventory))
+                     (< page-ordinal
+                        (database-backup-inventory-page-count inventory)))
                  (throw
                   (ex-info "Database restore task/inventory mismatch"
                            {:inventory inventory-cid
                             :target-db-id target-db-id
                             :page-ordinal page-ordinal})))
-               (-> (load-database-backup-page!
-                    e backup-bucket descriptor)
+               (-> (database-backup-page-descriptor!
+                    e backup-bucket inventory page-ordinal)
                    (.then
-                    (fn [entries]
-                      (-> (restore-database-entries!
-                           e primary backup-bucket
-                           inventory-cid entries)
+                    (fn [descriptor]
+                      (when-not descriptor
+                        (throw
+                         (ex-info "Database backup inventory page not found"
+                                  {:ordinal page-ordinal})))
+                      (-> (load-database-backup-page!
+                           e backup-bucket descriptor)
                           (.then
-                           (fn [counts]
-                             (advance-database-restore-checkpoint!
-                              e
-                              (merge
-                               claim
-                               {:page-ordinal page-ordinal
-                                :page-cid
-                                (get descriptor "cid")
-                                :entry-count (count entries)
-                                :restored (:restored counts)
-                                :already-present
-                                (:already-present counts)
-                                :first-entry
-                                [(get (first entries) "namespace")
-                                 (get (first entries) "cid")]
-                                :last-entry
-                                [(get (peek entries) "namespace")
-                                 (get (peek entries) "cid")]})))))))))))))))
+                           (fn [entries]
+                             (-> (restore-database-entries!
+                                  e primary backup-bucket
+                                  inventory-cid entries)
+                                 (.then
+                                  (fn [counts]
+                                    (advance-database-restore-checkpoint!
+                                     e
+                                     (merge
+                                      claim
+                                      {:page-ordinal page-ordinal
+                                       :page-cid
+                                       (get descriptor "cid")
+                                       :entry-count (count entries)
+                                       :restored (:restored counts)
+                                       :already-present
+                                       (:already-present counts)
+                                       :first-entry
+                                       [(get (first entries) "namespace")
+                                        (get (first entries) "cid")]
+                                       :last-entry
+                                       [(get (peek entries) "namespace")
+                                        (get (peek entries) "cid")]}))))))))))))))))))
 
 (def database-restore-verification-list-limit 64)
 
 (declare mark-database-restore-ready!)
 
+(defn- descriptor-contains-inventory-key?
+  [descriptor target]
+  (and (not (neg?
+             (compare target
+                      [(get-in descriptor ["first" "namespace"])
+                       (get-in descriptor ["first" "cid"])])))
+       (not (pos?
+             (compare target
+                      [(get-in descriptor ["last" "namespace"])
+                       (get-in descriptor ["last" "cid"])])))))
+
+(defn- database-backup-tree-candidate-pages!
+  [e backup-bucket root target]
+  (letfn [(descend [descriptor]
+            (-> (load-database-backup-directory!
+                 e backup-bucket descriptor)
+                (.then
+                 (fn [children]
+                   (let [matches
+                         (filterv
+                          #(descriptor-contains-inventory-key? % target)
+                          children)]
+                     (when (> (count matches) 1)
+                       (throw
+                        (ex-info
+                         "Overlapping database backup inventory ranges"
+                         {:target target :matches (count matches)})))
+                     (if-let [child (first matches)]
+                       (if (= "page" (get child "kind"))
+                         [(tree-page->page-descriptor child)]
+                         (descend child))
+                       []))))))]
+    (descend root)))
+
 (defn- database-backup-entry-inventory!
   "Resolve CID to its unique namespace from at most one candidate page per
-  namespace. Root descriptors are sparse and remain small for inventory v2."
+  namespace. Inventory v3 reads one bounded directory node per tree level."
   [e backup-bucket inventory cid]
-  (let [candidate-descriptors
-        (->> ["blocks" "objects"]
-             (mapcat
-              (fn [namespace]
-                (let [target [namespace cid]]
-                  (filter
-                   (fn [descriptor]
-                     (and (not (neg? (compare target
-                                              [(get-in descriptor
-                                                       ["first" "namespace"])
-                                               (get-in descriptor
-                                                       ["first" "cid"])])))
-                          (not (pos? (compare target
-                                             [(get-in descriptor
-                                                      ["last" "namespace"])
-                                              (get-in descriptor
-                                                      ["last" "cid"])])))))
-                   (get inventory "pages")))))
-             distinct
-             vec)]
-    (-> (js/Promise.all
-         (clj->js
-          (mapv #(load-database-backup-page!
-                  e backup-bucket %)
-                candidate-descriptors)))
+  (let [targets (mapv #(vector % cid) ["blocks" "objects"])
+        candidates
+        (if (= 2 (get inventory "version"))
+          (js/Promise.resolve
+           (->> targets
+                (mapcat
+                 (fn [target]
+                   (filter
+                    #(descriptor-contains-inventory-key?
+                      % target)
+                    (get inventory "pages"))))
+                distinct
+                vec))
+          (-> (js/Promise.all
+               (clj->js
+                (mapv
+                 #(database-backup-tree-candidate-pages!
+                   e backup-bucket (get inventory "page-tree") %)
+                 targets)))
+              (.then #(vec (distinct (mapcat identity
+                                             (array-seq %)))))))]
+    (-> candidates
+        (.then
+         (fn [candidate-descriptors]
+           (js/Promise.all
+            (clj->js
+             (mapv #(load-database-backup-page!
+                     e backup-bucket %)
+                   candidate-descriptors)))))
         (.then
          (fn [pages]
            (let [matches

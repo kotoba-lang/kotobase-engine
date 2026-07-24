@@ -993,6 +993,9 @@
              (is (= source-head (:head-cid backup)))
              (is (= 7 (:epoch backup)))
              (is (= 1 (:blocks backup)))
+             (is (= 1 (:inventory-pages backup)))
+             (is (= 1 (:inventory-directory-pages backup)))
+             (is (= 1 (:inventory-directory-height backup)))
              (is (= "backup"
                     (get-in backup [:retention-root "kind"])))
              (is (= source-head
@@ -1185,6 +1188,7 @@
          (range 10000))
         entries (vec (sort-by (juxt :namespace :cid) entries))
         pages (worker/database-backup-inventory-pages entries)
+        tree (worker/database-backup-inventory-tree pages)
         decoded
         (mapcat #(get-in % [:node "entries"]) pages)]
     (is (= 40 (count pages)))
@@ -1201,7 +1205,41 @@
     (is (= (mapv :cid pages)
            (mapv :cid
                  (worker/database-backup-inventory-pages entries)))
-        "the same inventory produces the same immutable page CIDs")))
+        "the same inventory produces the same immutable page CIDs")
+    (is (= 1 (:height tree)))
+    (is (= 40 (get-in tree [:root "page-count"])))
+    (is (= 10000 (get-in tree [:root "entry-count"])))
+    (is (= 1 (count (:nodes tree))))
+    (is (<= (.-byteLength (:bytes (peek (:nodes tree))))
+            worker/database-backup-directory-bytes))))
+
+(deftest database-backup-inventory-tree-root-remains-constant-size
+  (let [entry {"namespace" "blocks"
+               "cid" (str (ipld/cid (ipld/encode {"tree" "entry"})))}
+        page-cid (str (ipld/cid (ipld/encode {"tree" "page"})))
+        pages
+        (mapv
+         (fn [ordinal]
+           {:descriptor
+            {"cid" page-cid
+             "ordinal" ordinal
+             "count" 256
+             "encoded-bytes" 1024
+             "first" entry
+             "last" entry}})
+         (range 4097))
+        tree (worker/database-backup-inventory-tree pages)
+        root-node (peek (:nodes tree))]
+    (is (= 3 (:height tree)))
+    (is (= 4097 (get-in tree [:root "page-count"])))
+    (is (= (* 4097 256) (get-in tree [:root "entry-count"])))
+    (is (= 68 (count (:nodes tree))))
+    (is (= 2 (count (get-in root-node [:node "children"]))))
+    (is (<= (.-byteLength (:bytes root-node))
+            worker/database-backup-directory-bytes))
+    (is (= (:root tree)
+           (:root (worker/database-backup-inventory-tree pages)))
+        "the same page descriptors produce the same constant-size root")))
 
 (deftest gc-marks-every-head-before-sweeping-shared-block-prefix
   (async done
