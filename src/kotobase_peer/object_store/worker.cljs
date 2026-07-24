@@ -2382,6 +2382,47 @@
                 (sort-by :key)
                 vec))))))
 
+(defn- all-r2-database-backup-roots! [e bucket]
+  (let [fetch-pointer
+        (fn [object]
+          (let [key (gobj/get object "key")]
+            (-> (.get bucket key)
+                (.then
+                 (fn [stored]
+                   (when stored
+                     (-> (.text stored)
+                         (.then
+                          (fn [value]
+                            (let [pointer
+                                  (js->clj (js/JSON.parse value))]
+                              {:key key
+                               :etag (gobj/get stored "etag")
+                               :uploaded-ms
+                               (some-> (gobj/get object "uploaded")
+                                       .getTime)
+                               :db-id (get pointer "db-id")
+                               :backup-id (get pointer "backup-id")
+                               :head-cid (get pointer "head-cid")
+                               :status (get pointer "status")}))))))))))]
+    (-> (list-r2-blocks!
+         bucket (str (prefix e) "scheduler/database-backup/"))
+        (.then
+         (fn [objects]
+           (let [pointers
+                 (filterv #(str/ends-with?
+                            (gobj/get % "key") "/current")
+                          objects)]
+             (if (seq pointers)
+               (js/Promise.all
+                (clj->js (mapv fetch-pointer pointers)))
+               (js/Promise.resolve #js [])))))
+        (.then
+         (fn [roots]
+           (->> (array-seq roots)
+                (remove nil?)
+                (sort-by :key)
+                vec))))))
+
 (defn- all-r2-ingress-roots! [e bucket]
   (let [fetch-job
         (fn [object]
@@ -2421,20 +2462,23 @@
                            (all-r2-retention-roots! e bucket)
                            (all-r2-resumable-roots! e bucket)
                            (all-r2-database-restore-roots! e bucket)
+                           (all-r2-database-backup-roots! e bucket)
                            (all-r2-ingress-roots! e bucket)])
       (.then (fn [values]
                {:heads (aget values 0)
                 :roots (aget values 1)
                 :resumable-roots (aget values 2)
                 :database-restore-roots (aget values 3)
-                :ingress-roots (aget values 4)}))
+                :database-backup-roots (aget values 4)
+                :ingress-roots (aget values 5)}))
       (.catch (fn [error]
                 (js/Promise.reject
                  (js/Error. (str "GC root snapshot failed: " error)))))))
 
 (defn- gc-audit! [e bucket
                   {:keys [heads roots resumable-roots
-                          database-restore-roots ingress-roots]}
+                          database-restore-roots database-backup-roots
+                          ingress-roots]}
                   grace-ms now-ms]
   (let [head-by-key (into {} (map (juxt :key :value)) heads)
         oracle (retention/safe-epoch-oracle
@@ -2467,6 +2511,18 @@
                           (map :checkpoint active-database-restore-roots)
                           (map :workload active-ingress-roots))
         cutoff (- now-ms grace-ms)
+        active-database-backup-roots
+        (filterv
+         (fn [{:keys [status uploaded-ms]}]
+           (and (contains? #{"traversing" "indexing" "finalizing"} status)
+                uploaded-ms
+                (>= uploaded-ms cutoff)))
+         database-backup-roots)
+        active-database-backup-prefixes
+        (mapv
+         (fn [{:keys [key]}]
+           (subs key 0 (- (count key) (count "current"))))
+         active-database-backup-roots)
         stale-resumable-pointer-keys
         (->> resumable-roots
              (remove (set active-resumable-roots))
@@ -2498,7 +2554,9 @@
               (list-r2-blocks! bucket (str (prefix e) "blocks/"))
               (list-r2-blocks! bucket (str (prefix e) "objects/"))
               (list-r2-blocks!
-               bucket (str (prefix e) "scheduler/database-restore/"))])
+               bucket (str (prefix e) "scheduler/database-restore/"))
+              (list-r2-blocks!
+               bucket (str (prefix e) "scheduler/database-backup/"))])
         (.then
          (fn [result]
            (let [reachable (aget result 0)
@@ -2528,6 +2586,17 @@
                                           active-database-restore-prefixes)
                                 uploaded
                                 (< (.getTime uploaded) cutoff)))))
+                      (mapv #(gobj/get % "key")))
+                 database-backup-work-candidates
+                 (->> (aget result 4)
+                      (filter
+                       (fn [object]
+                         (let [key (gobj/get object "key")
+                               uploaded (gobj/get object "uploaded")]
+                           (and (not-any? #(str/starts-with? key %)
+                                          active-database-backup-prefixes)
+                                uploaded
+                                (< (.getTime uploaded) cutoff)))))
                       (mapv #(gobj/get % "key")))]
              {:reachable (count reachable)
               :heads (count heads)
@@ -2541,6 +2610,11 @@
               (count stale-database-restore-pointer-keys)
               :stale-database-restore-verification-markers
               (count verification-marker-candidates)
+              :database-backup-roots (count database-backup-roots)
+              :active-database-backup-roots
+              (count active-database-backup-roots)
+              :stale-database-backup-work
+              (count database-backup-work-candidates)
               :ingress-roots (count ingress-roots)
               :active-ingress-roots (count active-ingress-roots)
               :stale-ingress-pointers (count stale-ingress-pointer-keys)
@@ -2553,6 +2627,7 @@
                                            stale-resumable-pointer-keys
                                            stale-database-restore-pointer-keys
                                            verification-marker-candidates
+                                           database-backup-work-candidates
                                            stale-ingress-pointer-keys)
                                    distinct sort vec)
               :block-candidates (count block-candidates)
@@ -2561,12 +2636,14 @@
                                      (count
                                       stale-database-restore-pointer-keys)
                                      (count verification-marker-candidates)
+                                     (count database-backup-work-candidates)
                                      (count stale-ingress-pointer-keys))
               :candidates (+ (count data-candidates)
                              (count stale-resumable-pointer-keys)
                              (count
                               stale-database-restore-pointer-keys)
                              (count verification-marker-candidates)
+                             (count database-backup-work-candidates)
                              (count stale-ingress-pointer-keys))})))
         (.catch (fn [error]
                   (js/Promise.reject
@@ -2586,6 +2663,7 @@
          (str (prefix e) "objects/")
          (str (prefix e) "scheduler/resumable/")
          (str (prefix e) "scheduler/database-restore/")
+         (str (prefix e) "scheduler/database-backup/")
          (str (prefix e) "scheduler/ingress/")]))
 
 (defn- verify-gc-entry-bytes! [e key expected-cid bytes]
