@@ -6,7 +6,7 @@
 
 (defrecord Database
   [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
-   tx-functions])
+   tx-functions listeners])
 
 (defrecord Db
   [connection basis-cid mode since-t value])
@@ -27,7 +27,7 @@
     (throw (ex-info "Every transaction function must be callable"
                     {:type :kotobase.datomic/invalid-tx-functions})))
   (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
-              max-retries tx-functions))
+              max-retries tx-functions (atom {})))
 
 (defn head [database]
   (if (instance? Db database)
@@ -56,6 +56,30 @@
 (defn tx-function [database ident]
   (let [functions (:tx-functions (connection database))]
     (or (get functions ident) (get functions (str ident)))))
+
+(defn listen!
+  "Register an in-process transaction-report listener on CONNECTION."
+  [database listener]
+  (when-not (ifn? listener)
+    (throw (ex-info "Listener must be callable"
+                    {:type :kotobase.datomic/invalid-listener})))
+  (let [database (connection database)
+        id (.randomUUID js/crypto)]
+    (swap! (:listeners database) assoc id listener)
+    id))
+
+(defn unlisten! [database listener-id]
+  (let [database (connection database)
+        present? (contains? @(:listeners database) listener-id)]
+    (swap! (:listeners database) dissoc listener-id)
+    present?))
+
+(defn notify-listeners! [database tx-report]
+  (doseq [[_ listener] @(:listeners (connection database))]
+    (try
+      (listener tx-report)
+      (catch :default _ nil)))
+  tx-report)
 
 (defn- block-miss [cid]
   (doto (js/Error. "kotobase engine block miss")
@@ -192,6 +216,18 @@
            nil
            (at-basis (:connection snapshot)
                      #(some-> (peer/head % basis-cid) :seq)))))))
+
+(defn tx-range
+  ([database] (tx-range database nil nil))
+  ([database start end]
+   (-> (resolve-db database)
+       (.then
+        (fn [{:keys [basis-cid] :as snapshot}]
+          (let [database (:connection snapshot)]
+            (at-basis
+             database
+             #(peer/tx-range % basis-cid start end
+                             (:decrypt-fn database)))))))))
 
 (defn- db-value [database]
   (-> (resolve-db database)

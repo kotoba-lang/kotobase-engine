@@ -8,7 +8,7 @@
 
 (defrecord Database
   [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
-   tx-functions])
+   tx-functions listeners])
 
 (defrecord Db
   [connection basis-cid mode since-t value])
@@ -29,7 +29,7 @@
     (throw (ex-info "Every transaction function must be callable"
                     {:type :kotobase.datomic/invalid-tx-functions})))
   (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
-              max-retries tx-functions))
+              max-retries tx-functions (atom {})))
 
 (defn head [^Database database]
   (if (instance? Db database)
@@ -52,6 +52,30 @@
 (defn tx-function [database ident]
   (let [functions (:tx-functions (connection database))]
     (or (get functions ident) (get functions (str ident)))))
+
+(defn listen!
+  "Register an in-process transaction-report listener on CONNECTION."
+  [database listener]
+  (when-not (ifn? listener)
+    (throw (ex-info "Listener must be callable"
+                    {:type :kotobase.datomic/invalid-listener})))
+  (let [database (connection database)
+        id (str (java.util.UUID/randomUUID))]
+    (swap! (:listeners database) assoc id listener)
+    id))
+
+(defn unlisten! [database listener-id]
+  (let [database (connection database)
+        present? (contains? @(:listeners database) listener-id)]
+    (swap! (:listeners database) dissoc listener-id)
+    present?))
+
+(defn notify-listeners! [database tx-report]
+  (doseq [[_ listener] @(:listeners (connection database))]
+    (try
+      (listener tx-report)
+      (catch Throwable _ nil)))
+  tx-report)
 
 (defn as-of
   "Return an immutable database value at-or-before commit sequence T."
@@ -81,6 +105,14 @@
     (when basis-cid
       (let [{:keys [get-fn]} (storage/ports (:storage (connection database)))]
         (:seq (peer/head get-fn basis-cid))))))
+
+(defn tx-range
+  ([database] (tx-range database nil nil))
+  ([database start end]
+   (let [{:keys [basis-cid] :as snapshot} (ensure-db database)
+         database (connection snapshot)
+         {:keys [get-fn]} (storage/ports (:storage database))]
+     (peer/tx-range get-fn basis-cid start end (:decrypt-fn database)))))
 
 (defn transact!
   [^Database database tx-data]
