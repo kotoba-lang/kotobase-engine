@@ -69,4 +69,157 @@
                                         :components ["alice"]
                                         :limit 1}))))))
     (is (= #{":person/name"}
-           (set (keys (d/pull database [:person/name] "alice")))))))
+           (set (keys (d/pull database [:person/name] "alice")))))
+    (is (= 2 (count (d/pull-many database [:person/name]
+                                  ["alice" "bob"]))))
+    (is (= #{"Alice"}
+           (get (d/touch (d/entity database "alice")) ":person/name")))
+    (is (= 2 (count (d/seek-datoms database :aevt :person/name))))
+    (is (= #{"Alice" "Bob"}
+           (set (map (comp read-string :v_edn)
+                     (d/index-range database :person/name "A" "C")))))))
+
+(deftest datomic-identity-tempid-lookup-ref-and-transaction-functions
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)
+                   :tx-functions
+                   {:user/set-name
+                    (d/function
+                     {:impl
+                      (fn [_database lookup-ref name]
+                        [[:db/add lookup-ref :user/name name]])})}})
+        schema
+        [{:db/id :user/email
+          :db/ident :user/email
+          :db/valueType :db.type/string
+          :db/cardinality :db.cardinality/one
+          :db/unique :db.unique/identity}
+         {:db/id :user/name
+          :db/ident :user/name
+          :db/valueType :db.type/string
+          :db/cardinality :db.cardinality/one}
+         {:db/id :user/manager
+          :db/ident :user/manager
+          :db/valueType :db.type/ref
+          :db/cardinality :db.cardinality/one}]
+        _ (d/transact database {:tx-data schema})
+        alice-tempid (d/tempid :db.part/user)
+        alice-report
+        (d/transact database
+                    {:tx-data [{:db/id alice-tempid
+                                :user/email "alice@example.test"
+                                :user/name "Alice"}]})
+        alice (d/resolve-tempid alice-report alice-tempid)
+        bob-tempid (d/tempid :db.part/user)
+        bob-report
+        (d/transact database
+                    {:tx-data [{:db/id bob-tempid
+                                :user/email "bob@example.test"
+                                :user/name "Bob"
+                                :user/manager
+                                [:user/email "alice@example.test"]}]})
+        bob (d/resolve-tempid bob-report bob-tempid)
+        upsert-tempid (d/tempid :db.part/user)
+        upsert-report
+        (d/transact database
+                    {:tx-data [{:db/id upsert-tempid
+                                :user/email "alice@example.test"
+                                :user/name "Alice Updated"}]})]
+    (is (string? alice))
+    (is (string? bob))
+    (is (= alice (d/resolve-tempid upsert-report upsert-tempid)))
+    (is (= "Alice Updated"
+           (d/q '[:find ?name .
+                  :where
+                  [?e :user/email "alice@example.test"]
+                  [?e :user/name ?name]]
+                database)))
+    (is (= alice
+           (d/q '[:find ?manager .
+                  :where
+                  [?e :user/email "bob@example.test"]
+                  [?e :user/manager ?manager]]
+                database)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (d/transact database
+                             {:tx-data [[:db/add
+                                         [:user/name "Bob"]
+                                         :user/name
+                                         "Not a lookup ref"]]})))
+    (d/transact database
+                {:tx-data [[:db.fn/cas
+                            [:user/email "alice@example.test"]
+                            :user/name "Alice Updated" "Alice CAS"]]})
+    (is (= "Alice CAS"
+           (d/q '[:find ?name .
+                  :where
+                  [?e :user/email "alice@example.test"]
+                  [?e :user/name ?name]]
+                database)))
+    (d/transact database
+                {:tx-data [[:user/set-name
+                            [:user/email "alice@example.test"]
+                            "Alice Function"]]})
+    (is (= "Alice Function"
+           (d/q '[:find ?name .
+                  :where
+                  [?e :user/email "alice@example.test"]
+                  [?e :user/name ?name]]
+                database)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (d/transact database
+                             {:tx-data [[:db.fn/cas alice :user/name
+                                         "wrong" "never"]]})))
+    (d/transact database
+                {:tx-data [[:db.fn/retractAttribute
+                            [:user/email "alice@example.test"]
+                            :user/name]]})
+    (is (nil? (d/q '[:find ?name .
+                     :where
+                     [?e :user/email "alice@example.test"]
+                     [?e :user/name ?name]]
+                   database)))))
+
+(deftest datomic-immutable-db-as-of-since-and-history
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        _ (d/transact database
+                      {:tx-data [[:db/add "e" :item/value "v1"]]})
+        at-v1 (d/db database)
+        t-v1 (d/basis-t at-v1)
+        _ (d/transact database
+                      {:tx-data [[:db/retract "e" :item/value "v1"]
+                                 [:db/add "e" :item/value "v2"]]})
+        current (d/db database)
+        historical (d/history current)
+        speculative (d/with current
+                            {:tx-data [[:db/add "e" :item/draft "draft"]]})]
+    (is (= "v1"
+           (d/q '[:find ?v . :where ["e" :item/value ?v]] at-v1)))
+    (is (= "v1"
+           (d/q '[:find ?v . :where ["e" :item/value ?v]]
+                (d/as-of current t-v1))))
+    (is (= "v2"
+           (d/q '[:find ?v . :where ["e" :item/value ?v]] current)))
+    (is (= "draft"
+           (d/q '[:find ?v . :where ["e" :item/draft ?v]]
+                (:db-after speculative))))
+    (is (nil?
+         (d/q '[:find ?v . :where ["e" :item/draft ?v]] current)))
+    (is (= #{["v2"]}
+           (d/q '[:find ?v :where ["e" :item/value ?v]]
+                (d/since current t-v1))))
+    (is (= [true false true]
+           (mapv :added
+                 (filter #(= ":item/value" (:a %))
+                         (d/datoms historical
+                                   {:index :eavt
+                                    :components ["e"]})))))))
