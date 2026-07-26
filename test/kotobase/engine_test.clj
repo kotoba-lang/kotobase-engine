@@ -223,3 +223,70 @@
                          (d/datoms historical
                                    {:index :eavt
                                     :components ["e"]})))))))
+
+(deftest datomic-tuples-persisted-functions-listeners-and-tx-range
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        reports (atom [])
+        listener-id (d/listen database #(swap! reports conj %))]
+    (d/transact
+     database
+     {:tx-data
+      [{:db/id :account/tenant
+        :db/ident :account/tenant
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :account/external-id
+        :db/ident :account/external-id
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :account/tenant+external
+        :db/ident :account/tenant+external
+        :db/valueType :db.type/tuple
+        :db/tupleAttrs [:account/tenant :account/external-id]
+        :db/cardinality :db.cardinality/one
+        :db/unique :db.unique/identity}
+       {:db/id :account/status
+        :db/ident :account/status
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :fn/set-status
+        :db/ident :fn/set-status
+        :db/fn {:lang "kotobase/tx-ir-v1"
+                :params '[db entity status]
+                :code '[[:db/add entity :account/status status]]}}]})
+    (let [first-id (d/tempid :db.part/user)
+          first-report
+          (d/transact database
+                      {:tx-data [{:db/id first-id
+                                  :account/tenant "tenant-1"
+                                  :account/external-id "external-1"
+                                  :account/status "new"}]})
+          account-id (d/resolve-tempid first-report first-id)
+          upsert-id (d/tempid :db.part/user)
+          upsert-report
+          (d/transact database
+                      {:tx-data [{:db/id upsert-id
+                                  :account/tenant "tenant-1"
+                                  :account/external-id "external-1"}]})]
+      (is (= account-id (d/resolve-tempid upsert-report upsert-id)))
+      (d/transact
+       database
+       {:tx-data [[:fn/set-status
+                   [:account/tenant+external
+                    ["tenant-1" "external-1"]]
+                   "active"]]})
+      (is (= "active"
+             (d/q '[:find ?status .
+                    :where [?e :account/status ?status]]
+                  database)))
+      (is (= 4 (count @reports)))
+      (is (= 4 (count (d/tx-range database 0 nil))))
+      (is (true? (d/unlisten database listener-id)))
+      (d/transact database
+                  {:tx-data [[:db/add account-id :account/status "inactive"]]})
+      (is (= 4 (count @reports))))))
