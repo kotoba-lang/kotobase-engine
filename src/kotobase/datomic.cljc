@@ -944,25 +944,38 @@
                   (.then #(finish snapshot %)))))))))
 
 (defn transact-prepared
-  "Persist a transaction returned by `prepare-transaction`."
+  "Persist a transaction returned by `prepare-transaction`. `:novelty-size`
+  in the report is `kotobase-peer.core/novelty-size` on the post-commit
+  chain -- the same signal `kotobase-server`'s `do-transact` (the novelty-
+  append XRPC path) reports as `novelty_size`, computed here off the SAME
+  shared primitive so both paths agree on when a fold is worth invoking.
+  O(1), no extra round trip (the chain was just produced by this commit)."
   [connection {:keys [request requested-tx-data tempids]}]
   (let [tx-data (if (map? request) (:tx-data request) request)
         before (engine/head connection)
-        report (fn [before after]
+        report (fn [before after novelty-size]
                  {:db-before before
                   :db-after after
                   :tx-data requested-tx-data
-                  :tempids tempids})]
+                  :tempids tempids
+                  :novelty-size novelty-size})]
     #?(:clj
-       (let [after (engine/transact! connection tx-data)]
-         (engine/notify-listeners! connection (report before after)))
+       (let [after (engine/transact! connection tx-data)
+             novelty-size (engine/novelty-size connection after)]
+         (engine/notify-listeners! connection (report before after novelty-size)))
        :cljs
        (-> before
            (.then
             (fn [before-cid]
               (-> (engine/transact! connection tx-data)
-                  (.then #(engine/notify-listeners!
-                           connection (report before-cid %))))))))))
+                  (.then
+                   (fn [after-cid]
+                     (-> (engine/novelty-size connection after-cid)
+                         (.then
+                          (fn [novelty-size]
+                            (engine/notify-listeners!
+                             connection
+                             (report before-cid after-cid novelty-size))))))))))))))
 
 (defn transact
   "Accept Datomic Client's `{:tx-data [...]}` shape or a raw tx-data seq.
