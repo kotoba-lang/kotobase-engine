@@ -4,7 +4,10 @@
   This namespace deliberately uses Datomic's argument order:
   `(q query db & inputs)`, `(pull db selector eid)`, and
   `(datoms db opts)`. `kotobase.core` remains the smaller native facade."
-  (:require [kotobase.engine :as engine]))
+  (:require #?(:clj [clojure.edn :as edn]
+               :cljs [cljs.reader :as edn])
+            [clojure.string :as str]
+            [kotobase.engine :as engine]))
 
 (def ^:private query-sections
   #{:find :with :in :where :keys :strs :syms :rules})
@@ -131,6 +134,20 @@
   [database selector eid]
   (engine/pull database (wire-value eid) (wire-value selector)))
 
+(defn pull-many [database selector eids]
+  (engine/pull-many database (wire-value selector) (mapv wire-value eids)))
+
+(defn entity [database eid]
+  (engine/entity database (wire-value eid)))
+
+(defn touch [entity] entity)
+
+(defn entid [database id]
+  (engine/entid database (wire-value id)))
+
+(defn ident [database id]
+  (engine/ident database (wire-value id)))
+
 (defn datoms
   "Datomic-compatible shape: `(datoms db {:index :eavt ...})`."
   ([database] (engine/datoms database))
@@ -140,15 +157,301 @@
     (cond-> options
       (:components options) (update :components #(mapv wire-value %))))))
 
+(defn seek-datoms
+  "Datomic-shaped index seek. Kotobase's ordered index prefix is the seek key."
+  [database index & components]
+  (datoms database {:index index :components (vec components)}))
+
+(defn index-range
+  "Return AVET datoms for ATTRIBUTE whose decoded values fall in [START, END)."
+  [database attribute start end]
+  (let [finish
+        (fn [rows]
+          (->> rows
+               (filter
+                (fn [{:keys [v_edn]}]
+                  (let [value (edn/read-string v_edn)]
+                    (and (or (nil? start) (not (neg? (compare value start))))
+                         (or (nil? end) (neg? (compare value end)))))))
+               vec))
+        rows (datoms database {:index :avet
+                               :components [attribute]})]
+    #?(:clj (finish rows)
+       :cljs (.then rows finish))))
+
 (defn db
-  "Return the readable database handle. Kotobase handles resolve their head
-  at operation time; unlike Datomic Peer this is not an immutable basis value."
+  "Return an immutable database value pinned to the connection's current CID."
   [connection]
-  connection)
+  (engine/db connection))
+
+(defn as-of [database t] (engine/as-of database t))
+(defn since [database t] (engine/since database t))
+(defn history [database] (engine/history database))
+(defn basis-t [database] (engine/basis-t database))
+(defn basis-cid [database] (engine/basis-cid database))
+
+(defn next-t [database]
+  (let [value (basis-t database)
+        advance #(if (nil? %) 0 (inc %))]
+    #?(:clj (advance value)
+       :cljs (.then value advance))))
+
+(defn db-stats [database]
+  (let [rows (datoms database)
+        finish (fn [rows] {:datoms (count rows)})]
+    #?(:clj (finish rows)
+       :cljs (.then rows finish))))
+
+(defonce ^:private next-tempid (atom -1000000))
+
+(defn tempid
+  "Return a Datomic-shaped negative temporary id.
+
+  PARTITION is accepted for syntax compatibility; Kotobase allocates
+  content-independent entity ids and does not physically partition them."
+  ([partition] (swap! next-tempid dec))
+  ([partition id] id))
+
+(defn resolve-tempid [tx-report tempid]
+  (get (:tempids tx-report) tempid tempid))
+
+(defn function
+  "Create a trusted host transaction function.
+
+  A callable may be supplied directly, or as `{:impl callable}` alongside
+  Datomic-style documentation keys. Persisted arbitrary source is deliberately
+  not evaluated inside storage Workers."
+  [spec]
+  (let [implementation (if (map? spec) (:impl spec) spec)]
+    (when-not (ifn? implementation)
+      (throw
+       (ex-info "Transaction function requires a callable :impl"
+                {:type :kotobase.datomic/invalid-transaction-function})))
+    implementation))
+
+(defn invoke [database function-ident & args]
+  (if-let [tx-function (engine/tx-function database function-ident)]
+    (apply tx-function database args)
+    (throw
+     (ex-info "Transaction function is not registered"
+              {:type :kotobase.datomic/unknown-transaction-function
+               :function function-ident}))))
 
 (defn- reverse-attribute [attribute]
   (when (and (keyword? attribute) (.startsWith (name attribute) "_"))
     (keyword (namespace attribute) (subs (name attribute) 1))))
+
+(defn- lookup-ref? [value]
+  (and (vector? value)
+       (= 2 (count value))
+       (or (keyword? (first value)) (string? (first value)))))
+
+(defn- temporary-id? [value]
+  (and (integer? value) (neg? value)))
+
+(defn advanced-transaction?
+  "True when TX needs a basis read for tempids, lookup refs, identity upsert,
+  or transaction-function expansion. Storage adapters may retain a zero-read
+  fast path when this returns false."
+  [tx]
+  (let [tx-data (if (map? tx) (:tx-data tx) tx)
+        advanced-value?
+        (fn advanced-value? [value]
+          (or (temporary-id? value)
+              (lookup-ref? value)
+              (and (coll? value)
+                   (some advanced-value? value))))]
+    (boolean
+     (some
+      (fn [item]
+        (cond
+          (map? item)
+          (or (not (contains? item :db/id))
+              (advanced-value? (:db/id item))
+              (some advanced-value? (vals (dissoc item :db/id))))
+
+          (vector? item)
+          (or (and (keyword? (first item))
+                   (not (contains? #{:db/add :db/retract
+                                     :db/retractEntity}
+                                   (first item))))
+              (some advanced-value? (rest item)))
+
+          :else false))
+      tx-data))))
+
+(defn- fresh-entity-id []
+  (str "kotobase.tempid/"
+       #?(:clj (java.util.UUID/randomUUID)
+          :cljs (.randomUUID js/crypto))))
+
+(defn- stored-value [value]
+  (let [value (wire-value value)]
+    (if (string? value) value (str value))))
+
+(defn- row-value [{:keys [v_edn]}]
+  (edn/read-string v_edn))
+
+(defn- rows-index [rows]
+  {:lookup
+   (reduce
+    (fn [result {:keys [e a] :as row}]
+      (update result [a (row-value row)] (fnil conj #{}) e))
+    {}
+    rows)
+   :pairs
+   (reduce
+    (fn [result {:keys [e a] :as row}]
+      (update result [e a] (fnil conj #{}) (row-value row)))
+    {}
+    rows)})
+
+(defn- schema-from-rows [rows]
+  (let [entities
+        (reduce
+         (fn [result {:keys [e a] :as row}]
+           (assoc-in result [e a] (row-value row)))
+         {}
+         rows)]
+    (into {}
+          (keep
+           (fn [[entity attributes]]
+             (when-let [ident (get attributes ":db/ident")]
+               [ident
+                {:entity entity
+                 :value-type (get attributes ":db/valueType")
+                 :cardinality (get attributes ":db/cardinality")
+                 :unique (get attributes ":db/unique")}]))
+           entities))))
+
+(defn- inline-schema [tx-data]
+  (into {}
+        (keep
+         (fn [item]
+           (when (and (map? item) (:db/ident item))
+             [(str (wire-value (:db/ident item)))
+              {:entity (str (:db/id item))
+               :value-type (some-> (:db/valueType item) wire-value str)
+               :cardinality (some-> (:db/cardinality item) wire-value str)
+               :unique (some-> (:db/unique item) wire-value str)}])))
+        tx-data))
+
+(defn- validate-value-type! [definition attribute value]
+  (when-let [value-type (:value-type definition)]
+    (let [valid?
+          (case value-type
+            ":db.type/string" (string? value)
+            ":db.type/boolean" (boolean? value)
+            ":db.type/long" (integer? value)
+            ":db.type/double" (number? value)
+            ":db.type/keyword" (keyword? value)
+            ":db.type/ref" (or (string? value) (keyword? value)
+                               (and (integer? value) (not (neg? value)))
+                               (lookup-ref? value))
+            ":db.type/instant" (inst? value)
+            ":db.type/uuid" (uuid? value)
+            ":db.type/symbol" (symbol? value)
+            true)]
+      (when-not valid?
+        (throw
+         (ex-info "Value violates Datomic :db/valueType"
+                  {:type :kotobase.datomic/value-type
+                   :attribute attribute :value value
+                   :value-type value-type}))))))
+
+(defn- single-owner [lookup attribute value]
+  (let [owners (get lookup [(str (wire-value attribute))
+                            (stored-value value)] #{})]
+    (when (> (count owners) 1)
+      (throw
+       (ex-info "Unique lookup ref resolves to multiple entities"
+                {:type :kotobase.datomic/corrupt-unique-index
+                 :attribute attribute :value value :entities owners})))
+    (first owners)))
+
+(defn- resolve-lookup [schema lookup value]
+  (if-not (lookup-ref? value)
+    value
+    (let [[attribute lookup-value] value
+          definition (get schema (str (wire-value attribute)))]
+      (when-not (:unique definition)
+        (throw
+         (ex-info "Lookup refs require a :db/unique attribute"
+                  {:type :kotobase.datomic/non-unique-lookup-ref
+                   :lookup-ref value})))
+      (or (single-owner lookup attribute lookup-value)
+          (throw
+           (ex-info "Lookup ref does not resolve"
+                    {:type :kotobase.datomic/lookup-ref-not-found
+                     :lookup-ref value}))))))
+
+(defn- assign-map-ids [tx-data schema lookup]
+  (let [identity-attributes
+        (into #{}
+              (keep (fn [[attribute definition]]
+                      (when (= ":db.unique/identity" (:unique definition))
+                        attribute)))
+              schema)
+        tempids (atom {})]
+    (letfn [(bind-temp! [id owner]
+              (let [resolved (or owner (get @tempids id) (fresh-entity-id))]
+                (when-let [prior (get @tempids id)]
+                  (when-not (= prior resolved)
+                    (throw
+                     (ex-info "Tempid resolves to conflicting identities"
+                              {:type :kotobase.datomic/conflicting-upsert
+                               :tempid id :left prior :right resolved}))))
+                (swap! tempids assoc id resolved)
+                resolved))
+            (identity-owner [entity]
+              (let [owners
+                    (into
+                     #{}
+                     (keep
+                      (fn [[attribute value]]
+                        (when (contains? identity-attributes
+                                         (str (wire-value attribute)))
+                          (single-owner lookup attribute value))))
+                     (dissoc entity :db/id))]
+                (when (> (count owners) 1)
+                  (throw
+                   (ex-info "Identity attributes resolve to different entities"
+                            {:type :kotobase.datomic/conflicting-upsert
+                             :entity entity :owners owners})))
+                (first owners)))]
+      {:tx-data
+       (mapv
+        (fn [item]
+          (if-not (map? item)
+            item
+            (let [id (if (contains? item :db/id)
+                       (:db/id item)
+                       (tempid :db.part/user))
+                  owner (identity-owner item)
+                  resolved
+                  (cond
+                    (lookup-ref? id)
+                    (let [lookup-owner (resolve-lookup schema lookup id)]
+                      (when (and owner (not= owner lookup-owner))
+                        (throw
+                         (ex-info "Lookup ref conflicts with identity upsert"
+                                  {:type :kotobase.datomic/conflicting-upsert
+                                   :lookup-ref id :identity-owner owner})))
+                      lookup-owner)
+
+                    (temporary-id? id) (bind-temp! id owner)
+
+                    :else
+                    (do
+                      (when (and owner (not= owner (str id)))
+                        (throw
+                         (ex-info "Explicit entity id conflicts with identity"
+                                  {:type :kotobase.datomic/conflicting-upsert
+                                   :entity id :identity-owner owner})))
+                      id))]
+              (assoc item :db/id resolved))))
+        tx-data)
+       :tempids @tempids})))
 
 (defn- entity-map-ops [entity]
   (let [entity-id (:db/id entity)]
@@ -160,7 +463,8 @@
     (mapcat
      (fn [[attribute value]]
        (when-not (= attribute :db/id)
-         (let [values (if (and (coll? value) (not (map? value)))
+         (let [values (if (and (coll? value) (not (map? value))
+                               (not (lookup-ref? value)))
                         value
                         [value])]
            (map
@@ -171,7 +475,7 @@
             values))))
      entity)))
 
-(defn- normalize-tx-data [tx-data]
+(defn- normalize-entity-maps [tx-data]
   (vec
    (mapcat
     (fn [item]
@@ -180,21 +484,249 @@
         [item]))
     tx-data)))
 
-(defn transact
-  "Accept Datomic Client's `{:tx-data [...]}` shape or a raw tx-data seq.
+(defn prepare-basic-transaction
+  "Normalize entity maps without reading a database basis.
 
-  Returns a Promise on ClojureScript and a value on the JVM. The report names
-  the immutable before/after head CIDs explicitly because Kotobase does not
-  manufacture Datomic numeric t/tx entity ids."
+  Storage adapters use this for transactions that `advanced-transaction?`
+  proves contain no tempid, lookup-ref, upsert, or transaction function."
+  [tx]
+  (let [requested (if (map? tx) (:tx-data tx) tx)
+        normalized (normalize-entity-maps requested)]
+    {:request (if (map? tx) (assoc tx :tx-data normalized) normalized)
+     :requested-tx-data requested
+     :tempids {}}))
+
+(def ^:private built-in-operations
+  #{:db/add :db/retract :db/retractEntity
+    :db.fn/cas :db.fn/retractAttribute :db.fn/retractEntity})
+
+(defn- expand-registered-functions [database snapshot tx-data]
+  (loop [remaining (seq tx-data), expanded [], expansions 0]
+    (when (> expansions 1024)
+      (throw
+       (ex-info "Transaction function expansion limit exceeded"
+                {:type :kotobase.datomic/tx-function-expansion-limit})))
+    (if-let [item (first remaining)]
+      (let [function-ident (when (and (vector? item)
+                                      (keyword? (first item))
+                                      (not (contains? built-in-operations
+                                                      (first item))))
+                             (first item))
+            tx-function (when function-ident
+                          (engine/tx-function database function-ident))]
+        (if tx-function
+          (let [produced (apply tx-function snapshot (rest item))]
+            (when-not (or (nil? produced) (sequential? produced))
+              (throw
+               (ex-info "Transaction function must return transaction data"
+                        {:type :kotobase.datomic/invalid-tx-function-result
+                         :function function-ident :result produced})))
+            (recur (concat produced (rest remaining))
+                   expanded (inc expansions)))
+          (recur (next remaining) (conj expanded item) expansions)))
+      expanded)))
+
+(defn- resolve-operation
+  [operation schema lookup tempids]
+  (letfn [(resolve-id [value]
+            (cond
+              (lookup-ref? value) (resolve-lookup schema lookup value)
+              (temporary-id? value)
+              (or (get @tempids value)
+                  (let [resolved (fresh-entity-id)]
+                    (swap! tempids assoc value resolved)
+                    resolved))
+              :else value))
+          (resolve-value [attribute value]
+            (if (= ":db.type/ref"
+                   (:value-type (get schema (str (wire-value attribute)))))
+              (resolve-id value)
+              value))]
+    (cond
+      (and (vector? operation)
+           (contains? #{:db/add :db/retract} (first operation))
+           (= 4 (count operation)))
+      (let [[op entity attribute value] operation]
+        [op (resolve-id entity) attribute
+         (resolve-value attribute value)])
+
+      (and (vector? operation)
+           (= :db/retractEntity (first operation))
+           (= 2 (count operation)))
+      [:db/retractEntity (resolve-id (second operation))]
+
+      (and (vector? operation)
+           (contains? #{:db.fn/cas :db.fn/retractAttribute
+                        :db.fn/retractEntity}
+                      (first operation)))
+      (assoc operation 1 (resolve-id (second operation)))
+
+      :else operation)))
+
+(defn- expand-builtins [operations pair-values schema lookup]
+  (:tx-data
+   (reduce
+    (fn [{:keys [tx-data pairs unique-values]} operation]
+      (let [[op entity attribute old-value new-value] operation
+            attribute-wire (some-> attribute wire-value str)
+            pair [(str entity) attribute-wire]
+            definition (get schema attribute-wire)]
+        (case op
+          :db.fn/cas
+          (let [current (get pairs pair #{})
+                expected (stored-value old-value)]
+            (when-not (= current #{expected})
+              (throw
+               (ex-info "Compare-and-swap failed"
+                        {:type :kotobase.datomic/cas-failed
+                         :entity entity :attribute attribute
+                         :expected old-value :actual current})))
+            {:tx-data (into tx-data
+                            [[:db/retract entity attribute expected]
+                             [:db/add entity attribute new-value]])
+             :pairs (assoc pairs pair #{(stored-value new-value)})
+             :unique-values unique-values})
+
+          :db.fn/retractAttribute
+          (let [current (get pairs pair #{})]
+            {:tx-data
+             (into tx-data
+                   (map (fn [value]
+                          [:db/retract entity attribute value]))
+                   current)
+             :pairs (dissoc pairs pair)
+             :unique-values
+             (into {}
+                   (remove
+                    (fn [[[candidate-attribute _] owner]]
+                      (and (= candidate-attribute attribute-wire)
+                           (= owner (str entity)))))
+                   unique-values)})
+
+          :db.fn/retractEntity
+          {:tx-data (conj tx-data [:db/retractEntity entity])
+           :pairs (into {}
+                        (remove (fn [[[candidate _] _]]
+                                  (= candidate (str entity))))
+                        pairs)
+           :unique-values
+           (into {}
+                 (remove (fn [[_ owner]] (= owner (str entity))))
+                 unique-values)}
+
+          :db/add
+          (let [value-wire (stored-value old-value)
+                one? (= ":db.cardinality/one" (:cardinality definition))
+                prior (if one? (get pairs pair #{}) #{})
+                replacements (remove #{value-wire} prior)
+                already? (contains? (get pairs pair #{}) value-wire)
+                owner (when (:unique definition)
+                        (get unique-values [attribute-wire value-wire]))]
+            (validate-value-type! definition attribute old-value)
+            (when (and owner (not= owner (str entity)))
+              (throw
+               (ex-info "Value violates Datomic :db/unique"
+                        {:type :kotobase.datomic/unique-conflict
+                         :entity entity :attribute attribute
+                         :value old-value :owner owner})))
+            {:tx-data
+             (cond-> (into tx-data
+                           (map (fn [value]
+                                  [:db/retract entity attribute value]))
+                           replacements)
+               (not already?) (conj operation))
+             :pairs
+             (assoc pairs pair
+                    (if one?
+                      #{value-wire}
+                      (conj (get pairs pair #{}) value-wire)))
+             :unique-values
+             (cond-> unique-values
+               (:unique definition)
+               (assoc [attribute-wire value-wire] (str entity)))})
+
+          :db/retract
+          {:tx-data (conj tx-data operation)
+           :pairs (update pairs pair disj (stored-value old-value))
+           :unique-values
+           (if (= (str entity)
+                  (get unique-values
+                       [attribute-wire (stored-value old-value)]))
+             (dissoc unique-values
+                     [attribute-wire (stored-value old-value)])
+             unique-values)}
+
+          :db/retractEntity
+          {:tx-data (conj tx-data operation)
+           :pairs (into {}
+                        (remove (fn [[[candidate _] _]]
+                                  (= candidate (str entity))))
+                        pairs)
+           :unique-values
+           (into {}
+                 (remove (fn [[_ owner]] (= owner (str entity))))
+                 unique-values)}
+
+          (throw
+           (ex-info "Unsupported transaction function or operation"
+                    {:type :kotobase.datomic/unsupported-transaction-item
+                     :item operation})))))
+    {:tx-data []
+     :pairs pair-values
+     :unique-values
+     (into {}
+           (for [[attribute definition] schema
+                 :when (:unique definition)
+                 [[candidate-attribute value] owners] lookup
+                 :when (and (= attribute candidate-attribute)
+                            (= 1 (count owners)))]
+             [[attribute value] (first owners)]))}
+    operations)))
+
+(defn prepare-transaction
+  "Resolve tempids, lookup refs, identity upserts and built-in transaction
+  functions against one immutable database basis."
   [connection tx]
-  (let [requested-tx-data (if (map? tx) (:tx-data tx) tx)
-        tx-data (normalize-tx-data requested-tx-data)
+  (let [requested (if (map? tx) (:tx-data tx) tx)
+        finish
+        (fn [snapshot rows]
+          (let [expanded-requested
+                (expand-registered-functions
+                 connection snapshot requested)
+                {:keys [lookup pairs]} (rows-index rows)
+                schema (merge (schema-from-rows rows)
+                              (inline-schema expanded-requested))
+                {assigned :tx-data initial-tempids :tempids}
+                (assign-map-ids expanded-requested schema lookup)
+                tempids (atom initial-tempids)
+                operations
+                (mapv #(resolve-operation % schema lookup tempids)
+                      (normalize-entity-maps assigned))
+                normalized (expand-builtins operations pairs schema lookup)]
+            {:request (if (map? tx)
+                        (assoc tx :tx-data normalized)
+                        normalized)
+             :requested-tx-data requested
+             :tempids @tempids}))
+        snapshot (db connection)]
+    #?(:clj (finish snapshot (engine/datoms snapshot))
+       :cljs
+       (-> snapshot
+           (.then
+            (fn [snapshot]
+              (-> (engine/datoms snapshot)
+                  (.then #(finish snapshot %)))))))))
+
+(defn transact-prepared
+  "Persist a transaction returned by `prepare-transaction`."
+  [connection {:keys [request requested-tx-data tempids]}]
+  (let [tx-data (if (map? request) (:tx-data request) request)
         before (engine/head connection)
         report (fn [before after]
                  {:db-before before
                   :db-after after
                   :tx-data requested-tx-data
-                  :tempids {}})]
+                  :tempids tempids})]
     #?(:clj
        (let [after (engine/transact! connection tx-data)]
          (report before after))
@@ -204,3 +736,39 @@
             (fn [before-cid]
               (-> (engine/transact! connection tx-data)
                   (.then #(report before-cid %)))))))))
+
+(defn transact
+  "Accept Datomic Client's `{:tx-data [...]}` shape or a raw tx-data seq.
+
+  Resolves lookup refs, `:db.unique/identity` upserts, negative tempids and
+  Datomic's built-in transaction functions before publishing the immutable
+  transaction."
+  [connection tx]
+  #?(:clj
+     (transact-prepared connection (prepare-transaction connection tx))
+     :cljs
+     (-> (prepare-transaction connection tx)
+         (.then #(transact-prepared connection %)))))
+
+(defn with
+  "Speculatively apply TX to DATABASE and return a Datomic-shaped tx-report
+  without writing blocks or advancing the mutable ref."
+  [database tx]
+  (let [finish
+        (fn [{:keys [request requested-tx-data tempids]}]
+          (let [tx-data (if (map? request) (:tx-data request) request)
+                report (engine/with database tx-data)
+                decorate #(assoc % :tx-data requested-tx-data
+                                 :tempids tempids)]
+            #?(:clj (decorate report)
+               :cljs (.then report decorate))))
+        prepared (prepare-transaction database tx)]
+    #?(:clj (finish prepared)
+       :cljs (.then prepared finish))))
+
+(defn with-db [database tx]
+  (let [report (with database tx)]
+    #?(:clj (:db-after report)
+       :cljs (.then report :db-after))))
+
+(def transact-async transact)

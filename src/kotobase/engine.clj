@@ -7,11 +7,16 @@
             [kotobase.storage.core :as storage]))
 
 (defrecord Database
-  [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries])
+  [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
+   tx-functions])
+
+(defrecord Db
+  [connection basis-cid mode since-t value])
 
 (defn open
-  [{:keys [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries]
-    :or {ref-name "main" max-retries 16}}]
+  [{:keys [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
+           tx-functions]
+    :or {ref-name "main" max-retries 16 tx-functions {}}}]
   (storage/validate-backend! storage)
   (doseq [[control value]
           [[:encrypt-fn encrypt-fn] [:decrypt-fn decrypt-fn]
@@ -20,36 +25,145 @@
       (throw (ex-info "Kotobase engine requires an explicit security control"
                       {:type :kotobase.engine/missing-control
                        :control control}))))
+  (when-not (every? ifn? (vals tx-functions))
+    (throw (ex-info "Every transaction function must be callable"
+                    {:type :kotobase.datomic/invalid-tx-functions})))
   (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
-              max-retries))
+              max-retries tx-functions))
 
 (defn head [^Database database]
-  (some-> (storage/-read-ref (:storage database) (:ref-name database)) :cid))
+  (if (instance? Db database)
+    (:basis-cid database)
+    (some-> (storage/-read-ref (:storage database) (:ref-name database)) :cid)))
+
+(defn db
+  "Return an immutable database value pinned to the connection's current CID."
+  [connection]
+  (if (instance? Db connection)
+    connection
+    (->Db connection (head connection) :current nil nil)))
+
+(defn- ensure-db [database]
+  (if (instance? Db database) database (db database)))
+
+(defn- connection [database]
+  (if (instance? Db database) (:connection database) database))
+
+(defn tx-function [database ident]
+  (let [functions (:tx-functions (connection database))]
+    (or (get functions ident) (get functions (str ident)))))
+
+(defn as-of
+  "Return an immutable database value at-or-before commit sequence T."
+  [database t]
+  (let [{:keys [basis-cid] :as database} (ensure-db database)
+        {:keys [get-fn]} (storage/ports (:storage (connection database)))]
+    (assoc database
+           :basis-cid (peer/as-of get-fn basis-cid t)
+           :mode :current
+           :since-t nil)))
+
+(defn since
+  "Return a database value containing changes strictly after commit sequence T."
+  [database t]
+  (assoc (ensure-db database) :mode :since :since-t t))
+
+(defn history
+  "Return a database value whose datoms expose the complete assertion/retraction log."
+  [database]
+  (assoc (ensure-db database) :mode :history :since-t nil))
+
+(defn basis-cid [database]
+  (:basis-cid (ensure-db database)))
+
+(defn basis-t [database]
+  (let [{:keys [basis-cid] :as database} (ensure-db database)]
+    (when basis-cid
+      (let [{:keys [get-fn]} (storage/ports (:storage (connection database)))]
+        (:seq (peer/head get-fn basis-cid))))))
 
 (defn transact!
   [^Database database tx-data]
+  (when (instance? Db database)
+    (throw (ex-info "Cannot transact against an immutable database value"
+                    {:type :kotobase.datomic/immutable-db})))
   (let [{:keys [put! get-fn cas!]} (storage/ports (:storage database))]
     (peer/commit-serialized!
      put! get-fn cas! (:ref-name database) (head database) tx-data
      (:encrypt-fn database) (:max-retries database))))
 
-(defn- db-value [^Database database]
-  (let [{:keys [get-fn]} (storage/ports (:storage database))]
-    (peer/hydrate-chain get-fn (head database)
-                        (:blind-fn database) (:decrypt-fn database))))
+(defn- db-value [database]
+  (let [{:keys [basis-cid mode since-t] :as snapshot} (ensure-db database)
+        database (connection snapshot)
+        {:keys [get-fn]} (storage/ports (:storage database))]
+    (or (:value snapshot)
+        (case mode
+          :since (peer/since get-fn basis-cid since-t (:decrypt-fn database))
+          :history (peer/history get-fn basis-cid
+                                 (:blind-fn database) (:decrypt-fn database))
+          (peer/hydrate-chain get-fn basis-cid
+                              (:blind-fn database) (:decrypt-fn database))))))
+
+(defn with
+  "Speculatively apply normalized TX-DATA to an immutable database value."
+  [database tx-data]
+  (let [before (ensure-db database)
+        after-value (peer/transact (db-value before) tx-data)]
+    {:db-before before
+     :db-after (assoc before :value after-value)
+     :tx-data tx-data}))
+
+(defn- history-row-matches? [options {:keys [e a v_edn]}]
+  (let [value (read-string v_edn)
+        key (case (or (:index options) :eavt)
+              :eavt [e a value]
+              :aevt [a e value]
+              :avet [a value e]
+              :vaet [value a e])
+        components (:components options)]
+    (= (vec components) (subvec key 0 (min (count key)
+                                            (count components))))))
 
 (defn datoms
   ([database] (datoms database nil))
-  ([^Database database options]
-   (peer/datoms (db-value database) options (:visible? database))))
+  ([database options]
+   (let [{:keys [basis-cid mode] :as snapshot} (ensure-db database)
+         database (connection snapshot)
+         {:keys [get-fn]} (storage/ports (:storage database))]
+     (if (= :history mode)
+       (let [entity (when (and (= :eavt (:index options))
+                               (seq (:components options)))
+                      (first (:components options)))
+             rows (peer/history-datoms get-fn basis-cid entity
+                                       (:visible? database)
+                                       (:decrypt-fn database))]
+         (cond->> rows
+           (seq (:components options))
+           (filter #(history-row-matches? options %))
+           (:limit options) (take (:limit options))
+           true vec))
+       (peer/datoms (db-value snapshot) options (:visible? database))))))
 
-(defn q [^Database database pattern]
-  (peer/q (db-value database) pattern (:visible? database)))
+(defn q [database pattern]
+  (peer/q (db-value database) pattern (:visible? (connection database))))
 
 (defn query
   ([database query] (query database query []))
-  ([^Database database query inputs]
-   (peer/query (db-value database) query (:visible? database) inputs)))
+  ([database query inputs]
+   (peer/query (db-value database) query
+               (:visible? (connection database)) inputs)))
 
-(defn pull [^Database database entity pattern]
+(defn pull [database entity pattern]
   (peer/pull (db-value database) entity pattern))
+
+(defn pull-many [database pattern entities]
+  (mapv #(pull database % pattern) entities))
+
+(defn entity [database entity-id]
+  (peer/entity (db-value database) entity-id))
+
+(defn entid [database id]
+  (peer/entid (db-value database) id))
+
+(defn ident [database id]
+  (peer/ident (db-value database) id))
