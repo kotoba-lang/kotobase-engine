@@ -189,6 +189,14 @@
 (defn history [database] (engine/history database))
 (defn basis-t [database] (engine/basis-t database))
 (defn basis-cid [database] (engine/basis-cid database))
+(defn tx-range
+  ([database] (engine/tx-range database))
+  ([database start] (engine/tx-range database start nil))
+  ([database start end] (engine/tx-range database start end)))
+
+(defn listen [connection listener] (engine/listen! connection listener))
+(defn unlisten [connection listener-id]
+  (engine/unlisten! connection listener-id))
 
 (defn next-t [database]
   (let [value (basis-t database)
@@ -287,10 +295,20 @@
 
 (defn- stored-value [value]
   (let [value (wire-value value)]
-    (if (string? value) value (str value))))
+    (cond
+      (string? value) value
+      (vector? value) (str (mapv stored-value value))
+      :else (str value))))
 
 (defn- row-value [{:keys [v_edn]}]
   (edn/read-string v_edn))
+
+(defn- stored-edn [value]
+  (if (string? value)
+    (try
+      (edn/read-string value)
+      (catch #?(:clj Exception :cljs :default) _ value))
+    value))
 
 (defn- rows-index [rows]
   {:lookup
@@ -318,10 +336,16 @@
            (fn [[entity attributes]]
              (when-let [ident (get attributes ":db/ident")]
                [ident
-                {:entity entity
+               {:entity entity
                  :value-type (get attributes ":db/valueType")
                  :cardinality (get attributes ":db/cardinality")
-                 :unique (get attributes ":db/unique")}]))
+                 :unique (get attributes ":db/unique")
+                 :tuple-attrs
+                 (some-> (get attributes ":db/tupleAttrs") stored-edn vec)
+                 :tuple-types
+                 (some-> (get attributes ":db/tupleTypes") stored-edn vec)
+                 :tuple-type
+                 (some-> (get attributes ":db/tupleType") stored-edn str)}]))
            entities))))
 
 (defn- inline-schema [tx-data]
@@ -333,7 +357,14 @@
               {:entity (str (:db/id item))
                :value-type (some-> (:db/valueType item) wire-value str)
                :cardinality (some-> (:db/cardinality item) wire-value str)
-               :unique (some-> (:db/unique item) wire-value str)}])))
+               :unique (some-> (:db/unique item) wire-value str)
+               :tuple-attrs
+               (some->> (:db/tupleAttrs item)
+                        (mapv #(str (wire-value %))))
+               :tuple-types
+               (some->> (:db/tupleTypes item)
+                        (mapv #(str (wire-value %))))
+               :tuple-type (some-> (:db/tupleType item) wire-value str)}])))
         tx-data))
 
 (defn- validate-value-type! [definition attribute value]
@@ -351,6 +382,37 @@
             ":db.type/instant" (inst? value)
             ":db.type/uuid" (uuid? value)
             ":db.type/symbol" (symbol? value)
+            ":db.type/fn" (or (map? value) (string? value))
+            ":db.type/tuple"
+            (and
+             (vector? value)
+             (<= 2 (count value) 8)
+             (cond
+               (:tuple-types definition)
+               (and
+                (= (count value) (count (:tuple-types definition)))
+                (every?
+                 true?
+                 (map (fn [item item-type]
+                        (try
+                          (validate-value-type!
+                           {:value-type (str item-type)} attribute item)
+                          true
+                          (catch #?(:clj Exception :cljs :default) _ false)))
+                      value (:tuple-types definition))))
+
+               (:tuple-type definition)
+               (every?
+                (fn [item]
+                  (try
+                    (validate-value-type!
+                     {:value-type (:tuple-type definition)} attribute item)
+                    true
+                    (catch #?(:clj Exception :cljs :default) _ false)))
+                value)
+
+               (:tuple-attrs definition) true
+               :else false))
             true)]
       (when-not valid?
         (throw
@@ -384,6 +446,33 @@
            (ex-info "Lookup ref does not resolve"
                     {:type :kotobase.datomic/lookup-ref-not-found
                      :lookup-ref value}))))))
+
+(defn- derive-map-composites [tx-data schema]
+  (let [composites
+        (keep
+         (fn [[attribute definition]]
+           (when (seq (:tuple-attrs definition))
+             [attribute (:tuple-attrs definition)]))
+         schema)]
+    (mapv
+     (fn [item]
+       (if-not (map? item)
+         item
+         (reduce
+          (fn [entity [attribute constituents]]
+            (let [constituent-keys
+                  (mapv #(if (keyword? %) % (edn/read-string (str %)))
+                        constituents)]
+              (if (and (not (contains? entity
+                                      (edn/read-string attribute)))
+                       (every? #(contains? entity %) constituent-keys))
+                (assoc entity (edn/read-string attribute)
+                       (mapv #(stored-value (get entity %))
+                             constituent-keys))
+                entity)))
+          item
+          composites)))
+     tx-data)))
 
 (defn- assign-map-ids [tx-data schema lookup]
   (let [identity-attributes
@@ -453,7 +542,10 @@
         tx-data)
        :tempids @tempids})))
 
-(defn- entity-map-ops [entity]
+(def ^:private schema-vector-attributes
+  #{:db/tupleAttrs :db/tupleTypes :db/fn})
+
+(defn- entity-map-ops [entity schema]
   (let [entity-id (:db/id entity)]
     (when-not (some? entity-id)
       (throw
@@ -463,8 +555,13 @@
     (mapcat
      (fn [[attribute value]]
        (when-not (= attribute :db/id)
-         (let [values (if (and (coll? value) (not (map? value))
-                               (not (lookup-ref? value)))
+         (let [definition (get schema (str (wire-value attribute)))
+               tuple-value? (= ":db.type/tuple" (:value-type definition))
+               values (if (and (coll? value) (not (map? value))
+                               (not (lookup-ref? value))
+                               (not tuple-value?)
+                               (not (contains? schema-vector-attributes
+                                               attribute)))
                         value
                         [value])]
            (map
@@ -475,14 +572,16 @@
             values))))
      entity)))
 
-(defn- normalize-entity-maps [tx-data]
-  (vec
-   (mapcat
-    (fn [item]
-      (if (and (map? item) (contains? item :db/id))
-        (entity-map-ops item)
-        [item]))
-    tx-data)))
+(defn- normalize-entity-maps
+  ([tx-data] (normalize-entity-maps tx-data {}))
+  ([tx-data schema]
+   (vec
+    (mapcat
+     (fn [item]
+       (if (and (map? item) (contains? item :db/id))
+         (entity-map-ops item schema)
+         [item]))
+     tx-data))))
 
 (defn prepare-basic-transaction
   "Normalize entity maps without reading a database basis.
@@ -500,7 +599,81 @@
   #{:db/add :db/retract :db/retractEntity
     :db.fn/cas :db.fn/retractAttribute :db.fn/retractEntity})
 
-(defn- expand-registered-functions [database snapshot tx-data]
+(defn- tree-size [value]
+  (if (coll? value)
+    (inc (reduce + (map tree-size
+                        (if (map? value)
+                          (mapcat identity value)
+                          value))))
+    1))
+
+(defn- substitute-ir [bindings value]
+  (cond
+    (symbol? value) (get bindings value value)
+    (vector? value) (mapv #(substitute-ir bindings %) value)
+    (list? value) (apply list (map #(substitute-ir bindings %) value))
+    (set? value) (into #{} (map #(substitute-ir bindings %) value))
+    (map? value) (into {}
+                       (map (fn [[key item]]
+                              [(substitute-ir bindings key)
+                               (substitute-ir bindings item)]))
+                       value)
+    :else value))
+
+(defn- compile-persisted-function [ident spec]
+  (let [spec (stored-edn spec)
+        language (or (:lang spec) (:kotobase.fn/type spec))
+        params (:params spec)
+        code (:code spec)]
+    (when-not (contains? #{"kotobase/tx-ir-v1" :kotobase/tx-ir-v1
+                           "kotobase.tx-ir/v1" :kotobase.tx-ir/v1}
+                         language)
+      (throw
+       (ex-info "Persisted function uses an unsupported language"
+                {:type :kotobase.datomic/unsupported-function-language
+                 :function ident :lang language})))
+    (when-not (and (vector? params) (every? symbol? params)
+                   (sequential? code) (<= (tree-size code) 4096))
+      (throw
+       (ex-info "Persisted transaction IR is invalid or exceeds its fuel limit"
+                {:type :kotobase.datomic/invalid-function-ir
+                 :function ident})))
+    (fn [database & args]
+      (when-not (= (count params) (inc (count args)))
+        (throw
+         (ex-info "Persisted transaction function arity mismatch"
+                  {:type :kotobase.datomic/function-arity
+                   :function ident
+                   :expected (dec (count params))
+                   :actual (count args)})))
+      (let [bindings (zipmap params (cons database args))
+            expanded (substitute-ir bindings code)]
+        (doseq [item expanded]
+          (when (and (vector? item)
+                     (not (contains? built-in-operations (first item))))
+            (throw
+             (ex-info "Persisted transaction IR may only emit built-in operations"
+                      {:type :kotobase.datomic/unsafe-function-ir
+                       :function ident :item item}))))
+        expanded))))
+
+(defn- persisted-functions [rows]
+  (let [entities
+        (reduce
+         (fn [result {:keys [e a] :as row}]
+           (assoc-in result [e a] (row-value row)))
+         {}
+         rows)]
+    (into {}
+          (keep
+           (fn [[_ attributes]]
+             (when-let [spec (get attributes ":db/fn")]
+               (let [ident (get attributes ":db/ident")]
+                 [ident (compile-persisted-function ident spec)]))))
+          entities)))
+
+(defn- expand-registered-functions [database snapshot tx-data rows]
+  (let [persisted (persisted-functions rows)]
   (loop [remaining (seq tx-data), expanded [], expansions 0]
     (when (> expansions 1024)
       (throw
@@ -513,7 +686,8 @@
                                                       (first item))))
                              (first item))
             tx-function (when function-ident
-                          (engine/tx-function database function-ident))]
+                          (or (engine/tx-function database function-ident)
+                              (get persisted (str function-ident))))]
         (if tx-function
           (let [produced (apply tx-function snapshot (rest item))]
             (when-not (or (nil? produced) (sequential? produced))
@@ -524,7 +698,7 @@
             (recur (concat produced (rest remaining))
                    expanded (inc expansions)))
           (recur (next remaining) (conj expanded item) expansions)))
-      expanded)))
+      expanded))))
 
 (defn- resolve-operation
   [operation schema lookup tempids]
@@ -564,8 +738,7 @@
       :else operation)))
 
 (defn- expand-builtins [operations pair-values schema lookup]
-  (:tx-data
-   (reduce
+  (reduce
     (fn [{:keys [tx-data pairs unique-values]} operation]
       (let [[op entity attribute old-value new-value] operation
             attribute-wire (some-> attribute wire-value str)
@@ -681,7 +854,53 @@
                  :when (and (= attribute candidate-attribute)
                             (= 1 (count owners)))]
              [[attribute value] (first owners)]))}
-    operations)))
+    operations))
+
+(defn- composite-operations [tx-data pair-values schema]
+  (let [composites
+        (keep
+         (fn [[attribute definition]]
+           (when (seq (:tuple-attrs definition))
+             [attribute definition]))
+         schema)
+        touched
+        (reduce
+         (fn [result operation]
+           (let [[op entity attribute] operation
+                 attribute (some-> attribute wire-value str)]
+             (if (and (contains? #{:db/add :db/retract} op)
+                      (some (fn [[_ definition]]
+                              (contains? (set (:tuple-attrs definition))
+                                         attribute))
+                            composites))
+               (conj result (str entity))
+               result)))
+         #{}
+         tx-data)]
+    (vec
+     (mapcat
+      (fn [entity]
+        (mapcat
+         (fn [[tuple-attribute definition]]
+           (let [constituents (:tuple-attrs definition)
+                 component-values
+                 (mapv #(get pair-values [entity (str %)] #{})
+                       constituents)
+                 desired (when (every? #(= 1 (count %)) component-values)
+                           (mapv first component-values))
+                 current (get pair-values [entity tuple-attribute] #{})
+                 desired-wire (some-> desired stored-value)
+                 retracts
+                 (map (fn [value]
+                        [:db/retract entity
+                         (edn/read-string tuple-attribute) value])
+                      (remove #{desired-wire} current))]
+             (cond-> (vec retracts)
+               (and desired (not (contains? current desired-wire)))
+               (conj [:db/add entity
+                      (edn/read-string tuple-attribute) desired]))))
+         composites))
+      touched))))
 
 (defn prepare-transaction
   "Resolve tempids, lookup refs, identity upserts and built-in transaction
@@ -690,19 +909,26 @@
   (let [requested (if (map? tx) (:tx-data tx) tx)
         finish
         (fn [snapshot rows]
-          (let [expanded-requested
+          (let [{:keys [lookup pairs]} (rows-index rows)
+                expanded-requested
                 (expand-registered-functions
-                 connection snapshot requested)
-                {:keys [lookup pairs]} (rows-index rows)
+                 connection snapshot requested rows)
                 schema (merge (schema-from-rows rows)
                               (inline-schema expanded-requested))
+                expanded-requested
+                (derive-map-composites expanded-requested schema)
                 {assigned :tx-data initial-tempids :tempids}
                 (assign-map-ids expanded-requested schema lookup)
                 tempids (atom initial-tempids)
                 operations
                 (mapv #(resolve-operation % schema lookup tempids)
-                      (normalize-entity-maps assigned))
-                normalized (expand-builtins operations pairs schema lookup)]
+                      (normalize-entity-maps assigned schema))
+                ordinary (expand-builtins operations pairs schema lookup)
+                tuple-ops (composite-operations
+                           (:tx-data ordinary) (:pairs ordinary) schema)
+                tuples (expand-builtins tuple-ops (:pairs ordinary)
+                                        schema lookup)
+                normalized (into (:tx-data ordinary) (:tx-data tuples))]
             {:request (if (map? tx)
                         (assoc tx :tx-data normalized)
                         normalized)
@@ -729,13 +955,14 @@
                   :tempids tempids})]
     #?(:clj
        (let [after (engine/transact! connection tx-data)]
-         (report before after))
+         (engine/notify-listeners! connection (report before after)))
        :cljs
        (-> before
            (.then
             (fn [before-cid]
               (-> (engine/transact! connection tx-data)
-                  (.then #(report before-cid %)))))))))
+                  (.then #(engine/notify-listeners!
+                           connection (report before-cid %))))))))))
 
 (defn transact
   "Accept Datomic Client's `{:tx-data [...]}` shape or a raw tx-data seq.

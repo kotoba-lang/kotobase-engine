@@ -224,6 +224,73 @@
                                    {:index :eavt
                                     :components ["e"]})))))))
 
+(deftest datomic-tuples-persisted-functions-listeners-and-tx-range
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        reports (atom [])
+        listener-id (d/listen database #(swap! reports conj %))]
+    (d/transact
+     database
+     {:tx-data
+      [{:db/id :account/tenant
+        :db/ident :account/tenant
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :account/external-id
+        :db/ident :account/external-id
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :account/tenant+external
+        :db/ident :account/tenant+external
+        :db/valueType :db.type/tuple
+        :db/tupleAttrs [:account/tenant :account/external-id]
+        :db/cardinality :db.cardinality/one
+        :db/unique :db.unique/identity}
+       {:db/id :account/status
+        :db/ident :account/status
+        :db/valueType :db.type/string
+        :db/cardinality :db.cardinality/one}
+       {:db/id :fn/set-status
+        :db/ident :fn/set-status
+        :db/fn {:lang "kotobase/tx-ir-v1"
+                :params '[db entity status]
+                :code '[[:db/add entity :account/status status]]}}]})
+    (let [first-id (d/tempid :db.part/user)
+          first-report
+          (d/transact database
+                      {:tx-data [{:db/id first-id
+                                  :account/tenant "tenant-1"
+                                  :account/external-id "external-1"
+                                  :account/status "new"}]})
+          account-id (d/resolve-tempid first-report first-id)
+          upsert-id (d/tempid :db.part/user)
+          upsert-report
+          (d/transact database
+                      {:tx-data [{:db/id upsert-id
+                                  :account/tenant "tenant-1"
+                                  :account/external-id "external-1"}]})]
+      (is (= account-id (d/resolve-tempid upsert-report upsert-id)))
+      (d/transact
+       database
+       {:tx-data [[:fn/set-status
+                   [:account/tenant+external
+                    ["tenant-1" "external-1"]]
+                   "active"]]})
+      (is (= "active"
+             (d/q '[:find ?status .
+                    :where [?e :account/status ?status]]
+                  database)))
+      (is (= 4 (count @reports)))
+      (is (= 4 (count (d/tx-range database 0 nil))))
+      (is (true? (d/unlisten database listener-id)))
+      (d/transact database
+                  {:tx-data [[:db/add account-id :account/status "inactive"]]})
+      (is (= 4 (count @reports))))))
+
 (deftest fold-declares-a-view-then-view-reads-it-fresh
   (let [database (engine/open
                   {:storage (memory/memory-store)
@@ -233,15 +300,19 @@
                    :visible? (constantly true)})]
     (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}
                                      {:db/id "e2" :other/attr "x"}]})
-    (let [fold-result (d/fold database {:views {"names" {"attrs" [":person/name"]}}})]
+    (let [fold-result
+          (d/fold database
+                  {:views {"names" {"attrs" [":person/name"]}}})]
       (is (true? (:committed? fold-result))
           ":views forces the fold even though there's plenty of novelty to spare too"))
     (d/transact database {:tx-data [{:db/id "e3" :person/name "Bob"}]})
     (let [view (d/view database "names")]
       (is (some? view))
-      (is (= 2 (count (:rows view))) "1 folded row + 1 fresh novelty row for the declared attr")
+      (is (= 2 (count (:rows view)))
+          "1 folded row + 1 fresh novelty row for the declared attr")
       (is (every? #(= ":person/name" (:a %)) (:rows view))))
-    (is (nil? (d/view database "nope")) "an undeclared view is nil, not an empty read")))
+    (is (nil? (d/view database "nope"))
+        "an undeclared view is nil, not an empty read")))
 
 (deftest fold-with-views-forces-below-threshold
   (let [database (engine/open
@@ -253,6 +324,9 @@
     (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}]})
     (is (false? (:committed? (d/fold database {:threshold 1000})))
         "ordinarily a no-op this far below threshold")
-    (let [forced (d/fold database {:threshold 1000 :views {"names" {"attrs" [":person/name"]}}})]
+    (let [forced
+          (d/fold database
+                  {:threshold 1000
+                   :views {"names" {"attrs" [":person/name"]}}})]
       (is (true? (:committed? forced))))
     (is (= 1 (count (:rows (d/view database "names")))))))
