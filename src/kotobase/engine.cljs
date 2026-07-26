@@ -157,6 +157,18 @@
               put! get-fn cas! (:ref-name database) current tx-data
               (:encrypt-fn database) (:max-retries database))))))))
 
+(defn novelty-size
+  "How many not-yet-folded tx blocks sit on `chain-cid` (kotobase-peer.core/
+  novelty-size) -- O(1), reads a maintained counter field. `chain-cid` is a
+  caller-supplied chain (e.g. `transact!`'s own return value) rather than
+  re-deriving via `head`, avoiding a redundant ref read for the common case
+  of checking novelty right after writing."
+  [database chain-cid]
+  (with-blocks
+    (:storage database)
+    (fn [get-fn _put! _cas!]
+      (js/Promise.resolve (peer/novelty-size get-fn chain-cid)))))
+
 (defn- async-get-fn
   "Promise-returning direct block fetch, for kotobase-peer's cold-snapshot half.
 

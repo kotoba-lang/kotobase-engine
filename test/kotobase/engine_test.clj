@@ -330,3 +330,18 @@
                    :views {"names" {"attrs" [":person/name"]}}})]
       (is (true? (:committed? forced))))
     (is (= 1 (count (:rows (d/view database "names")))))))
+
+(deftest transact-reports-novelty-size
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})]
+    (is (= 1 (:novelty-size (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}]})))
+        "1 not-yet-folded tx block after the first commit")
+    (is (= 2 (:novelty-size (d/transact database {:tx-data [{:db/id "e2" :person/name "Bob"}]})))
+        "novelty accumulates across commits between folds")
+    (is (true? (:committed? (d/fold database {:threshold 1}))))
+    (is (= 2 (:novelty-size (d/transact database {:tx-data [{:db/id "e3" :person/name "Carol"}]})))
+        "novelty drops back down after a fold, instead of continuing to accumulate")))
