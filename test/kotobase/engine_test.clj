@@ -223,3 +223,36 @@
                          (d/datoms historical
                                    {:index :eavt
                                     :components ["e"]})))))))
+
+(deftest fold-declares-a-view-then-view-reads-it-fresh
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})]
+    (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}
+                                     {:db/id "e2" :other/attr "x"}]})
+    (let [fold-result (d/fold database {:views {"names" {"attrs" [":person/name"]}}})]
+      (is (true? (:committed? fold-result))
+          ":views forces the fold even though there's plenty of novelty to spare too"))
+    (d/transact database {:tx-data [{:db/id "e3" :person/name "Bob"}]})
+    (let [view (d/view database "names")]
+      (is (some? view))
+      (is (= 2 (count (:rows view))) "1 folded row + 1 fresh novelty row for the declared attr")
+      (is (every? #(= ":person/name" (:a %)) (:rows view))))
+    (is (nil? (d/view database "nope")) "an undeclared view is nil, not an empty read")))
+
+(deftest fold-with-views-forces-below-threshold
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})]
+    (d/transact database {:tx-data [{:db/id "e1" :person/name "Alice"}]})
+    (is (false? (:committed? (d/fold database {:threshold 1000})))
+        "ordinarily a no-op this far below threshold")
+    (let [forced (d/fold database {:threshold 1000 :views {"names" {"attrs" [":person/name"]}}})]
+      (is (true? (:committed? forced))))
+    (is (= 1 (count (:rows (d/view database "names")))))))
