@@ -295,6 +295,61 @@
   (-> (db-value database)
       (.then #(peer/pull % entity pattern))))
 
+(defn fold!
+  "Compact the database's accumulated novelty into a fresh indexed
+  snapshot. Self-retrying on head-CAS contention (`kotobase-peer.core/
+  fold-serialized-if-needed!`) the same way `transact!` relies on
+  `commit-serialized!`'s own self-retry -- there is no outer retry loop
+  here, unlike kotobase-server's `do-fold` (which relies on ITS caller's
+  `run-write` retry instead; this fn is the standalone-safe equivalent for
+  a caller, like kotobase-storage-d1, with no such outer loop of its own).
+
+  `opts` (optional map): `:threshold`/`:max-novelty`/`:max-retries`
+  (kotobase-peer defaults apply) and `:views` -- a map of
+  `{view-name spec-or-nil}` materialized view declarations (nil removes a
+  view). A non-nil `:views` forces the fold to run even when there is no
+  novelty to compact, so a caller's view declaration is never silently
+  dropped (see `fold-serialized-if-needed!`'s own docstring)."
+  ([database] (fold! database {}))
+  ([database opts]
+   (-> (head database)
+       (.then
+        (fn [current]
+          (with-blocks
+            (:storage database)
+            (fn [get-fn put! cas!]
+              (peer/fold-serialized-if-needed!
+               put! get-fn cas! (:ref-name database) current
+               (:blind-fn database) (:encrypt-fn database) (:decrypt-fn database)
+               opts))))))))
+
+(defn view
+  "Rows of a fold-materialized view, always fresh (the fold-time view rows
+  with unfolded novelty merged on top). nil when the graph has no head yet
+  or the view isn't declared (a prior `fold!` with `:views` declares it) --
+  a real miss, not an ambiguous empty read, same distinction kotobase-
+  server's `do-view` makes.
+
+  Uses the synchronous `with-blocks` trampoline (matching every other read
+  in this namespace before `db-value`'s async-get-fn path was added for
+  datoms/q/pull) because `kotobase-peer.core/view-rows` does not yet
+  accept an `async-get-fn` -- a cold/large view read pays the same O(N^2)
+  block-discovery cost `do-datoms`'s docstring documents was a REAL
+  production CPU-budget failure for datoms/q before that fix. Adding
+  async-get-fn support to `view-rows` itself is a kotobase-peer follow-up,
+  not something to route around here by half-wiring it."
+  [database view-name]
+  (-> (head database)
+      (.then
+       (fn [current]
+         (if-not current
+           (js/Promise.resolve nil)
+           (with-blocks
+             (:storage database)
+             (fn [get-fn _put! _cas!]
+               (peer/view-rows get-fn current view-name
+                               (:visible? database) (:decrypt-fn database)))))))))
+
 (defn pull-many [database pattern entities]
   (-> (db-value database)
       (.then

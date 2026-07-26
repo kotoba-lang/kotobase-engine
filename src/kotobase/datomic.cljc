@@ -772,3 +772,41 @@
        :cljs (.then report :db-after))))
 
 (def transact-async transact)
+
+(defn- wire-view-spec
+  "A view spec's `\"attrs\"` list holds attribute-shaped values (the same
+  kind `datoms`/`q`/`pull` already wire-encode via `wire-value`) -- callers
+  that pass real Datomic keywords need them translated to the engine's
+  string form the same way; callers that already pass pre-encoded strings
+  (e.g. gftdcojp/aozora-engine's feed_view.cljc) get an unchanged no-op
+  from `wire-value` on an already-string value."
+  [spec]
+  (some-> spec (update "attrs" #(mapv wire-value %))))
+
+(defn fold
+  "Maintenance op, not part of Datomic's client API proper: compact
+  `connection`'s accumulated novelty into a fresh indexed snapshot.
+
+  `opts` (optional): `:max-novelty`/`:threshold`/`:max-retries` plus
+  `:views` -- a map of `{view-name spec-or-nil}` (nil spec removes a
+  view) declaring/updating the graph's materialized views. A non-nil
+  `:views` forces the fold to run even with nothing to compact, so a
+  view declaration is never silently dropped (see `engine/fold!`'s
+  docstring)."
+  ([connection] (fold connection {}))
+  ([connection opts]
+   (engine/fold!
+    connection
+    (cond-> opts
+      (:views opts)
+      (update :views
+              (fn [views]
+                (into {} (map (fn [[view-name spec]] [view-name (wire-view-spec spec)])) views)))))))
+
+(defn view
+  "Rows of a fold-materialized view. Datomic-adjacent, not part of the
+  client API proper (mirrors `datoms`' response shape). nil when the
+  graph has no head yet or the view isn't declared (a prior `fold` with
+  `:views` declares it)."
+  [connection view-name]
+  (engine/view connection view-name))
