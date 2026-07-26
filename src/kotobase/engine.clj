@@ -167,3 +167,31 @@
 
 (defn ident [database id]
   (peer/ident (db-value database) id))
+
+(defn fold!
+  "Compact the database's accumulated novelty into a fresh indexed
+  snapshot. Self-retrying on head-CAS contention
+  (`kotobase-peer.core/fold-serialized-if-needed!`), the JVM sibling of
+  the cljs `fold!` in `engine.cljs` (see its docstring for `opts`, in
+  particular `:views`)."
+  ([database] (fold! database {}))
+  ([^Database database opts]
+   (when (instance? Db database)
+     (throw (ex-info "Cannot fold an immutable database value"
+                     {:type :kotobase.datomic/immutable-db})))
+   (let [{:keys [put! get-fn cas!]} (storage/ports (:storage database))]
+     (peer/fold-serialized-if-needed!
+      put! get-fn cas! (:ref-name database) (head database)
+      (:blind-fn database) (:encrypt-fn database) (:decrypt-fn database)
+      opts))))
+
+(defn view
+  "Rows of a fold-materialized view, always fresh. nil when the graph has
+  no head yet or the view isn't declared (a prior `fold!` with `:views`
+  declares it). JVM sibling of `engine.cljs`'s `view` (see its docstring)."
+  [database view-name]
+  (let [current (head database)]
+    (when current
+      (let [conn (connection database)
+            {:keys [get-fn]} (storage/ports (:storage conn))]
+        (peer/view-rows get-fn current view-name (:visible? conn) (:decrypt-fn conn))))))
