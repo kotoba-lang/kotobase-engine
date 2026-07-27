@@ -113,26 +113,61 @@
      :named? (boolean (some seq ((juxt :keys :strs :syms) query)))}))
 
 (defn q
-  "Datomic-compatible argument order: `(q query db & inputs)`.
+  "Datomic Client API compatible `q`.
 
-  Supports relation, scalar (`.`), collection (`...`), tuple, and
-  `:keys`/`:strs`/`:syms` result shapes."
-  [query database & inputs]
-  (let [{compiled :query shape :shape named? :named?}
-        (compile-query query)
-        finish (fn [results]
-                 (let [results (if named?
-                                 (named-results compiled results)
-                                 results)]
-                   (if named? results (shape-results shape results))))
-        result (engine/query database compiled (mapv wire-value inputs))]
-    #?(:clj (finish result)
-       :cljs (.then result finish))))
+  Supports:
+  * `(q query db & inputs)` — classic multi-arity form
+  * `(q {:query … :args […] :limit … :offset …})` — Client API arg-map
+
+  Result shapes: relation, scalar (`.`), collection (`...`), tuple, and
+  `:keys`/`:strs`/`:syms`."
+  ([arg-map]
+   (when-not (map? arg-map)
+     (throw (ex-info "q arity-1 requires an arg-map with :query and :args"
+                     {:type :kotobase.datomic/invalid-query})))
+   (let [query (:query arg-map)
+         args (or (:args arg-map) [])
+         result (apply q query args)
+         limit (:limit arg-map)
+         offset (or (:offset arg-map) 0)
+         window
+         (fn [xs]
+           (let [xs (cond-> (if (set? xs) (vec xs) (vec xs))
+                      (pos? offset) (->> (drop offset) vec)
+                      (and (number? limit) (not= -1 limit) (not (neg? limit)))
+                      (->> (take limit) vec))]
+             (if (set? result) (set xs) xs)))]
+     (if (or (pos? offset) (and (number? limit) (not= -1 limit)))
+       (if (or (set? result) (sequential? result))
+         (window result)
+         result)
+       result)))
+  ([query database & inputs]
+   (let [{compiled :query shape :shape named? :named?}
+         (compile-query query)
+         finish (fn [results]
+                  (let [results (if named?
+                                  (named-results compiled results)
+                                  results)]
+                    (if named? results (shape-results shape results))))
+         result (engine/query database compiled (mapv wire-value inputs))]
+     #?(:clj (finish result)
+        :cljs (.then result finish)))))
 
 (defn pull
-  "Datomic-compatible argument order: `(pull db selector eid)`."
-  [database selector eid]
-  (engine/pull database (wire-value eid) (wire-value selector)))
+  "Datomic Client API compatible `pull`.
+
+  Supports `(pull db selector eid)` and
+  `(pull db {:selector … :eid …})`."
+  ([database arg-map]
+   (if (map? arg-map)
+     (pull database (:selector arg-map) (:eid arg-map))
+     ;; arity-2 historical: treat second arg as selector only when third
+     ;; is supplied by the 3-arity overload below.
+     (throw (ex-info "pull arity-2 map form requires :selector and :eid"
+                     {:type :kotobase.datomic/invalid-pull}))))
+  ([database selector eid]
+   (engine/pull database (wire-value eid) (wire-value selector))))
 
 (defn pull-many [database selector eids]
   (engine/pull-many database (wire-value selector) (mapv wire-value eids)))
@@ -1006,10 +1041,17 @@
     #?(:clj (finish prepared)
        :cljs (.then prepared finish))))
 
-(defn with-db [database tx]
-  (let [report (with database tx)]
-    #?(:clj (:db-after report)
-       :cljs (.then report :db-after))))
+(defn with-db
+  "Client API `(with-db conn)` — return a db value suitable for `with`.
+
+  Historical 2-arity `(with-db db tx)` remains as a deprecated alias that
+  returns only `:db-after` of a speculative transaction."
+  ([connection]
+   (db connection))
+  ([database tx]
+   (let [report (with database tx)]
+     #?(:clj (:db-after report)
+        :cljs (.then report :db-after)))))
 
 (def transact-async transact)
 
