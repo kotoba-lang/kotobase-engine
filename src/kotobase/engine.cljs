@@ -369,7 +369,7 @@
               (peer/fold-serialized-if-needed!
                put! get-fn cas! (:ref-name database) current
                (:blind-fn database) (:encrypt-fn database) (:decrypt-fn database)
-               opts))))))))
+               (assoc opts :async-get-fn (async-get-fn (:storage database)))))))))))
 
 (defn view
   "Rows of a fold-materialized view, always fresh (the fold-time view rows
