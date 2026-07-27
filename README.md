@@ -1,8 +1,10 @@
 # kotobase-engine
 
 Database engine facade over `kotobase-peer` internals. Applications use the
-provider-neutral `kotobase.datomic` namespace and do not depend on the
-historical “peer” naming or on a storage provider SDK.
+provider-neutral **`kotobase.datomic.client`** namespace as a drop-in for
+published `datomic.client.api` (same arg-maps and return shapes), or the
+lower-level `kotobase.datomic` grammar facade. Neither depends on the
+historical “peer” naming, XRPC, or a storage provider SDK.
 
 The Datomic-shaped surface includes immutable `db` values, `transact`, `with`,
 `q`, `pull`/`pull-many`, `entity`/`touch`, all four `datoms` index orders,
