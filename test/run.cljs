@@ -1,30 +1,60 @@
 (ns run
-  (:require [kotobase.core :as kotobase]
+  "Smoke for the ClojureScript facade.
+
+  This file previously required `kotobase.core`, a namespace that does not
+  exist -- so it could not load, let alone pass. It had been dead since the
+  rename, and with no CI nothing said so. That matters more than a stale
+  import usually would: `kotobase.engine` has a `.clj` and a `.cljs`
+  implementation, the JVM suite covers only the first, and the second is
+  the one every Worker deployment runs.
+
+  Kept deliberately small. It is a smoke test for the async facade -- open,
+  transact, read the published ref, query it back -- not a second copy of
+  the JVM suite. The storage backends carry the deep round trips against
+  their own stores."
+  (:require [kotobase.datomic :as d]
+            [kotobase.engine :as engine]
             [kotobase.storage.core :as storage]
             [kotobase.storage.memory :as memory]))
 
-(let [backend (memory/memory-store)
-      database
-      (kotobase/open
-       {:storage backend
-        :encrypt-fn #(js/Promise.resolve %)
-        :decrypt-fn #(js/Promise.resolve %)
-        :blind-fn #(js/Promise.resolve (pr-str %))
-        :visible? (constantly true)})]
-  (-> (kotobase/transact! database [["alice" "role" "admin"]])
-      (.then
-       (fn [committed]
-         (when-not (string? committed)
-           (throw (js/Error. "transaction did not return a CID")))
-         (-> (storage/-read-ref backend "main")
-             js/Promise.resolve
-             (.then
-              (fn [ref]
-                (when-not (= committed (:cid ref))
-                  (throw (js/Error.
-                          "transaction ref was not published")))
-                (println "Async engine transaction: ok"))))))
-      (.catch
-       (fn [error]
-         (js/console.error error)
-         (js/process.exit 1)))))
+(def ^:private failures (atom 0))
+
+(defn- expect [ok? message]
+  (if ok?
+    (println (str "ok  - " message))
+    (do (js/console.error (str "FAIL: " message)) (swap! failures inc))))
+
+(defn -main [& _]
+  (let [backend (memory/memory-store)
+        ;; The four controls must return Promises here. The seam is
+        ;; synchronous on the JVM and Promise-returning on cljs, and a
+        ;; plain `identity` fails from deep inside kotobase-peer rather
+        ;; than at the call site.
+        conn (engine/open {:storage backend
+                           :encrypt-fn #(js/Promise.resolve %)
+                           :decrypt-fn #(js/Promise.resolve %)
+                           :blind-fn #(js/Promise.resolve (pr-str %))
+                           :visible? (constantly true)})]
+    (-> (d/transact conn [{:db/id "alice" :person/role "admin"}
+                          {:db/id "bob" :person/role "member"}])
+        (.then (fn [report]
+                 (expect (some? report) "transact returns a report")
+                 (js/Promise.resolve (storage/-read-ref backend "main"))))
+        (.then (fn [ref]
+                 (expect (some? (:cid ref))
+                         "the transaction published a ref")
+                 (d/q '[:find ?r :where [?e :person/role ?r]] (d/db conn))))
+        (.then (fn [rows]
+                 (expect (= #{["admin"] ["member"]} (set (map vec rows)))
+                         (str "q reads both entities back: " (pr-str rows)))))
+        (.catch (fn [error]
+                  (js/console.error (str "FAIL: " (.-message error)))
+                  (swap! failures inc)))
+        (.then (fn [_]
+                 (if (zero? @failures)
+                   (println "kotobase-engine (cljs facade): all green")
+                   (println (str "kotobase-engine (cljs facade): " @failures
+                                 " FAILURE(S) above")))
+                 (.exit js/process (if (zero? @failures) 0 1)))))))
+
+(-main)
