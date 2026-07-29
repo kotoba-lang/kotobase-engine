@@ -1,7 +1,7 @@
 {:paths ["src"]
  :deps {io.github.kotoba-lang/kotobase-storage
         {:git/url "https://github.com/kotoba-lang/kotobase-storage.git"
-         :git/sha "5cbf6c5107ad49c0daac14dca118c837053de0d6"}
+         :git/sha "b507198f4a27b71196d8b6e212451fe8edd3393e"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
          :git/sha "545d0866ebbaa99d3cc93c44b69b0f07977909f6"}}
