@@ -146,7 +146,7 @@
 (defrecord LocalConnection [client db-name database])
 (defrecord LocalDb [connection database t as-of-t since-t history?])
 (defrecord RemoteConnection [client db-name])
-(defrecord RemoteDb [connection db-name graph t as-of-t since-t history? with?])
+(defrecord RemoteDb [connection db-name graph t as-of-t since-t history? with? with-tx-data])
 
 (defn- remote-client? [x] (boolean (::remote x)))
 (defn- remote-connection? [x] (instance? RemoteConnection x))
@@ -242,13 +242,14 @@
     (some? (:as-of-t db)) (assoc :as-of (:as-of-t db))
     (some? (:since-t db)) (assoc :since (:since-t db))
     (:history? db) (assoc :history true)
-    (:with? db) (assoc :with true)))
+    (:with? db) (assoc :with true)
+    (some? (:with-tx-data db)) (assoc :with-tx-data (:with-tx-data db))))
 
 (defn- wire->remote-db [connection value]
   (let [db-name (or (:db-name value) (:db-name connection))]
     (->RemoteDb connection db-name (:graph value) (:basis-t value)
                 (:as-of value) (:since value) (boolean (:history value))
-                (boolean (:with value)))))
+                (boolean (:with value)) (:with-tx-data value))))
 
 (defn- remote-db-post [db path body]
   (remote-post (:client (:connection db)) path body (:db-name db)))
@@ -660,7 +661,28 @@
        connection))))
 
 (defn administer-system
-  "Cloud-only control plane. Intentionally unsupported on Kotobase."
-  [_client _arg-map]
-  (unsupported!
-   "administer-system is not part of the Kotobase Client API surface"))
+  "Run the public Client API administration action. Datomic currently
+  documents only `:upgrade-schema`; Kotobase's intrinsic base schema has no
+  out-of-band catalog migration, so a current database returns a diagnostic
+  no-op result rather than pretending to expose Cognitect's private control
+  plane."
+  [client arg-map]
+  (when-not (map? arg-map)
+    (incorrect! "administer-system requires an arg-map"))
+  (let [{:keys [action db-name]} arg-map]
+    (when-not (= :upgrade-schema action)
+      (unsupported! "administer-system supports only :upgrade-schema"
+                    {:action action}))
+    (when-not (and (string? db-name) (seq db-name))
+      (incorrect! "administer-system :upgrade-schema requires :db-name"))
+    (if (remote-client? client)
+      (remote-post client "/api/administer-system" arg-map db-name)
+      (do
+        (ensure-local-client! client)
+        (when-not (contains? @(:dbs client) db-name)
+          (incorrect! (str "Database does not exist: " db-name)
+                      {:db-name db-name}))
+        {:action :upgrade-schema
+         :db-name db-name
+         :status :current
+         :base-schema :kotobase/v1}))))

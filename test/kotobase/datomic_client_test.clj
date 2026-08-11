@@ -23,8 +23,11 @@
     (is (some? (d/db conn)))
     (is (true? _del))
     (is (= ["a"] names-after))
+    (is (= {:action :upgrade-schema :db-name "a"
+            :status :current :base-schema :kotobase/v1}
+           (d/administer-system client {:action :upgrade-schema :db-name "a"})))
     (is (thrown? clojure.lang.ExceptionInfo
-                 (d/administer-system client {:action :upgrade-schema})))))
+                 (d/administer-system client {:action :not-public :db-name "a"})))))
 
 (deftest transact-q-pull-datoms-client-shapes
   (let [conn (fresh-conn)
@@ -121,8 +124,11 @@
                   "/api/with" {:db-before {:kotobase/db-value true :db-name "alpha"
                                             :graph "bafygraph" :basis-t 7}
                                :db-after {:kotobase/db-value true :db-name "alpha"
-                                          :graph "bafywith" :basis-t "bafywith" :with true}
+                                          :graph "bafygraph" :basis-t 7 :with true
+                                          :with-tx-data (:tx-data input)}
                                :tx-data [] :tempids {}}
+                  "/api/administer-system" {:action :upgrade-schema :db-name "alpha"
+                                             :status :current :base-schema :kotobase/v1}
                   "/api/transact" {:db-before {:kotobase/db-value true :db-name "alpha"
                                                 :graph "bafygraph" :basis-t 7}
                                    :db-after {:kotobase/db-value true :db-name "alpha"
@@ -172,8 +178,18 @@
     (is (= 1 (:datoms (d/db-stats db))))
     (is (= 1 (count (d/tx-range conn {:start 0}))))
     (is (= 8 (:t (:db-after (d/transact conn {:tx-data [{:db/id "new"}]})))))
-    (is (:with? (:db-after (d/with (d/with-db conn)
-                                    {:tx-data [{:db/id "spec"}]}))))
+    (let [spec-db (:db-after (d/with (d/with-db conn)
+                                     {:tx-data [{:db/id "spec" :person/name "Spec"}]}))]
+      (is (:with? spec-db))
+      (is (= [{:db/id "spec" :person/name "Spec"}] (:with-tx-data spec-db)))
+      (d/q query spec-db)
+      (let [wire (->> @requests
+                      (filter #(.endsWith ^String (:url %) "/api/q"))
+                      last :body clojure.edn/read-string :args first)]
+        (is (= (:with-tx-data spec-db) (:with-tx-data wire)))))
+    (is (= :current (:status (d/administer-system client
+                                                   {:action :upgrade-schema
+                                                    :db-name "alpha"}))))
     (let [q-request (first (filter #(.endsWith ^String (:url %) "/api/q") @requests))
           body (clojure.edn/read-string (:body q-request))
           wire-db (first (:args body))]
