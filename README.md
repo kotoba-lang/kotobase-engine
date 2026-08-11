@@ -6,6 +6,27 @@ published `datomic.client.api` (same arg-maps and return shapes), or the
 lower-level `kotobase.datomic` grammar facade. Neither depends on the
 historical “peer” naming, XRPC, or a storage provider SDK.
 
+The `:kotobase` server type is a real HTTP client for
+`https://datomic.kotobase.net/api/*`. It carries immutable database values
+(`db-name`, graph, basis, as-of/since/history filters) as ordinary EDN while
+the edge re-derives the graph from the authenticated tenant. JVM Clojure uses
+`java.net.http.HttpClient`; tests and other hosts can inject `:request-fn`.
+
+```clojure
+(require '[kotobase.datomic.client :as d])
+
+(def client (d/client {:server-type :kotobase
+                       :endpoint "https://datomic.kotobase.net"
+                       :token #(System/getenv "KOTOBASE_TOKEN")}))
+(def conn (d/connect client {:db-name "production"}))
+(def snapshot (d/as-of (d/db conn) 42))
+(d/q '[:find ?e :where [?e :person/name _]] snapshot)
+```
+
+This is published-API shape compatibility, not Cognitect proprietary wire
+compatibility. A stock `com.datomic/client-cloud` binary cannot be redirected
+to this endpoint.
+
 The Datomic-shaped surface includes immutable `db` values, `transact`, `with`,
 `q`, `pull`/`pull-many`, `entity`/`touch`, all four `datoms` index orders,
 `seek-datoms`, `index-range`, `entid`/`ident`, `basis-t`, `as-of`, `since`, and
