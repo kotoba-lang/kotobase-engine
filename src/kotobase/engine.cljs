@@ -1,6 +1,8 @@
 (ns kotobase.engine
   "Promise-based Kotobase engine for Worker/JavaScript storage providers."
-  (:require [cljs.reader :as reader]
+  (:require [arrangement.core :as qs]
+            [arrangement.query :as kqe]
+            [cljs.reader :as reader]
             [kotobase-peer.core :as peer]
             [kotobase.storage.core :as storage]))
 
@@ -319,6 +321,45 @@
               (-> (db-value snapshot)
                   (.then #(peer/datoms % options
                                       (:visible? database)))))))))))
+
+(defn- row-in-value-range? [start end {:keys [v_edn]}]
+  (let [value (reader/read-string v_edn)]
+    (and (or (nil? start) (not (neg? (compare value start))))
+         (or (nil? end) (neg? (compare value end))))))
+
+(defn- quads->datom-rows [quads visible?]
+  (->> quads
+       (map (fn [{:keys [s p o]}]
+              {:e s :a p :v_edn (pr-str (qs/link->edn o)) :added true}))
+       (filter visible?)
+       vec))
+
+(defn index-range
+  "AVET datoms for ATTRIBUTE whose stored values fall in [START, END).
+
+  Exclusive hi. The hot in-memory db answers this via
+  `arrangement.query/query-range` (datalog `:pos`). History is an
+  assertion log, so that mode still filters decoded values after a
+  prefix read. HMAC-blinded persisted covering keys are not
+  order-preserving; this path does not claim they can prune by value."
+  [database attribute start end]
+  (-> (resolve-db database)
+      (.then
+       (fn [{:keys [mode] :as snapshot}]
+         (let [visible? (:visible? (:connection snapshot))]
+           (if (= :history mode)
+             (-> (datoms snapshot {:index :avet :components [attribute]})
+                 (.then (fn [rows]
+                          (->> rows
+                               (filter #(row-in-value-range? start end %))
+                               vec))))
+             (-> (db-value snapshot)
+                 (.then
+                  (fn [value]
+                    (quads->datom-rows
+                     (kqe/query-range value attribute start end
+                                      (constantly true))
+                     visible?))))))))))
 
 (defn q [database pattern]
   (-> (db-value database)

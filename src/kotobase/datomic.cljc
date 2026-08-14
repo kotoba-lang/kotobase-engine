@@ -198,21 +198,14 @@
   (datoms database {:index index :components (vec components)}))
 
 (defn index-range
-  "Return AVET datoms for ATTRIBUTE whose decoded values fall in [START, END)."
+  "Return AVET datoms for ATTRIBUTE whose decoded values fall in [START, END).
+
+  Exclusive hi. Delegates to the hot in-memory `query-range` path
+  (`arrangement.query` / `datalog.query`). HMAC-blinded persisted
+  covering keys are not order-preserving and are not claimed to prune
+  by value."
   [database attribute start end]
-  (let [finish
-        (fn [rows]
-          (->> rows
-               (filter
-                (fn [{:keys [v_edn]}]
-                  (let [value (edn/read-string v_edn)]
-                    (and (or (nil? start) (not (neg? (compare value start))))
-                         (or (nil? end) (neg? (compare value end)))))))
-               vec))
-        rows (datoms database {:index :avet
-                               :components [attribute]})]
-    #?(:clj (finish rows)
-       :cljs (.then rows finish))))
+  (engine/index-range database (wire-value attribute) start end))
 
 (defn db
   "Return an immutable database value pinned to the connection's current CID."

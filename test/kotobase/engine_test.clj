@@ -77,7 +77,13 @@
     (is (= 2 (count (d/seek-datoms database :aevt :person/name))))
     (is (= #{"Alice" "Bob"}
            (set (map (comp read-string :v_edn)
-                     (d/index-range database :person/name "A" "C")))))))
+                     (d/index-range database :person/name "A" "C")))))
+    (is (= #{"Alice"}
+           (set (map (comp read-string :v_edn)
+                     (d/index-range database :person/name "A" "B")))))
+    (is (= #{"Alice" "Bob"}
+           (set (map (comp read-string :v_edn)
+                     (d/index-range database :person/name "A" nil)))))))
 
 (deftest datomic-identity-tempid-lookup-ref-and-transaction-functions
   (let [database (engine/open
