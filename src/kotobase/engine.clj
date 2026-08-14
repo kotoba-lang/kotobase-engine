@@ -3,7 +3,9 @@
 
   The historical kotobase-peer implementation is deliberately hidden behind
   this database-shaped API."
-  (:require [kotobase-peer.core :as peer]
+  (:require [arrangement.core :as qs]
+            [arrangement.query :as kqe]
+            [kotobase-peer.core :as peer]
             [kotobase.storage.core :as storage]))
 
 (defrecord Database
@@ -185,6 +187,39 @@
            (:limit options) (take (:limit options))
            true vec))
        (peer/datoms (db-value snapshot) options (:visible? database))))))
+
+(defn- row-in-value-range? [start end {:keys [v_edn]}]
+  (let [value (read-string v_edn)]
+    (and (or (nil? start) (not (neg? (compare value start))))
+         (or (nil? end) (neg? (compare value end))))))
+
+(defn- quads->datom-rows [quads visible?]
+  (->> quads
+       (map (fn [{:keys [s p o]}]
+              {:e s :a p :v_edn (pr-str (qs/link->edn o)) :added true}))
+       (filter visible?)
+       vec))
+
+(defn index-range
+  "AVET datoms for ATTRIBUTE whose stored values fall in [START, END).
+
+  Exclusive hi. The hot in-memory db answers this via
+  `arrangement.query/query-range` (datalog `:pos`). History is an
+  assertion log, so that mode still filters decoded values after a
+  prefix read. HMAC-blinded persisted covering keys are not
+  order-preserving; this path does not claim they can prune by value."
+  [database attribute start end]
+  (let [{:keys [mode] :as snapshot} (ensure-db database)
+        conn (connection snapshot)
+        visible? (:visible? conn)]
+    (if (= :history mode)
+      (->> (datoms snapshot {:index :avet :components [attribute]})
+           (filter #(row-in-value-range? start end %))
+           vec)
+      (quads->datom-rows
+       (kqe/query-range (db-value snapshot) attribute start end
+                        (constantly true))
+       visible?))))
 
 (defn q [database pattern]
   (peer/q (db-value database) pattern (:visible? (connection database))))

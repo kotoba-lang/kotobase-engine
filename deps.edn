@@ -4,7 +4,12 @@
          :git/sha "b507198f4a27b71196d8b6e212451fe8edd3393e"}
         io.github.kotoba-lang/kotobase-peer
         {:git/url "https://github.com/kotoba-lang/kotobase-peer.git"
-         :git/sha "545d0866ebbaa99d3cc93c44b69b0f07977909f6"}}
+         :git/sha "545d0866ebbaa99d3cc93c44b69b0f07977909f6"
+         :exclusions [io.github.kotoba-lang/arrangement]}
+        ;; Hot `index-range` walks arrangement/datalog `:pos` via query-range.
+        ;; Peer's own arrangement pin is pre-range; exclude it so this SHA wins.
+        io.github.kotoba-lang/arrangement
+        {:git/sha "279c8c3b3a53fba287a105b44556b813ddca0966"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
