@@ -140,7 +140,13 @@
               (try
                 (-> (f get-fn put! cas!)
                     js/Promise.resolve
-                    (.catch retry-miss))
+                    ;; The wrapper is load-bearing: under nbb/SCI a `letfn`
+                    ;; sibling passed BY NAME to a JS callback is never invoked,
+                    ;; so `(.catch retry-miss)` silently did nothing and an
+                    ;; async block-miss escaped instead of trampolining. The
+                    ;; sync arm below was unaffected, which is why this stayed
+                    ;; invisible. Correct on every runtime. Root ADR-2608190100.
+                    (.catch (fn [error] (retry-miss error))))
                 (catch :default error
                   (retry-miss error))))]
       (step))))
