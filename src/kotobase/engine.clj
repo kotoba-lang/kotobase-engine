@@ -51,6 +51,21 @@
 (defn- connection [database]
   (if (instance? Db database) (:connection database) database))
 
+(defn at-cid
+  "Return an immutable database value pinned to exactly COMMIT-CID.
+
+  The commit is not trusted merely because a caller names it. Its block and
+  every block reached while reading it are still fetched through the
+  provider-neutral storage contract and verified by kotobase-peer. A missing
+  or forged commit therefore fails on the first read instead of falling back
+  to the mutable head."
+  [database commit-cid]
+  (when-not (and (string? commit-cid) (seq commit-cid))
+    (throw (ex-info "Kotobase requires a non-empty commit CID"
+                    {:type :kotobase.engine/invalid-commit-cid
+                     :commit-cid commit-cid})))
+  (->Db (connection database) commit-cid :current nil nil))
+
 (defn tx-function [database ident]
   (let [functions (:tx-functions (connection database))]
     (or (get functions ident) (get functions (str ident)))))

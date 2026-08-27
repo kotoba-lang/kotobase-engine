@@ -212,6 +212,11 @@
   [connection]
   (engine/db connection))
 
+(defn at-cid
+  "Return an immutable database value pinned to an exact commit CID."
+  [database commit-cid]
+  (engine/at-cid database commit-cid))
+
 (defn as-of [database t] (engine/as-of database t))
 (defn since [database t] (engine/since database t))
 (defn history [database] (engine/history database))

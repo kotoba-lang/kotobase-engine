@@ -43,10 +43,17 @@
         (.then (fn [ref]
                  (expect (some? (:cid ref))
                          "the transaction published a ref")
-                 (d/q '[:find ?r :where [?e :person/role ?r]] (d/db conn))))
+                 (-> (d/transact conn
+                                 [{:db/id "carol"
+                                   :person/role "guest"}])
+                     (.then (fn [_]
+                              (d/q
+                               '[:find ?r :where [?e :person/role ?r]]
+                               (d/at-cid conn (:cid ref))))))))
         (.then (fn [rows]
                  (expect (= #{["admin"] ["member"]} (set (map vec rows)))
-                         (str "q reads both entities back: " (pr-str rows)))))
+                         (str "q stays pinned to the exact commit: "
+                              (pr-str rows)))))
         (.catch (fn [error]
                   (js/console.error (str "FAIL: " (.-message error)))
                   (swap! failures inc)))
