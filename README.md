@@ -32,6 +32,9 @@ The Datomic-shaped surface includes immutable `db` values, `transact`, `with`,
 `seek-datoms`, `index-range`, `entid`/`ident`, `basis-t`, `as-of`, `since`, and
 `history`. `at-cid` pins an immutable value to an exact content-addressed
 commit; reads verify its blocks and never fall back to the mutable head.
+`commit-at!` appends against an exact basis without reading or publishing a
+mutable ref, so concurrent writers form explicit branches instead of silently
+rebasing.
 `tx-range` exposes committed transaction reports and `listen` /
 `unlisten` provide in-process post-commit listeners. Transactions resolve
 negative tempids, lookup refs and `:db.unique/identity` upserts before

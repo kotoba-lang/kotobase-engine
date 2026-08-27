@@ -111,8 +111,10 @@
 
 (defn- with-blocks
   "Trampoline synchronous IPLD reads over an async provider. Persist all
-  immutable writes before publishing the mutable ref."
-  [backend f]
+  immutable writes before publishing the mutable ref. When FLUSH-RESULT? is
+  true, persist them before returning an immutable-only commit result too."
+  ([backend f] (with-blocks backend f false))
+  ([backend f flush-result?]
   (let [cache (atom {})
         pending (atom [])
         get-fn (fn [cid]
@@ -156,6 +158,12 @@
               (try
                 (-> (f get-fn put! cas!)
                     js/Promise.resolve
+                    (.then
+                     (fn [result]
+                       (if flush-result?
+                         (-> (flush!)
+                             (.then (fn [_] result)))
+                         result)))
                     ;; The wrapper is load-bearing: under nbb/SCI a `letfn`
                     ;; sibling passed BY NAME to a JS callback is never invoked,
                     ;; so `(.catch retry-miss)` silently did nothing and an
@@ -165,7 +173,7 @@
                     (.catch (fn [error] (retry-miss error))))
                 (catch :default error
                   (retry-miss error))))]
-      (step))))
+      (step)))))
 
 (defn transact! [database tx-data]
   (when (instance? Db database)
@@ -180,6 +188,33 @@
              (peer/commit-serialized!
               put! get-fn cas! (:ref-name database) current tx-data
               (:encrypt-fn database) (:max-retries database))))))))
+
+(defn commit-at!
+  "Append TX-DATA to exactly EXPECTED-BASIS without a mutable-ref retry.
+
+  All immutable writes are awaited before the returned commit CID resolves.
+  Concurrent writers on one basis remain explicit branches."
+  [database expected-basis tx-data]
+  (cond
+    (instance? Db database)
+    (js/Promise.reject
+     (ex-info "Cannot commit through an immutable database value"
+              {:type :kotobase.datomic/immutable-db}))
+
+    (not (or (nil? expected-basis)
+             (and (string? expected-basis) (seq expected-basis))))
+    (js/Promise.reject
+     (ex-info "Kotobase requires nil or a non-empty basis CID"
+              {:type :kotobase.engine/invalid-commit-cid
+               :commit-cid expected-basis}))
+
+    :else
+    (with-blocks
+      (:storage database)
+      (fn [get-fn put! _cas!]
+        (peer/commit! put! get-fn tx-data expected-basis
+                      (:encrypt-fn database)))
+      true)))
 
 (defn novelty-size
   "How many not-yet-folded tx blocks sit on `chain-cid` (kotobase-peer.core/

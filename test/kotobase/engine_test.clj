@@ -44,6 +44,25 @@
          #"non-empty commit CID"
          (engine/at-cid database "")))))
 
+(deftest canonical-commits-branch-from-the-callers-exact-basis
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        root (engine/commit-at! database nil [["root" "value" 1]])
+        left (engine/commit-at! database root [["left" "value" 2]])
+        right (engine/commit-at! database root [["right" "value" 3]])]
+    (is (nil? (engine/head database)))
+    (is (not= left right))
+    (is (= #{{:s "root" :p "value" :o "1"}
+             {:s "left" :p "value" :o "2"}}
+           (engine/q (engine/at-cid database left) [nil "value" nil])))
+    (is (= #{{:s "root" :p "value" :o "1"}
+             {:s "right" :p "value" :o "3"}}
+           (engine/q (engine/at-cid database right) [nil "value" nil])))))
+
 (deftest datomic-query-syntax-and-argument-order
   (let [database (engine/open
                   {:storage (memory/memory-store)
