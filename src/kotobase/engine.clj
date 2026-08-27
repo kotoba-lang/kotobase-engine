@@ -141,6 +141,26 @@
      put! get-fn cas! (:ref-name database) (head database) tx-data
      (:encrypt-fn database) (:max-retries database))))
 
+(defn commit-at!
+  "Append TX-DATA to exactly EXPECTED-BASIS and return the new commit CID.
+
+  This is the immutable canonical write primitive. It writes CID-addressed
+  blocks but does not read, publish, or retry through a mutable ref. Concurrent
+  callers using the same basis therefore produce explicit branches for a
+  later deterministic merge instead of silently rebasing one caller's intent."
+  [^Database database expected-basis tx-data]
+  (when (instance? Db database)
+    (throw (ex-info "Cannot commit through an immutable database value"
+                    {:type :kotobase.datomic/immutable-db})))
+  (when-not (or (nil? expected-basis)
+                (and (string? expected-basis) (seq expected-basis)))
+    (throw (ex-info "Kotobase requires nil or a non-empty basis CID"
+                    {:type :kotobase.engine/invalid-commit-cid
+                     :commit-cid expected-basis})))
+  (let [{:keys [put! get-fn]} (storage/ports (:storage database))]
+    (peer/commit! put! get-fn tx-data expected-basis
+                  (:encrypt-fn database))))
+
 (defn novelty-size
   "How many not-yet-folded tx blocks sit on `chain-cid` (kotobase-peer.core/
   novelty-size) -- O(1), reads a maintained counter field. `chain-cid` is a

@@ -53,7 +53,20 @@
         (.then (fn [rows]
                  (expect (= #{["admin"] ["member"]} (set (map vec rows)))
                          (str "q stays pinned to the exact commit: "
-                              (pr-str rows)))))
+                              (pr-str rows)))
+                 (engine/commit-at! conn nil [["branch" "kind" "root"]])))
+        (.then (fn [branch-cid]
+                 (-> (storage/-read-ref backend "main")
+                     js/Promise.resolve
+                     (.then
+                      (fn [ref]
+                        (expect (not= branch-cid (:cid ref))
+                                "canonical commit does not publish a mutable ref")
+                        (engine/q (engine/at-cid conn branch-cid)
+                                  ["branch" "kind" nil]))))))
+        (.then (fn [rows]
+                 (expect (= #{{:s "branch" :p "kind" :o "root"}} rows)
+                         "canonical commit is readable at its returned CID")))
         (.catch (fn [error]
                   (js/console.error (str "FAIL: " (.-message error)))
                   (swap! failures inc)))
