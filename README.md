@@ -30,7 +30,9 @@ to this endpoint.
 The Datomic-shaped surface includes immutable `db` values, `transact`, `with`,
 `q`, `pull`/`pull-many`, `entity`/`touch`, all four `datoms` index orders,
 `seek-datoms`, `index-range`, `entid`/`ident`, `basis-t`, `as-of`, `since`, and
-`history`. `tx-range` exposes committed transaction reports and `listen` /
+`history`. `at-cid` pins an immutable value to an exact content-addressed
+commit; reads verify its blocks and never fall back to the mutable head.
+`tx-range` exposes committed transaction reports and `listen` /
 `unlisten` provide in-process post-commit listeners. Transactions resolve
 negative tempids, lookup refs and `:db.unique/identity` upserts before
 publication. Cardinality, uniqueness and value types are enforced from schema

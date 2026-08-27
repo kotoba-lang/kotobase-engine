@@ -21,6 +21,29 @@
     (is (= #{{:s "alice" :p "role" :o "admin"}}
            (engine/q database ["alice" "role" nil])))))
 
+(deftest exact-cid-values-do-not-drift-with-the-mutable-head
+  (let [database (engine/open
+                  {:storage (memory/memory-store)
+                   :encrypt-fn identity
+                   :decrypt-fn identity
+                   :blind-fn pr-str
+                   :visible? (constantly true)})
+        first-cid (engine/transact!
+                   database [["alice" "role" "member"]])
+        at-first (engine/at-cid database first-cid)
+        _second-cid (engine/transact!
+                     database [["alice" "role" "admin"]])]
+    (is (= first-cid (engine/basis-cid at-first)))
+    (is (= #{{:s "alice" :p "role" :o "member"}}
+           (engine/q at-first ["alice" "role" nil])))
+    (is (= #{{:s "alice" :p "role" :o "member"}
+             {:s "alice" :p "role" :o "admin"}}
+           (engine/q database ["alice" "role" nil])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"non-empty commit CID"
+         (engine/at-cid database "")))))
+
 (deftest datomic-query-syntax-and-argument-order
   (let [database (engine/open
                   {:storage (memory/memory-store)

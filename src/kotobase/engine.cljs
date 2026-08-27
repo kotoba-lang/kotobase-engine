@@ -55,6 +55,22 @@
 (defn- connection [database]
   (if (instance? Db database) (:connection database) database))
 
+(defn at-cid
+  "Return an immutable database value pinned to exactly COMMIT-CID.
+
+  Reads still verify every fetched CID-addressed block. A missing or forged
+  commit rejects the read and never falls back to the mutable head."
+  [database commit-cid]
+  (if-not (and (string? commit-cid) (seq commit-cid))
+    (js/Promise.reject
+     (ex-info "Kotobase requires a non-empty commit CID"
+              {:type :kotobase.engine/invalid-commit-cid
+               :commit-cid commit-cid}))
+    (-> (js/Promise.resolve database)
+        (.then (fn [database]
+                 (->Db (connection database) commit-cid
+                       :current nil nil))))))
+
 (defn tx-function [database ident]
   (let [functions (:tx-functions (connection database))]
     (or (get functions ident) (get functions (str ident)))))
