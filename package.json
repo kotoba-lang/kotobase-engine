@@ -21,10 +21,5 @@
     "url": "https://github.com/kotoba-lang/kotobase-engine/issues"
   },
   "homepage": "https://github.com/kotoba-lang/kotobase-engine#readme",
-  "dependencies": {
-    "@ipld/dag-cbor": "^10.0.1",
-    "@noble/curves": "^2.2.0",
-    "@noble/hashes": "^2.2.0",
-    "multiformats": "^14.0.5"
-  }
+  "dependencies": {}
 }
