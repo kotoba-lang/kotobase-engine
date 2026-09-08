@@ -6,7 +6,7 @@
   `(datoms db opts)`. `kotobase.core` remains the smaller native facade."
   (:require #?(:clj [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotobase.engine :as engine]))
 
 (def ^:private query-sections

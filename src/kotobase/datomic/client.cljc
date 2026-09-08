@@ -28,7 +28,7 @@
   (:refer-clojure :exclude [sync])
   (:require #?(:clj [clojure.edn :as edn]
                :cljs [cljs.reader :as edn])
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [kotobase.datomic :as d]
             [kotobase.engine :as engine]
             [kotobase.storage.memory :as memory])
