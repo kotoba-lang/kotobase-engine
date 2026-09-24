@@ -323,7 +323,7 @@
 
 (defn- fresh-entity-id []
   (str "kotobase.tempid/"
-       #?(:clj (java.util.UUID/randomUUID)
+       #?(:clj (random-uuid)
           :cljs (.randomUUID js/crypto))))
 
 (defn- stored-value [value]

@@ -77,7 +77,7 @@
     (throw (ex-info "Listener must be callable"
                     {:type :kotobase.datomic/invalid-listener})))
   (let [database (connection database)
-        id (str (java.util.UUID/randomUUID))]
+        id (str (random-uuid))]
     (swap! (:listeners database) assoc id listener)
     id))
 
