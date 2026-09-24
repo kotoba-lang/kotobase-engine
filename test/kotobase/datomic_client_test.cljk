@@ -1,6 +1,6 @@
 (ns kotobase.datomic-client-test
   "Maturity suite for the official Client API surface."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [kotoba.test :refer [deftest is]]
             [kotobase.datomic.client :as d]))
 
 (defn- fresh-conn []
