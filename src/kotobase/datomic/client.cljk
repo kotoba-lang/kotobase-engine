@@ -26,7 +26,7 @@
 
   See ADR-2607265000 (grammar) and ADR-2607279000 (client API maturity)."
   (:refer-clojure :exclude [sync])
-  (:require #?(:clj [clojure.edn :as edn]
+  (:require #?(:clj [kotoba.lang.edn :as edn]
                :cljs [cljs.reader :as edn])
             [kotoba.lang.text :as str]
             [kotobase.datomic :as d]
