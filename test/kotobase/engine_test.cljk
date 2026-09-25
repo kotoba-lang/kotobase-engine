@@ -1,11 +1,11 @@
 (ns kotobase.engine-test
-  (:require [kotoba.test :refer [deftest is]]
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is]]
             [kotobase.datomic :as d]
             [kotobase.engine :as engine]
             [kotobase.storage.memory :as memory]))
 
 (deftest open-fails-closed-without-security-controls
-  (is (thrown? clojure.lang.ExceptionInfo
+  (is (thrown? kerror/ExceptionInfo
                (engine/open {:storage (memory/memory-store)}))))
 
 (deftest public-engine-round-trips-a-transaction
@@ -40,7 +40,7 @@
              {:s "alice" :p "role" :o "admin"}}
            (engine/q database ["alice" "role" nil])))
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
+         kerror/ExceptionInfo
          #"non-empty commit CID"
          (engine/at-cid database "")))))
 
@@ -192,7 +192,7 @@
                   [?e :user/email "bob@example.test"]
                   [?e :user/manager ?manager]]
                 database)))
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? kerror/ExceptionInfo
                  (d/transact database
                              {:tx-data [[:db/add
                                          [:user/name "Bob"]
@@ -218,7 +218,7 @@
                   [?e :user/email "alice@example.test"]
                   [?e :user/name ?name]]
                 database)))
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? kerror/ExceptionInfo
                  (d/transact database
                              {:tx-data [[:db.fn/cas alice :user/name
                                          "wrong" "never"]]})))
