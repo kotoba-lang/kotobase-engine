@@ -1,6 +1,6 @@
 (ns kotobase.datomic-client-test
   "Maturity suite for the official Client API surface."
-  (:require [kotoba.test :refer [deftest is]]
+  (:require [kotoba.lang.error :as kerror] [kotoba.test :refer [deftest is]]
             [kotobase.datomic.client :as d]))
 
 (defn- fresh-conn []
@@ -26,7 +26,7 @@
     (is (= {:action :upgrade-schema :db-name "a"
             :status :current :base-schema :kotobase/v1}
            (d/administer-system client {:action :upgrade-schema :db-name "a"})))
-    (is (thrown? clojure.lang.ExceptionInfo
+    (is (thrown? kerror/ExceptionInfo
                  (d/administer-system client {:action :not-public :db-name "a"})))))
 
 (deftest transact-q-pull-datoms-client-shapes
