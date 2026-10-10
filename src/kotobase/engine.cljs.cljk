@@ -4,6 +4,7 @@
             [arrangement.query :as kqe]
             [cljs.reader :as reader]
             [kotobase-peer.core :as peer]
+            [kotobase.engine.logical :as logical]
             [kotobase.storage.core :as storage]))
 
 (defrecord Database
@@ -513,3 +514,122 @@
 (defn ident [database id]
   (-> (db-value database)
       (.then #(peer/ident % id))))
+
+;; ---------------------------------------------------------------------------
+;; Multi-parent merge (kotobase ADR-2610101200, kotobase.engine.logical)
+
+(defn- reject-db [message]
+  (js/Promise.reject
+   (ex-info message {:type :kotobase.datomic/immutable-db})))
+
+(defn merge-at!
+  "Deterministically merge the branch commits HEADS (CIDs returned by
+  `commit-at!`/`merge-at!`, in any order) into one multi-parent commit.
+
+  Like `commit-at!` this writes CID-addressed blocks only and never reads or
+  publishes the mutable ref, so two offline writers holding the same blocks
+  compute the same merge independently. Resolves to
+  `kotobase.engine.logical/merge-at`'s result: `:status` is `:merged` (a new
+  commit, `:cid`) or `:fast-forward` (one head already contains the others;
+  nothing is written). Rejects with `:type :kotobase.merge/rejected` and a
+  `:problem` (e.g. `:closure-too-large`, `:work-budget-exceeded`,
+  `:unrelated-histories`) when the contract refuses the merge.
+
+  `opts`: see `kotobase.engine.logical/settings` (`:schema`, `:database-id`,
+  `:max-closure`, `:max-work`, ...)."
+  ([database heads] (merge-at! database heads {}))
+  ([database heads opts]
+   (if (instance? Db database)
+     (reject-db "Cannot merge through an immutable database value")
+     (with-blocks
+       (:storage database)
+       (fn [get-fn put! _cas!]
+         (logical/merge-at get-fn put! database heads opts))
+       true))))
+
+(defn merge!
+  "Merge HEADS into the database's mutable ref and advance it through the
+  provider's compare-and-set (the same IRefStore path `transact!` uses).
+
+  The current ref head is always one of the merged heads. On a lost CAS the
+  merge is recomputed with the winner's head, up to `:max-retries`. Resolves
+  to the `merge-at!` result plus `:ref-advanced?` (false when the merge
+  fast-forwards to the current head)."
+  ([database heads] (merge! database heads {}))
+  ([database heads opts]
+   (if (instance? Db database)
+     (reject-db "Cannot merge through an immutable database value")
+     (-> (head database)
+         (.then
+          (fn [current]
+            (with-blocks
+              (:storage database)
+              (fn [get-fn put! cas!]
+                (letfn [(attempt [current attempts]
+                          (if (> attempts (:max-retries database))
+                            (js/Promise.reject
+                             (ex-info "merge! exceeded max-retries on the ref CAS"
+                                      {:type :kotobase.engine/cas-contention
+                                       :ref-name (:ref-name database)
+                                       :attempts attempts}))
+                            (-> (logical/merge-at
+                                 get-fn put! database
+                                 (cond-> (vec heads) current (conj current))
+                                 opts)
+                                js/Promise.resolve
+                                (.then
+                                 (fn [{:keys [cid] :as result}]
+                                   (if (= cid current)
+                                     (assoc result :ref-advanced? false)
+                                     (-> (cas! (:ref-name database) current cid)
+                                         (.then
+                                          (fn [actual]
+                                            (if (= actual cid)
+                                              (assoc result :ref-advanced? true)
+                                              (attempt actual (inc attempts))))))))))))]
+                  (attempt current 0))))))))))
+
+(defn branch-heads
+  "Reduce known commit CIDS (e.g. every CID writers got back from
+  `commit-at!`) to the sibling heads a merge must name: duplicates and
+  commits contained in another listed commit (over every parent) drop out."
+  ([database cids] (branch-heads database cids {}))
+  ([database cids {:keys [max-closure] :or {max-closure 100000}}]
+   (with-blocks
+     (:storage (connection database))
+     (fn [get-fn _put! _cas!]
+       (logical/reduce-physical-heads get-fn cids max-closure)))))
+
+(defn logical-projection
+  "The logical (contract) view of the physical closure of HEADS:
+  `{:graph {logical-root {:commit :tx}} :logical {physical-cid {:root ..}}}`.
+  `:graph` is what `kotobase.engine.merge/state`/`verify-merge` and frontier
+  proofs consume."
+  ([database heads] (logical-projection database heads {}))
+  ([database heads opts]
+   (let [conn (connection database)]
+     (with-blocks
+       (:storage conn)
+       (fn [get-fn _put! _cas!]
+         (logical/project get-fn (:decrypt-fn conn)
+                          (logical/settings conn opts) heads))))))
+
+(defn verify-at
+  "Verify the commit at CID before trusting reads through a merge
+  (ADR-2610101200 requires a reader to recompute every merge in the
+  closure). Every merge in its ancestry is recomputed through the contract,
+  and the physical state `q`/`pull` read at CID must equal the contract's
+  logical state there. Resolves to `{:cid :logical-root :logical-commit
+  :epoch :datoms}`."
+  ([database cid] (verify-at database cid {}))
+  ([database cid opts]
+   (let [conn (connection database)]
+     (-> (logical-projection conn [cid] opts)
+         (.then
+          (fn [projection]
+            (-> (db-value (->Db conn cid :current nil nil))
+                (.then
+                 (fn [value]
+                   (logical/verify-physical
+                    projection cid
+                    (peer/q value [nil nil nil] (constantly true))))))))))))

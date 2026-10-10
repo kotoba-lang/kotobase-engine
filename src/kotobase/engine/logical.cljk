@@ -1,0 +1,484 @@
+(ns kotobase.engine.logical
+  "Logical identity and deterministic merge for kotobase-engine commits.
+
+  kotobase ADR-2610101200 defines merge over *logical* commits
+  (`kotobase.logical-commit/v1` and `/v2`, kotobase-engine-contract). The
+  engine writes *physical* kotobase-peer chain commits
+  (`{state prev seq}`, `chain.core`). This namespace is the seam between the
+  two:
+
+  - **Projection.** Every physical commit has exactly one logical meaning,
+    derived deterministically from blocks the engine already writes:
+    - a commit whose novelty grew by one transaction block is a v1 logical
+      commit over its `prev`'s logical commit, with that transaction;
+    - a commit that only restructures state (`fold!`) is logically its
+      `prev` (a checkpoint is not a logical commit);
+    - a commit with chain `causes` is a merge. Its parents are
+      `prev ∪ causes` in canonical order, and its logical commit is whatever
+      the contract's `merge` computes from the parents' logical commits. It is
+      recomputed on every projection, never trusted.
+    The projection carries no new bytes in v1 physical commits, so every
+    existing commit CID is unchanged.
+
+  - **Physical merge.** `merge-at` writes one chain commit whose `prev` is the
+    first canonical physical parent and whose `causes` are the rest
+    (chain's existing multi-parent field). Its state is a fresh indexed
+    snapshot of the merged visible datoms (ADR-2610101200: \"the physical root
+    may be rebuilt from the merged Datoms\"), so `q`/`pull`/`datoms`/`entity`
+    read the merged state through the unchanged kotobase-peer read path.
+
+  Platform: synchronous on the JVM. On ClojureScript the functions that read
+  transaction blocks or write the snapshot return Promises; the block walk
+  itself is synchronous over the engine's `get-fn` (the cljs facade's
+  `with-blocks` trampoline restarts it on a block miss)."
+  (:require [arrangement.core :as qs]
+            [chain.core :as chain]
+            [ipld.core :as ipld]
+            [kotobase-peer.core :as peer]
+            [kotobase.engine.canonical :as canonical]
+            [kotobase.engine.identity :as identity]
+            [kotobase.engine.merge :as merge]))
+
+;; ---------------------------------------------------------------------------
+;; Platform
+
+(defn- then [x f]
+  #?(:clj (f x)
+     :cljs (.then (js/Promise.resolve x) f)))
+
+(defn- all [xs]
+  #?(:clj (vec xs)
+     :cljs (.then (js/Promise.all (into-array xs)) vec)))
+
+(defn- reject! [problem message data]
+  (throw (ex-info message (assoc data :type :kotobase.merge/rejected
+                                      :problem problem))))
+
+;; kotobase-peer is feature frozen (MIGRATION.md), so its block shapes are
+;; stable; these private readers are used rather than re-implemented so the
+;; projection reads novelty exactly as every other peer reader does.
+(defn- normalize-state [state] (#'peer/normalize-state state))
+(defn- legacy-novelty? [state] (#'peer/legacy-novelty-state? state))
+(defn- newest-tx-cid [get-fn state] (#'peer/newest-novelty-cid get-fn state))
+(defn- read-tx-block [get-fn tx-cid decrypt-fn]
+  (#'peer/read-tx-block get-fn tx-cid decrypt-fn))
+
+;; ---------------------------------------------------------------------------
+;; Settings
+
+(defn digest
+  "The injected digest the contract requires: CIDv1 (dag-cbor, sha2-256) of
+  the canonical string. Printable ASCII, identical on JVM and JS."
+  [s]
+  (ipld/cid (ipld/encode s)))
+
+(defn- root-of [x] (digest (canonical/canonical-string x)))
+
+(defn settings
+  "Normalize merge options.
+
+  - `:database-id`  logical database id (default: the engine ref name).
+  - `:schema`       `{attribute {:db/cardinality .. :db/unique ..}}` keyed by
+                    the attribute string as stored (kotobase-peer stringifies
+                    attributes, e.g. `\":person/name\"`). Default `{}`:
+                    every attribute is cardinality-many and non-unique, which
+                    is what raw kotobase-peer quads already mean.
+  - `:model-contract-root`, `:admission-policy-root`  roots bound into every
+                    logical commit (defaults name an unspecified contract).
+  - `:max-closure`  bound on physical and logical commits walked.
+  - `:max-work`     bound on replay work (projection and each contract call).
+
+  Every writer that is meant to converge must use the same settings: they
+  are part of every logical commit's bytes."
+  [database opts]
+  (let [schema (or (:schema opts) {})]
+    (when-not (map? schema)
+      (reject! :invalid-option ":schema must be a map" {:schema schema}))
+    (let [s {:database-id (or (:database-id opts) (:ref-name database))
+             :schema schema
+             :schema-root (root-of {:kotobase.engine/schema schema})
+             :model-contract-root
+             (or (:model-contract-root opts)
+                 (root-of :kotobase.engine/unspecified-model-contract))
+             :admission-policy-root
+             (or (:admission-policy-root opts)
+                 (root-of :kotobase.engine/unspecified-admission-policy))
+             :max-closure (get opts :max-closure merge/default-max-closure)
+             :max-work (get opts :max-work merge/default-max-work)}]
+      (doseq [k [:max-closure :max-work]]
+        (when-not (and (integer? (get s k)) (pos? (get s k)))
+          (reject! :invalid-option (str (name k) " must be a positive integer")
+                   {:option k :value (get s k)})))
+      (when-not (and (string? (:database-id s)) (seq (:database-id s)))
+        (reject! :invalid-option ":database-id must be a nonblank string"
+                 {:database-id (:database-id s)}))
+      s)))
+
+;; ---------------------------------------------------------------------------
+;; Physical DAG
+
+(defn- cid-arg! [cid]
+  (when-not (and (string? cid) (seq cid))
+    (reject! :invalid-heads "heads must be non-empty commit CID strings"
+             {:head cid}))
+  cid)
+
+(defn walk-physical
+  "Verified chain commits reachable from HEADS over `prev` and `causes`.
+  Every block is CID-verified by chain. Fails closed past MAX-CLOSURE."
+  [get-fn heads max-closure]
+  (loop [pending (vec heads) seen {}]
+    (if-let [cid (peek pending)]
+      (let [pending (pop pending)]
+        (if (contains? seen cid)
+          (recur pending seen)
+          (do
+            (when (<= max-closure (count seen))
+              (reject! :closure-too-large
+                       "physical ancestor closure exceeds max-closure"
+                       {:max-closure max-closure}))
+            (when (nil? (get-fn cid))
+              (reject! :missing-ancestor "commit block is not available"
+                       {:cid cid}))
+            (let [info (chain/commit-info get-fn cid)]
+              (recur (into pending (chain/causal-parents info))
+                     (assoc seen cid info))))))
+      seen)))
+
+(defn- topo-order
+  "Physical CIDs, every parent before its children (deterministic)."
+  [infos]
+  (loop [stack (mapv (fn [c] [c false]) (sort (keys infos)))
+         done #{}
+         order []]
+    (if-let [[cid expanded?] (peek stack)]
+      (let [stack (pop stack)]
+        (cond
+          (contains? done cid) (recur stack done order)
+          expanded? (recur stack (conj done cid) (conj order cid))
+          :else (recur (into (conj stack [cid true])
+                             (for [p (chain/causal-parents (get infos cid))
+                                   :when (not (contains? done p))]
+                               [p false]))
+                       done order)))
+      order)))
+
+(defn- novelty-count [state]
+  (if (legacy-novelty? state)
+    (count (get state "novelty" []))
+    (get state "novelty-count" 0)))
+
+(defn- classify
+  "What physical commit CID means logically."
+  [get-fn infos cid]
+  (let [{:keys [prev causes state]} (get infos cid)
+        norm (normalize-state state)
+        before (if prev (novelty-count (normalize-state (:state (get infos prev)))) 0)]
+    (cond
+      (seq causes)
+      (let [parents (vec (cons prev causes))]
+        (when-not (and prev (= parents (identity/canonical-parents parents)))
+          (reject! :merge-mismatch
+                   "physical merge parents are not distinct and canonical"
+                   {:cid cid :parents parents}))
+        {:kind :merge :parents parents})
+
+      (= (novelty-count norm) (inc before))
+      {:kind :tx :parent prev :tx-cid (newest-tx-cid get-fn norm)}
+
+      prev
+      {:kind :carry :parent prev}
+
+      :else
+      (reject! :unsupported-history
+               "a parentless commit without a transaction has no logical history"
+               {:cid cid}))))
+
+(defn- read-txs
+  "{physical-cid quads} for every transaction commit. Promise on cljs."
+  [get-fn decrypt-fn kinds]
+  (then (all (for [[cid {:keys [kind tx-cid]}] (sort-by key kinds)
+                   :when (= :tx kind)]
+               (then (read-tx-block get-fn tx-cid decrypt-fn)
+                     (fn [quads] [cid quads]))))
+        #(into {} %)))
+
+;; ---------------------------------------------------------------------------
+;; Logical values
+
+(defn- quad-value->logical [o]
+  (if (ipld/link? o) {"/" (ipld/link-cid o)} o))
+
+(defn- logical-value->quad [v]
+  (if (and (map? v) (contains? v "/")) (ipld/link (get v "/")) v))
+
+(defn datom->quad [{:keys [e a v]}]
+  {:s e :p a :o (logical-value->quad v)})
+
+(defn quad->datom [{:keys [s p o]}]
+  {:e s :a p :v (quad-value->logical o)})
+
+(defn- ea-key [e a] (canonical/canonical-string [e a]))
+(defn- v-key [v] (canonical/canonical-string v))
+
+(defn- cardinality-one? [schema a]
+  (= :db.cardinality/one (:db/cardinality (get schema a))))
+
+(defn- apply-datom
+  "Linear (single-writer) semantics, identical to the contract's replay of a
+  v1 chain: an assertion replaces the other values of a cardinality-one
+  attribute; a retraction removes exactly its datom."
+  [schema visible {:keys [e a v op] :as d}]
+  (let [ea (ea-key e a)
+        vk (v-key v)
+        d (dissoc d :op)]
+    (if (= :retract op)
+      (let [vs (dissoc (get visible ea) vk)]
+        (if (empty? vs) (dissoc visible ea) (assoc visible ea vs)))
+      (assoc visible ea (if (cardinality-one? schema a)
+                          {vk d}
+                          (assoc (get visible ea {}) vk d))))))
+
+(defn- entity-datoms [visible e]
+  (->> (vals visible)
+       (mapcat vals)
+       (filter #(= e (:e %)))
+       (sort-by canonical/logical-datom-key)))
+
+(defn- logical-tx
+  "The normalized logical transaction for one physical transaction, plus the
+  visible state after it. `retractEntity` is expanded against the state the
+  writer observed (its parent plus this transaction so far): it retracts
+  exactly what was visible, which is the observed-remove meaning the merge
+  policy needs."
+  [schema visible quads]
+  (reduce (fn [[tx visible] {:keys [s op] :as quad}]
+            (let [ds (if (= :retract-entity op)
+                       (map #(assoc % :op :retract) (entity-datoms visible s))
+                       [(assoc (quad->datom quad)
+                               :op (if (= :retract op) :retract :assert))])]
+              [(into tx ds) (reduce #(apply-datom schema %1 %2) visible ds)]))
+          [[] visible]
+          quads))
+
+(defn- visible-datoms [visible]
+  (mapcat vals (vals visible)))
+
+(defn- datoms->visible [datoms]
+  (reduce (fn [acc {:keys [e a v] :as d}]
+            (assoc-in acc [(ea-key e a) (v-key v)] (select-keys d [:e :a :v])))
+          {} datoms))
+
+(defn- charge [work amount max-work]
+  (let [work (+ work amount)]
+    (when (< max-work work)
+      (reject! :work-budget-exceeded "logical projection exceeds max-work"
+               {:max-work max-work}))
+    work))
+
+;; ---------------------------------------------------------------------------
+;; Projection
+
+(defn- project-tx
+  [{:keys [schema database-id schema-root model-contract-root
+           admission-policy-root]} parent quads]
+  (let [{:keys [root epoch visible]} parent
+        [tx visible] (logical-tx schema visible quads)
+        commit (identity/logical-commit
+                {:format identity/logical-commit-format
+                 :database-id database-id
+                 :epoch (if root (inc epoch) 0)
+                 :parents (if root [root] [])
+                 :tx-root (digest (canonical/transaction-string tx))
+                 :logical-checkpoint-root
+                 (digest (canonical/checkpoint-string (visible-datoms visible)))
+                 :schema-root schema-root
+                 :model-contract-root model-contract-root
+                 :admission-policy-root admission-policy-root})]
+    {:root (digest (identity/logical-commit-string commit))
+     :epoch (:epoch commit)
+     :visible visible
+     :commit commit
+     :tx tx}))
+
+(defn- contract-opts [settings graph]
+  {:graph graph :schema (:schema settings) :digest digest
+   :max-closure (:max-closure settings) :max-work (:max-work settings)})
+
+(defn- project-merge [settings graph cid parents]
+  (when (some (comp nil? :root) parents)
+    (reject! :unsupported-history "a merge parent has no logical history"
+             {:cid cid}))
+  (let [roots (mapv :root parents)
+        result (merge/merge (assoc (contract-opts settings graph)
+                                   :heads roots))]
+    ;; Every physical parent must be a distinct, non-redundant logical head:
+    ;; a merge that names an ancestor (or the same logical commit twice) is
+    ;; not the deterministic merge of its parents.
+    (when-not (and (= :merged (:status result))
+                   (= (count roots) (count (:heads result))))
+      (reject! :merge-mismatch
+               "physical merge commit is not a logical merge of its parents"
+               {:cid cid :result (:status result)}))
+    {:root (:root result)
+     :epoch (:epoch (:commit result))
+     :visible (datoms->visible (:datoms result))
+     :commit (:commit result)
+     :tx (:tx result)
+     :merge result}))
+
+(defn project
+  "Project the physical closure of HEADS into logical commits.
+
+  Returns (a Promise on cljs of)
+  `{:graph {logical-root {:commit :tx}}          ; contract graph
+    :logical {physical-cid {:root :epoch :visible ...}}
+    :infos {physical-cid chain-commit-info}
+    :work n}`.
+  Every merge commit met in the closure is recomputed through the
+  contract's `merge`; a physical merge whose logical commit would not be a
+  merge of its parents is rejected."
+  [get-fn decrypt-fn settings heads]
+  (let [heads (mapv cid-arg! heads)
+        infos (walk-physical get-fn heads (:max-closure settings))
+        kinds (into {} (map (fn [cid] [cid (classify get-fn infos cid)]))
+                    (keys infos))
+        order (topo-order infos)]
+    (then
+     (read-txs get-fn decrypt-fn kinds)
+     (fn [txs]
+       (reduce
+        (fn [{:keys [graph logical work] :as acc} cid]
+          (let [{:keys [kind parent parents]} (get kinds cid)
+                empty-parent {:root nil :epoch -1 :visible {}}]
+            (case kind
+              :carry (assoc-in acc [:logical cid] (get logical parent))
+              :tx
+              (let [entry (project-tx settings
+                                      (if parent (get logical parent) empty-parent)
+                                      (get txs cid))
+                    work (charge work (+ 1 (count (:tx entry))
+                                         (count (:visible entry)))
+                                 (:max-work settings))]
+                (assoc acc
+                       :graph (assoc graph (:root entry)
+                                     (select-keys entry [:commit :tx]))
+                       :logical (assoc logical cid
+                                       (dissoc entry :commit :tx))
+                       :work work))
+              :merge
+              (let [entry (project-merge settings graph cid
+                                         (mapv #(get logical %) parents))]
+                (assoc acc
+                       :graph (assoc graph (:root entry)
+                                     (select-keys entry [:commit :tx]))
+                       :logical (assoc logical cid
+                                       (dissoc entry :commit :tx :merge))
+                       :work (+ work (:work (:merge entry))))))))
+        {:graph {} :logical {} :infos infos :work 0}
+        order)))))
+
+(defn reduce-physical-heads
+  "Discover the sibling heads among CIDS: drop duplicates and every commit
+  that another one already contains (over `prev` and `causes`). This is
+  what a writer does with the commit CIDs `commit-at!`/`merge-at` returned
+  to itself and to other writers: the survivors are the branches a merge
+  must name."
+  [get-fn cids max-closure]
+  (let [cids (vec (sort (distinct (map cid-arg! cids))))
+        closures (into {} (map (fn [c] [c (set (keys (walk-physical get-fn [c] max-closure)))]))
+                       cids)]
+    (vec (remove (fn [c] (some #(and (not= c %) (contains? (get closures %) c)) cids))
+                 cids))))
+
+;; ---------------------------------------------------------------------------
+;; Merge
+
+(defn- physical-for
+  "The canonical-first physical head whose logical commit is ROOT."
+  [projection heads root]
+  (first (sort (filter #(= root (get-in projection [:logical % :root])) heads))))
+
+(defn merge-at
+  "Deterministically merge the physical commits HEADS of DATABASE.
+
+  Writes immutable blocks only (no mutable ref). Returns (a Promise on cljs
+  of) either
+  `{:status :fast-forward :cid c :logical-root r ...}` when one head already
+  contains the others (nothing is written), or
+  `{:status :merged :cid c :logical-root r :logical-commit v2 :tx resolution
+    :conflicts .. :bases [logical-root ..] :heads [physical-cid ..]
+    :logical-heads [logical-root ..] :work n}`.
+
+  The result depends only on the set of heads: argument order and duplicates
+  cannot change `:logical-root` (always) or `:cid` (when `encrypt-fn` and
+  `blind-fn` are deterministic, as content addressing requires)."
+  [get-fn put! database heads opts]
+  (when-not (and (sequential? heads) (seq heads))
+    (reject! :invalid-heads "merge requires at least one head" {:heads heads}))
+  (let [heads (vec (sort (distinct (map cid-arg! heads))))
+        settings (settings database opts)]
+    (when (< identity/max-merge-parents (count heads))
+      (reject! :too-many-parents "merge exceeds max-merge-parents"
+               {:count (count heads) :max identity/max-merge-parents}))
+    (then
+     (project get-fn (:decrypt-fn database) settings heads)
+     (fn [{:keys [graph logical] :as projection}]
+       (let [roots (mapv #(get-in logical [% :root]) heads)
+             _ (when (some nil? roots)
+                 (reject! :unsupported-history "a head has no logical history"
+                          {:heads heads}))
+             result (merge/merge (assoc (contract-opts settings graph)
+                                        :heads roots))
+             work (+ (:work projection) (:work result))]
+         (if (= :fast-forward (:status result))
+           {:status :fast-forward
+            :cid (physical-for projection heads (:root result))
+            :logical-root (:root result)
+            :heads heads
+            :work work}
+           (let [parents (vec (sort (map #(physical-for projection heads %)
+                                         (:heads result))))
+                 db (peer/transact (peer/empty-db)
+                                   (map datom->quad (:datoms result)))]
+             (then
+              (qs/commit! put! db nil qs/current-schema-version
+                          (:blind-fn database) (:encrypt-fn database))
+              (fn [snapshot-cid]
+                (let [cid (chain/commit!
+                           put! get-fn
+                           {"indexed" (ipld/link snapshot-cid)
+                            "novelty-front" nil "novelty-back" nil
+                            "novelty-count" 0}
+                           (first parents)
+                           {:causes (vec (rest parents))})]
+                  {:status :merged
+                   :cid cid
+                   :logical-root (:root result)
+                   :logical-commit (:commit result)
+                   :tx (:tx result)
+                   :datoms (:datoms result)
+                   :conflicts (:conflicts result)
+                   :bases (:bases result)
+                   :heads parents
+                   :logical-heads (:heads result)
+                   :work work}))))))))))
+
+(defn verify-physical
+  "Require the physical visible QUADS read at CID to equal the logical state
+  the projection derived for it. Returns the logical summary."
+  [projection cid quads]
+  (let [{:keys [root epoch visible]} (get-in projection [:logical cid])
+        expected (set (visible-datoms visible))
+        actual (set (map quad->datom quads))]
+    (when-not (= expected actual)
+      (reject! :physical-mismatch
+               "physical state differs from the commit's logical state"
+               {:cid cid :logical-root root
+                :missing (count (remove actual expected))
+                :unexpected (count (remove expected actual))}))
+    {:cid cid
+     :logical-root root
+     :logical-commit (get-in projection [:graph root :commit])
+     :epoch epoch
+     :datoms (vec (sort-by canonical/logical-datom-key expected))}))

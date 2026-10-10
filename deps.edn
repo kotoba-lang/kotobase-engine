@@ -25,7 +25,21 @@
         ;; Hot `index-range` walks arrangement/datalog `:pos` via query-range.
         ;; Peer's own arrangement pin is pre-range; exclude it so this SHA wins.
         io.github.kotoba-lang/arrangement
-        {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}}
+        {:git/sha "9c9f45d4cd043873cd5c5ea65fa3af8a8ead5e6d"}
+        ;; Multi-parent merge commits (kotobase ADR-2610101200). The contract
+        ;; owns the pure merge/state/verify-merge rule and the v1/v2 logical
+        ;; identities; pinned to the merge of kotobase-engine-contract#9.
+        io.github.kotoba-lang/kotobase-engine-contract
+        {:git/url "https://github.com/kotoba-lang/kotobase-engine-contract.git"
+         :git/sha "c13d517dbcfd0944c09695e7161d70a525ff35bb"}
+        ;; A physical merge commit names its other parents in chain's
+        ;; `causes` (prev stays the first canonical parent). kotobase-peer's
+        ;; own chain pin (fa099efd) predates `causes`; this explicit floor wins.
+        ;; Commits written without `causes` keep byte-identical CIDs (chain's
+        ;; own golden test, and merge_test's pinned commit-at! CID).
+        io.github.kotoba-lang/chain
+        {:git/url "https://github.com/kotoba-lang/chain.git"
+         :git/sha "6d0349418c4dc12a75c1983e51e51b8118c23384"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner

@@ -25,3 +25,21 @@ jobs:
       # could not even load -- and with no CI nothing said so.
       - name: cljs facade smoke
         run: nbb --classpath "$(clojure -Spath -M:cljs-test)" test/run.cljs
+
+  # kbb runs the .cljk sources on the Promise facade (the one Worker
+  # deployments run); `clojure -M:test` above finds no .cljk test and reports
+  # "Ran 0 tests". Gated to the namespaces that pass today: the older
+  # engine/datomic-client suites are written against the synchronous JVM
+  # facade and fail under kbb independently of this job.
+  kbb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: kotoba-lang/setup-kbb@19f38b03b81ad038ff3c0393a2c55ebef8889901
+      - name: multi-parent merge (kbb -M:test -n kotobase.engine.merge-test)
+        run: |
+          set -o pipefail
+          kbb -M:test -n kotobase.engine.merge-test 2>&1 | tee kbb-test.log
+          grep -E '^kbb test: [1-9][0-9]* test\(s\), [0-9]+ pass, 0 fail, 0 error' kbb-test.log
+      - name: cljs facade smoke
+        run: kbb test/run.cljk

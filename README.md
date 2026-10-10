@@ -35,6 +35,11 @@ commit; reads verify its blocks and never fall back to the mutable head.
 `commit-at!` appends against an exact basis without reading or publishing a
 mutable ref, so concurrent writers form explicit branches instead of silently
 rebasing.
+`merge-at!` deterministically merges such branches into one multi-parent
+commit (kotobase ADR-2610101200, rule in `kotobase-engine-contract`'s
+`kotobase.engine.merge`); `merge!` does the same with the current ref head and
+advances the ref through the provider's compare-and-set. See
+[Multi-parent merge](#multi-parent-merge).
 `tx-range` exposes committed transaction reports and `listen` /
 `unlisten` provide in-process post-commit listeners. Transactions resolve
 negative tempids, lookup refs and `:db.unique/identity` upserts before
@@ -53,3 +58,40 @@ The JVM facade is synchronous. The ClojureScript facade returns Promises and
 trampolines synchronous IPLD traversal over asynchronous S3/R2/IPFS reads.
 It awaits every immutable block write before publishing the mutable database
 ref.
+
+## Multi-parent merge
+
+Two writers that `commit-at!` on the same basis offline produce sibling
+commits. After exchanging blocks, either writer runs
+
+```clojure
+(engine/merge-at! conn [left right] {:schema {":doc/status" {:db/cardinality :db.cardinality/one}}
+                                     :database-id "tenant/db"})
+```
+
+and both get the same merge commit (argument order and duplicates do not
+matter). `branch-heads` reduces a set of known commit CIDs to the siblings a
+merge must name; `merge!` merges them with the ref head and publishes through
+CAS.
+
+- **Logical identity.** Each physical chain commit is projected, without new
+  bytes, onto a `kotobase.logical-commit/v1` commit (one transaction over its
+  `prev`); a `fold!` commit is logically its `prev`. The merge itself is the
+  contract's `kotobase.logical-commit/v2` commit, recomputed (never trusted)
+  whenever it is read. `logical-projection` returns the contract graph for
+  `kotobase.engine.merge/state`/`verify-merge` and frontier proofs.
+- **Physical commit.** chain `prev` = first canonical parent, chain `causes` =
+  the others; the state is a fresh indexed snapshot of the merged Datoms, so
+  `q`/`pull`/`datoms`/`entity` read through the unchanged peer path. Commits
+  without `causes` keep byte-identical CIDs.
+- **Reading through a merge.** `verify-at` recomputes every merge in the
+  ancestry and checks the physical state against the contract state; call it
+  before trusting a merge you did not compute.
+- **Settings are identity.** `:schema` (keyed by stored attribute strings),
+  `:database-id`, `:model-contract-root` and `:admission-policy-root` are part
+  of every logical commit; converging writers must agree on them.
+  `:max-closure`/`:max-work` bound the walk and replay and fail closed.
+- **Limits.** `tx-range`/`since`/`history`/`as-of` follow the `prev`
+  (first-parent) lineage; the full cross-branch history is the logical graph.
+  The physical merge CID equals across writers only with deterministic
+  `encrypt-fn`/`blind-fn`; the logical root always does.
