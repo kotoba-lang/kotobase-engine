@@ -36,18 +36,21 @@
   state is a fresh indexed snapshot of the merged visible datoms plus the
   union of the parents' materialized views, re-derived over it.
 
-  **Trust (read side).** A merge commit carries the state marker
-  `merge-marker` (`\"merge\"`). kotobase-peer's `commit!` copies unknown state
-  keys, so every linear descendant of a merge carries it too, until a
-  `fold!` (which rebuilds state) drops it. A reader therefore knows from the
-  one state block it fetches anyway whether the snapshot it reads can come
-  from a merge (`merge-origin?`): a commit with `causes` or with the marker.
-  Only then does it look further, walking `prev` to the nearest merge commit
-  and verifying that merge once (`verify-merge-commit`: contract recompute,
-  physical quads, materialized views, stored schema). A merge-free history
-  is read exactly as before, at no extra cost. The facade refuses to write
-  on top of, or fold, an unverified merge, so honest descendants never
-  launder one.
+  **Trust (read side).** A merge commit writes the state marker
+  `merge-marker` (`\"merge\"`) = `{policy, parents}`. kotobase-peer's
+  `commit!` copies unknown state keys (and `indexed`/`views` unchanged), so
+  every linear descendant of a merge carries the same marker, snapshot and
+  views until a `fold!` rebuilds the state and drops it. The snapshot a
+  descendant reads is therefore exactly its merge's snapshot, identified
+  without walking history by `origin`: `{parents indexed views}`. A reader
+  verifies that origin once (`verify-origin`: contract merge of the parents,
+  snapshot quads, views re-derived over the merged state, stored schema)
+  and caches it by origin, so every later head on the same snapshot costs
+  nothing. A merge-free history has no origin and is read exactly as
+  before. The facade's writers (`transact!`, `commit-at!`, `fold!`,
+  including the CAS retries) refuse an unverified origin, so honest writers
+  never launder one; a `fold!` of a verified origin produces a linear
+  snapshot of verified state.
 
   **Budget.** `:max-closure` bounds commits walked; `:max-work` is one budget
   for the whole call: projection (charged before each transaction block is
@@ -211,30 +214,29 @@
   "State key every merge commit writes and its linear descendants inherit."
   "merge")
 
-(defn merge-origin?
-  "Whether the snapshot read at chain commit INFO can come from a merge:
-  INFO is a merge, or a linear descendant of one (inherited marker)."
+(defn origin
+  "The merge a commit's snapshot comes from, read from INFO (its own chain
+  block) alone: nil for a merge-free snapshot, else
+  `{:parents [cid ..] :indexed cid :views cid-or-nil :marker m :merge? b}`.
+  For a merge commit the parents are its chain parents (and the marker must
+  name the same); for a descendant they come from the inherited marker."
   [info]
-  (boolean (or (seq (:causes info))
-               (contains? (normalize-state (:state info)) merge-marker))))
+  (let [state (normalize-state (:state info))
+        marker (get state merge-marker)
+        merge? (boolean (seq (:causes info)))]
+    (when (or merge? marker)
+      {:parents (if merge?
+                  (vec (chain/causal-parents info))
+                  (vec (get marker "parents")))
+       :indexed (some-> (get state "indexed") ipld/link-cid)
+       :views (some-> (get state "views") ipld/link-cid)
+       :marker marker
+       :merge? merge?})))
 
-(defn nearest-merge
-  "The merge commit whose snapshot CID's state descends from: CID itself if
-  it has `causes`, else the first one on its `prev` lineage while the marker
-  is inherited. nil when the marker lineage ends without one (the snapshot
-  then comes from a fold and is read on the linear trust model). Bounded by
-  MAX-CLOSURE; only ever walked for merge-origin commits."
-  [get-fn cid max-closure]
-  (loop [cid cid n 0]
-    (when cid
-      (when (<= max-closure n)
-        (reject! :closure-too-large "merge lineage exceeds max-closure"
-                 {:max-closure max-closure}))
-      (let [info (chain/commit-info get-fn cid)]
-        (cond
-          (seq (:causes info)) cid
-          (merge-origin? info) (recur (:prev info) (inc n))
-          :else nil)))))
+(defn merge-origin?
+  "Whether the snapshot read at chain commit INFO can come from a merge."
+  [info]
+  (some? (origin info)))
 
 (defn settings-key
   "Identity of the settings a verification was done under."
@@ -246,12 +248,18 @@
 (defn first-parent-merge
   "The first commit with `causes` on the `prev` lineage of CID, or nil. Log
   readers (`tx-range`, `since`, `history`, `as-of`) follow `prev` only and
-  must not silently drop the other parents' transactions."
-  [get-fn cid]
-  (loop [cid cid]
-    (when cid
-      (let [{:keys [prev causes]} (chain/commit-info get-fn cid)]
-        (if (seq causes) cid (recur prev))))))
+  must not silently drop the other parents' transactions. The walk stops
+  below MIN-SEQ (commits whose `seq` < MIN-SEQ cannot affect the reader's
+  range), so a reader near the head pays for its range only."
+  ([get-fn cid] (first-parent-merge get-fn cid 0))
+  ([get-fn cid min-seq]
+   (loop [cid cid]
+     (when cid
+       (let [{:keys [prev causes] seq-num :seq} (chain/commit-info get-fn cid)]
+         (cond
+           (< (long (or seq-num 0)) (long min-seq)) nil
+           (seq causes) cid
+           :else (recur prev)))))))
 
 (defn- topo-order
   "Physical CIDs, every parent before its children (deterministic)."
@@ -596,28 +604,34 @@
                  {:attribute ident :stored {:cardinality cardinality :unique unique}
                   :declared decl})))))
 
+(def ^:private schema-attributes
+  #{":db/ident" ":db/cardinality" ":db/unique"})
+
 (defn serial-patterns
   "The `[s p o]` read patterns (nil = wildcard) whose visible datoms at the
   basis decide whether QUADS are serial-valid: the current values of every
   asserted cardinality-one `[e a]`, the holders of every asserted unique
-  `[a v]`, and the entities a retractEntity removes. Empty when the
-  transaction asserts no cardinality-one or unique attribute."
+  `[a v]`, the whole schema entity of every schema datom the transaction
+  touches (so an ident and its cardinality written in separate transactions
+  are still cross-checked), and the entities a retractEntity removes. Empty
+  when none of these apply."
   [schema quads]
-  (let [relevant (filter (fn [{:keys [p op]}]
-                           (and (nil? op)
-                                (or (cardinality-one? schema p) (unique? schema p))))
-                         quads)]
-    (if (empty? relevant)
+  (let [asserts (filter #(nil? (:op %)) quads)
+        value-patterns (mapcat (fn [{:keys [s p o]}]
+                                 (cond-> []
+                                   (cardinality-one? schema p) (conj [s p nil])
+                                   (unique? schema p) (conj [nil p o])))
+                               asserts)
+        schema-patterns (for [{:keys [s p]} quads
+                              :when (contains? schema-attributes p)]
+                          [s nil nil])
+        patterns (concat value-patterns schema-patterns)]
+    (if (empty? patterns)
       []
       (vec (distinct
-            (concat
-             (mapcat (fn [{:keys [s p o]}]
-                       (cond-> []
-                         (cardinality-one? schema p) (conj [s p nil])
-                         (unique? schema p) (conj [nil p o])))
-                     relevant)
-             (for [{:keys [s op]} quads :when (= :retract-entity op)]
-               [s nil nil])))))))
+            (concat patterns
+                    (for [{:keys [s op]} quads :when (= :retract-entity op)]
+                      [s nil nil])))))))
 
 (defn check-serial!
   "Reject QUADS (one transaction, kotobase-peer quad form) unless it is valid
@@ -686,47 +700,76 @@
             (fn [link] [link work]))
       [nil work])))
 
-(defn verify-merge-commit
-  "Verify merge commit CID as written by `merge-at`: recompute it through the
-  contract (PROJECTION of its closure), and require its physical quads
-  (QUADS), its merge marker, the union of its parents' views re-derived over
-  the merged state, and the schema stored in the merged state to match.
-  Returns the logical summary (Promise on cljs)."
-  [get-fn database settings projection cid quads]
-  (let [summary (verify-physical projection cid quads)
-        info (get-in projection [:infos cid])
-        state (normalize-state (:state info))
-        parents (chain/causal-parents info)
-        datoms (:datoms summary)]
-    (when-not (contains? state merge-marker)
-      (reject! :physical-mismatch "merge commit lacks the merge marker"
-               {:cid cid}))
-    (check-stored-schema! (:schema settings) datoms)
-    (then
-     (all (map #(views-of get-fn (:decrypt-fn database) (:infos projection) %)
-               parents))
-     (fn [specs]
-       (let [union (union-views parents specs)
-             db (peer/transact (peer/empty-db) (map datom->quad datoms))
-             _ (charge (:work projection) (* (count datoms) (count union))
-                       (:max-work settings))
-             expected (into {} (map (fn [[k spec]]
-                                      [k {"spec" spec
-                                          "rows" (#'peer/derive-view-rows db spec)}]))
-                            union)]
-         (then
-          (if-let [link (get state "views")]
-            (read-views-block get-fn (ipld/link-cid link) (:decrypt-fn database))
-            {})
-          (fn [actual]
-            (when-not (= expected (or actual {}))
-              (reject! :physical-mismatch
-                       "merge commit's materialized views differ from its merged state"
-                       {:cid cid}))
-            summary)))))))
-
 ;; ---------------------------------------------------------------------------
 ;; Merge
+
+(defn verify-origin
+  "Verify a merge snapshot ORIGIN (see `origin`) as `merge-at` writes it:
+  - the marker is `{policy, parents}` naming exactly ORIGIN's parents, which
+    are distinct and in the admissible physical order;
+  - the parents' logical commits merge (contract) without fast-forward;
+  - SNAPSHOT-QUADS (the quads of ORIGIN's indexed snapshot alone) equal the
+    merged datoms;
+  - ORIGIN's views block equals the union of the parents' views re-derived
+    over the merged state;
+  - the settings' schema agrees with the schema stored in the merged state.
+  Returns the merge summary (Promise on cljs)."
+  [get-fn database settings origin snapshot-quads]
+  (let [{:keys [parents marker]} origin]
+    (when-not (and (= marker {"policy" identity/merge-policy "parents" parents})
+                   (<= 2 (count parents))
+                   (= (count parents) (count (distinct parents))))
+      (reject! :physical-mismatch "merge snapshot has no valid merge marker"
+               {:parents parents}))
+    (then
+     (project get-fn (:decrypt-fn database) settings parents)
+     (fn [{:keys [graph logical infos work] :as projection}]
+       (when-not (= parents (physical-parent-order infos parents))
+         (reject! :merge-mismatch "merge parents are not in canonical order"
+                  {:parents parents}))
+       (let [roots (mapv #(get-in logical [% :root]) parents)
+             _ (when (some nil? roots)
+                 (reject! :unsupported-history "a merge parent has no logical history"
+                          {:parents parents}))
+             result (contract-merge settings graph roots work)
+             _ (when-not (and (= :merged (:status result))
+                              (= (count roots) (count (:heads result))))
+                 (reject! :merge-mismatch
+                          "merge snapshot is not a logical merge of its parents"
+                          {:parents parents}))
+             datoms (:datoms result)
+             expected (set (map #(select-keys % [:e :a :v]) datoms))
+             actual (set (map quad->datom snapshot-quads))
+             work (charge (:work result) (count actual) (:max-work settings))]
+         (when-not (= expected actual)
+           (reject! :physical-mismatch
+                    "merge snapshot differs from the merge of its parents"
+                    {:parents parents :missing (count (remove actual expected))
+                     :unexpected (count (remove expected actual))}))
+         (check-stored-schema! (:schema settings) datoms)
+         (then
+          (all (map #(views-of get-fn (:decrypt-fn database) infos %) parents))
+          (fn [specs]
+            (let [union (union-views parents specs)
+                  db (peer/transact (peer/empty-db) (map datom->quad datoms))
+                  _ (charge work (* (count datoms) (count union)) (:max-work settings))
+                  wanted (into {} (map (fn [[k spec]]
+                                         [k {"spec" spec
+                                             "rows" (#'peer/derive-view-rows db spec)}]))
+                               union)]
+              (then
+               (if-let [v (:views origin)]
+                 (read-views-block get-fn v (:decrypt-fn database))
+                 {})
+               (fn [stored]
+                 (when-not (= wanted (or stored {}))
+                   (reject! :physical-mismatch
+                            "merge snapshot's materialized views differ from its merged state"
+                            {:parents parents}))
+                 {:logical-root (:root result)
+                  :logical-commit (:commit result)
+                  :datoms (vec (sort-by canonical/logical-datom-key datoms))
+                  :work work}))))))))))
 
 (defn- physical-for
   "The physical head carrying logical ROOT: PREFER when it does, else the
@@ -856,7 +899,8 @@
              (then
               (write-snapshot! get-fn put! database infos parents parents
                                (:datoms result)
-                               {merge-marker {"policy" identity/merge-policy}}
+                               {merge-marker {"policy" identity/merge-policy
+                                              "parents" parents}}
                                (:work result) max-work)
               (fn [[cid work]]
                 (assoc base

@@ -118,44 +118,60 @@ databases on the Promise facade.
     change data. One view name with different specs is refused
     (`:incompatible-views`). A view removed on one branch only is kept.
 - **Trust model for reads (no cost without merges).**
-  - Every merge commit writes a `"merge"` marker into its state.
-    kotobase-peer's `commit!` copies unknown state keys, so the merge's
-    linear descendants inherit the marker until a `fold!` rebuilds the state.
-  - Before hydrating, a read looks at the head block it fetches anyway.
-    - If the head has neither `causes` nor the marker, nothing comes from a
-      merge, so the read proceeds exactly as on `main`, with no extra fetch
-      and no closure bound. Measured on 300 transactions plus a `fold!`, a
-      fresh connection's first read makes 321 block requests in about 1.3 s
-      on `main` and on this branch, with or without `:merge` settings.
-    - Otherwise the reader walks `prev` to the nearest merge commit and
-      verifies that merge once per process and per settings. Verification
-      recomputes the merge through the contract and checks the physical
-      quads, the merge marker, the views re-derived from the merged state,
-      and the stored schema. The cache is process-wide, so a Worker that
-      opens a connection per request verifies a merge once per isolate.
+  - Every merge commit writes a `"merge"` marker `{policy, parents}` into its
+    state. kotobase-peer's `commit!` copies unknown state keys, and leaves
+    `indexed` and `views` unchanged. So every linear descendant of a merge
+    reads exactly that merge's snapshot and carries its marker, until a
+    `fold!` rebuilds the state.
+  - A read looks only at the head block it fetches anyway.
+    - If the head has neither `causes` nor the marker, the read is the same
+      as on `main`: no extra fetch, no closure bound.
+    - Otherwise the head names its merge snapshot (`{parents indexed views}`).
+      The snapshot is verified once: the contract merge of the parents, the
+      snapshot's quads, its views re-derived from the merged state, and the
+      stored schema. The result is cached by snapshot, not by head, so
+      every later head on that snapshot costs nothing extra and no history
+      is walked. Measured with 150 transactions after a merge:
+      | read | block requests |
+      |---|---|
+      | merge-free control | 163 |
+      | first read through the merge | 176 |
+      | next head | 164 |
+      | `transact!` | 3 (control: 2) |
+  - The cache is process-wide and bounded. It is scoped by key material:
+    `open`'s `:trust-scope` (for example a key id, so per-request
+    connections share it), defaulting to the `decrypt-fn` object.
   - Without `:merge` settings, reading or writing through a merge is
     refused (`:unverified-merge`).
   - Writers enforce the same rule. `transact!`, `commit-at!` and `fold!`
-    refuse to build on an unverified merge, so honest descendants never
-    launder one. A `fold!` would drop the marker, so it is guarded too.
+    refuse to build on an unverified snapshot, and that includes the head
+    returned by kotobase-peer's internal CAS retry in `fold!`. So honest
+    writers never launder a forged merge into an unmarked (linear-trust)
+    snapshot.
   - **Residual.** A commit with neither `causes` nor the marker is read on
     the linear trust model kotobase-peer always had: its CID-verified
     snapshot is trusted. That covers a forged linear commit, a forged
     `fold!`, and a child that an older, unguarded writer put on a forged
-    merge without the marker. All of these equal an attacker forging the
-    child directly. Two known gaps: `fold!` guards only the head it starts
-    from, while kotobase-peer's internal CAS retry may fold a newer head;
-    and a fast-forward returned by the immutable `merge-at!` is checked for
-    quads but not for views.
+    merge without a valid marker; each equals forging the child directly. A
+    fast-forward returned by the immutable `merge-at!` is checked for quads
+    but not for views. kotobase-peer's `rebase-fold!` over a merge snapshot
+    keeps the marker but changes the snapshot, so reads of it fail closed.
 - **Write-time checks with `:merge` settings.** `transact!` and
   `commit-at!` refuse a transaction that is not serial-valid for the merge
-  schema (`:schema-violation`). They hydrate the basis only when the
-  transaction asserts a cardinality-one or unique attribute. They also
-  refuse schema datoms in the transaction that contradict the settings
-  (`:schema-mismatch`). Merging and merge verification cross-check the
-  settings against the schema datoms stored in the heads' state, in the
-  `kotobase.datomic` form (`[e ":db/ident" a]`, `[e ":db/cardinality" ..]`,
-  `[e ":db/unique" ..]`).
+  schema (`:schema-violation`). The check uses point lookups only
+  (`[e a]`, `[a v]`, and the schema entity of any schema datom touched)
+  through kotobase-peer's range-pruned snapshot index plus its novelty
+  backlog, never a full hydrate. Writing one cardinality-one datom to a
+  folded 300-datom database takes 7 block requests against 1 without
+  `:merge`. With an unfolded backlog of 300 it takes 325, which is the
+  backlog scan a read also pays: the pinned kotobase-peer cannot prune
+  novelty. Those writes are no longer byte-identical to a connection
+  without `:merge`, because the check can refuse them. Schema datoms that
+  contradict the settings are refused (`:schema-mismatch`), including an
+  ident and its cardinality written in separate transactions. Merging and
+  merge verification cross-check the settings against the schema datoms
+  stored in the heads' state, in the `kotobase.datomic` form
+  (`[e ":db/ident" a]`, `[e ":db/cardinality" ..]`, `[e ":db/unique" ..]`).
 - **The ref only moves forward.** `merge!` keeps the current head when the
   merge is logically that head: an ancestor, a pre-`fold!` commit, or a
   forged look-alike. For a fast-forward to a logical descendant T it writes
@@ -165,9 +181,10 @@ databases on the Promise facade.
   keeps the fold's compaction and views on a branch from before a `fold!`,
   and never publishes a snapshot or view block forged on T.
 - **Log readers do not span merges.** `tx-range`, `since`, `history` and
-  `as-of` follow `prev` only. Through a merge they reject with
-  `:history-spans-merge` instead of dropping the other parents'
-  transactions. Cross-branch history is the logical graph.
+  `as-of` follow `prev` only. When their range reaches a merge they reject
+  with `:history-spans-merge` instead of dropping the other parents'
+  transactions. A range that starts above the latest merge is served, and
+  only the lineage the range reaches is checked. Cross-branch history is the logical graph.
 - **One budget.** `:max-closure` bounds commits walked. `:max-work` is one
   budget for the whole call. It covers the projection (charged before
   transaction blocks are fetched), retractEntity expansion, checkpoints and

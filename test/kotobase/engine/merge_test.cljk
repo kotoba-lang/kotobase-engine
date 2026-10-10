@@ -78,7 +78,8 @@
   ;; The chain pin that adds `causes` keeps every v1 CID (golden values
   ;; computed with the previous dependency set).
   (async done
-    (let [conn (open (memory/memory-store))]
+    ;; A connection without :merge settings writes exactly the old bytes.
+    (let [conn (open (memory/memory-store) {})]
       (-> (engine/commit-at! conn nil [["root" "value" "1"]])
           (.then (fn [g]
                    (is (= "bafyreiaavacsm5nftemscicen5xwabeasqje7fusxjz2bj2v7fgv4gjaiy" g))
