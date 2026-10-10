@@ -18,7 +18,8 @@
 (defn open
   [{:keys [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
            tx-functions]
-    :or {ref-name "main" max-retries 16 tx-functions {}}}]
+    :or {ref-name "main" tx-functions {}}
+    :as opts}]
   (storage/validate-backend! storage)
   (doseq [[control value]
           [[:encrypt-fn encrypt-fn] [:decrypt-fn decrypt-fn]
@@ -30,8 +31,18 @@
   (when-not (every? ifn? (vals tx-functions))
     (throw (ex-info "Every transaction function must be callable"
                     {:type :kotobase.datomic/invalid-tx-functions})))
-  (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
-              max-retries tx-functions (atom {})))
+  (when (contains? opts :merge)
+    ;; Merge commits are written and verified on the Promise facade only; a
+    ;; JVM connection configured for them would read merges unverified.
+    (throw (ex-info ":merge is not supported on the JVM facade"
+                    {:type :kotobase.engine/unsupported-platform})))
+  (let [max-retries (if (nil? max-retries) 16 max-retries)]
+    (when-not (and (integer? max-retries) (not (neg? max-retries)))
+      (throw (ex-info ":max-retries must be a non-negative integer"
+                      {:type :kotobase.engine/invalid-option
+                       :max-retries max-retries})))
+    (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
+                max-retries tx-functions (atom {}))))
 
 (defn head [^Database database]
   (if (instance? Db database)
@@ -307,3 +318,23 @@
       (let [conn (connection database)
             {:keys [get-fn]} (storage/ports (:storage conn))]
         (peer/view-rows get-fn current view-name (:visible? conn) (:decrypt-fn conn))))))
+
+;; ---------------------------------------------------------------------------
+;; Multi-parent merge (kotobase ADR-2610101200) is implemented and tested on
+;; the Promise facade only (engine.cljs.cljk, run by kbb). These JVM entry
+;; points exist for API symmetry and refuse: the kotoba dependency tree no
+;; longer loads on the JVM, so an implementation here could not be tested.
+;; JVM reads do not verify merge commits either; read through merges on the
+;; Promise facade.
+
+(defn- unsupported [fn-name]
+  (throw (ex-info (str fn-name " is not supported on the JVM facade; "
+                       "use the Promise facade (kotobase.engine on cljs)")
+                  {:type :kotobase.engine/unsupported-platform
+                   :fn fn-name})))
+
+(defn merge-at! [& _] (unsupported "merge-at!"))
+(defn merge! [& _] (unsupported "merge!"))
+(defn branch-heads [& _] (unsupported "branch-heads"))
+(defn logical-projection [& _] (unsupported "logical-projection"))
+(defn verify-at [& _] (unsupported "verify-at"))
