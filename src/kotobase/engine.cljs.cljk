@@ -4,6 +4,7 @@
             [arrangement.query :as kqe]
             [cljs.reader :as reader]
             [kotobase-peer.core :as peer]
+            [ipld.core :as ipld]
             [kotobase.engine.logical :as logical]
             [kotobase.engine.merge :as contract]
             [kotobase.storage.core :as storage]))
@@ -39,10 +40,20 @@
                        :max-retries max-retries})))
     ;; `:merge` = the merge settings (`kotobase.engine.logical/settings`) this
     ;; connection uses to merge and to verify reads through merge commits.
-    (when merge (logical/settings merge))
+    (when merge
+      (logical/settings merge)
+      ;; Verified merge snapshots are cached per :trust-scope across
+      ;; connections. A default tied to the decrypt-fn object would make
+      ;; per-request connections (fresh closures) re-verify every read, so
+      ;; the scope is required and must name the key material.
+      (when-not (or (and (string? trust-scope) (seq trust-scope))
+                    (keyword? trust-scope))
+        (throw (ex-info ":merge requires :trust-scope (a string or keyword naming the key material, e.g. a key id)"
+                        {:type :kotobase.engine/invalid-option
+                         :option :trust-scope :value trust-scope}))))
     (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
                 max-retries tx-functions (atom {}) merge
-                (or trust-scope decrypt-fn))))
+                (some-> trust-scope str))))
 
 (defn head [database]
   (if (instance? Db database)
@@ -201,30 +212,12 @@
             (swap! checks assoc basis p)
             p)))))
 
-(defn- commit-tx! [database put! get-fn tx-data basis]
-  (peer/commit! put! get-fn tx-data basis (:encrypt-fn database)))
-
-(defn- check-serial-once
-  "`check-serial` memoized per basis for one write: a `with-blocks` restart
-  (block miss while committing) must not repeat the lookups."
-  [database tx-data]
-  (let [checks (atom {})]
-    (fn [basis]
-      (or (get @checks basis)
-          (let [p (check-serial database basis tx-data)]
-            (swap! checks assoc basis p)
-            p)))))
-
 (defn- commit-tx!
-  "kotobase-peer `commit!`. A connection with `:merge` settings also writes
-  the keyed subject/attribute tokens on the novelty entry (kotobase-peer's
-  6-arity), so the serial-validity point lookups of later transactions skip
-  unrelated novelty blocks. Without `:merge` the bytes are exactly the
-  pre-existing ones."
+  "kotobase-peer `commit!`, byte-identical for every connection. (Keyed
+  novelty tokens are not written: the pinned kotobase-peer never reads them,
+  so they would only add bytes per write.)"
   [database put! get-fn tx-data basis]
-  (if (:merge-settings database)
-    (peer/commit! put! get-fn tx-data basis (:encrypt-fn database) (:blind-fn database))
-    (peer/commit! put! get-fn tx-data basis (:encrypt-fn database))))
+  (peer/commit! put! get-fn tx-data basis (:encrypt-fn database)))
 
 (defn transact!
   "Append TX-DATA to the ref head through the provider's compare-and-set,
@@ -688,35 +681,48 @@
 ;; Verified merge snapshots, keyed by the settings they were verified under
 ;; and by the snapshot itself ({parents indexed views}); never by head CID,
 ;; so every linear head on a verified snapshot is trusted with zero extra
-;; work. Process-wide and scoped by key material: `open`'s `:trust-scope`
-;; (e.g. a key id, so a Worker opening a connection per request verifies a
-;; snapshot once per isolate), defaulting to the `decrypt-fn` object, so a
-;; connection with other keys never inherits another's verification.
-;; Bounded: at most `max-trust-scopes` scopes and `max-trusted` snapshots
-;; each (a full table is cleared).
-(defonce ^:private trust-scopes (atom {}))
+;; work. Process-wide, scoped by `open`'s required `:trust-scope` (a string
+;; naming the key material, e.g. a key id), so per-request connections share
+;; one verification while connections with other keys verify for
+;; themselves. Only strings are held: no decrypt-fn closure is retained.
+;; LRU-bounded at both levels: `max-trust-scopes` scopes and `max-trusted`
+;; snapshots per scope (least recently used evicted, nothing else cleared).
+;; Concurrent verifications of one snapshot in one scope share a promise.
+(defonce ^:private trust-table (js/Map.))
+(defonce ^:private in-flight (js/Map.))
 (def ^:private max-trust-scopes 64)
 (def ^:private max-trusted 4096)
 
-(defn- trust-set [conn]
-  (let [k (:trust-scope conn)]
-    (or (get @trust-scopes k)
-        (let [a (atom #{})]
-          (swap! trust-scopes
-                 (fn [m] (assoc (if (<= max-trust-scopes (count m)) {} m) k a)))
-          a))))
+(defn- lru-touch!
+  "Move K to the most-recent end of JS Map M (setting V); evict the oldest
+  entries beyond CAP."
+  [m k v cap]
+  (.delete m k)
+  (.set m k v)
+  (while (< cap (.-size m))
+    (.delete m (.-value (.next (.keys m))))))
+
+(defn- scope-table [conn]
+  (let [scope (:trust-scope conn)
+        t (or (.get trust-table scope) (js/Map.))]
+    (lru-touch! trust-table scope t max-trust-scopes)
+    t))
 
 (defn- trust-key [conn origin]
   (when-let [s (settings-of conn)]
-    [(logical/settings-key s) (select-keys origin [:parents :indexed :views])]))
+    (str (logical/settings-key s) "|"
+         (pr-str (mapv #(get origin %) [:parents :indexed :views])))))
 
 (defn- trusted? [conn origin]
-  (contains? @(trust-set conn) (trust-key conn origin)))
+  (when-let [k (trust-key conn origin)]
+    (let [t (scope-table conn)]
+      (when (.has t k)
+        (lru-touch! t k true max-trusted)
+        true))))
 
 (defn- trust! [conn origin]
   (when-let [k (trust-key conn origin)]
-    (swap! (trust-set conn)
-           (fn [s] (conj (if (<= max-trusted (count s)) #{} s) k)))))
+    (lru-touch! (scope-table conn) k true max-trusted)))
 
 (defn- guard!
   "Synchronous, inside `with-blocks`: throw the needs-verify signal when
@@ -728,6 +734,12 @@
   (when cid
     (let [conn (connection conn)]
       (when-let [origin (logical/origin (peer/head get-fn cid))]
+        (when (and (:merge? origin) (:novelty? origin))
+          ;; merge-at never writes pending transactions on a merge commit;
+          ;; a snapshot key match must not lend them its trust.
+          (throw (ex-info "merge commit carries pending transactions"
+                          {:type :kotobase.merge/rejected :problem :physical-mismatch
+                           :cid cid})))
         (when-not (trusted? conn origin)
           (throw (ex-info "merge origin needs verification"
                           {:kotobase.engine/needs-verify cid})))))))
@@ -750,32 +762,40 @@
       (logical/project get-fn (:decrypt-fn conn) settings heads))))
 
 (defn- verify-snapshot*
-  "Verify the merge snapshot CID reads (`logical/verify-origin`). Reads the
-  snapshot's indexed quads directly (novelty above it is not part of it).
-  Resolves to [origin summary]."
-  [conn settings cid]
+  "Verify the merge snapshot ORIGIN (read at CID): `logical/verify-origin`
+  (contract merge of the parents, snapshot quads, views, stored schema),
+  then every covering index and leaf key of the snapshot
+  (`logical/verify-snapshot-indexes`). Resolves to the summary."
+  [conn settings origin]
   (let [backend (:storage conn)
         fetch1 (async-get-fn backend)]
-    (-> (at-basis conn #(logical/origin (peer/head % cid)))
-        (.then
-         (fn [origin]
-           (-> (with-blocks
-                 backend
-                 (fn [get-fn _put! _cas!]
-                   (peer/hydrate-db-cached get-fn (:indexed origin)
-                                           (:blind-fn conn) (:decrypt-fn conn)
-                                           nil nil fetch1)))
-               (.then (fn [db]
-                        (let [quads (peer/q db [nil nil nil] (constantly true))]
-                          (with-blocks
-                            backend
-                            (fn [get-fn _put! _cas!]
-                              (logical/verify-origin get-fn conn settings origin quads))))))
-               (.then (fn [summary] [origin summary]))))))))
+    (when (and (:merge? origin) (:novelty? origin))
+      (logical/reject! :physical-mismatch "merge commit carries pending transactions" {}))
+    (-> (with-blocks
+          backend
+          (fn [get-fn _put! _cas!]
+            (peer/hydrate-db-cached get-fn (:indexed origin)
+                                    (:blind-fn conn) (:decrypt-fn conn)
+                                    nil nil fetch1)))
+        (.then (fn [db]
+                 (let [quads (peer/q db [nil nil nil] (constantly true))]
+                   (with-blocks
+                     backend
+                     (fn [get-fn _put! _cas!]
+                       (logical/verify-origin get-fn conn settings origin quads))))))
+        (.then (fn [summary]
+                 (-> (logical/verify-snapshot-indexes fetch1 (:indexed origin)
+                                                      (:datoms summary)
+                                                      (:blind-fn conn) (:decrypt-fn conn))
+                     (.then (fn [_] summary))))))))
+
+(defn- origin-at [conn cid]
+  (at-basis conn #(logical/origin (peer/head % cid))))
 
 (defn- verify-origin!
-  "Verify CID's merge snapshot once per process, settings and keys. Without
-  `:merge` settings the read or write is refused (`:unverified-merge`)."
+  "Verify CID's merge snapshot once per process, settings and trust scope;
+  concurrent callers share the in-flight verification. Without `:merge`
+  settings the read or write is refused (`:unverified-merge`)."
   [conn cid]
   (let [conn (connection conn)
         settings (settings-of conn)]
@@ -783,8 +803,19 @@
       (js/Promise.reject
        (ex-info "reading or writing through a merge commit requires the connection's :merge settings"
                 {:type :kotobase.merge/rejected :problem :unverified-merge :cid cid}))
-      (-> (verify-snapshot* conn settings cid)
-          (.then (fn [[origin _]] (trust! conn origin)))))))
+      (-> (origin-at conn cid)
+          (.then
+           (fn [origin]
+             (let [k (str (:trust-scope conn) "\u0000" (trust-key conn origin))]
+               (cond
+                 (trusted? conn origin) nil
+                 (.has in-flight k) (.get in-flight k)
+                 :else
+                 (let [p (-> (verify-snapshot* conn settings origin)
+                             (.then (fn [_] (trust! conn origin) nil))
+                             (.finally (fn [] (.delete in-flight k))))]
+                   (.set in-flight k p)
+                   p)))))))))
 
 (def ^:private max-verifications 8)
 
@@ -831,7 +862,17 @@
               (with-blocks
                 (:storage conn)
                 (fn [get-fn _put! _cas!]
-                  (-> (js/Promise.all (into-array (map #(lookup get-fn %) patterns)))
+                  ;; A blind-fn that does not match the snapshot's keys would
+                  ;; make every lookup silently empty: fail closed instead.
+                  ;; Both start synchronously (lookups first), so a block-miss
+                  ;; restart of this function does not repeat the probe late.
+                  (-> (let [lookups (into-array (map #(lookup get-fn %) patterns))
+                            probe (logical/check-blinding
+                                   fetch1 (some-> (get (peer/head get-fn basis) :state)
+                                                  (get "indexed") ipld/link-cid)
+                                   (:blind-fn conn) (:decrypt-fn conn))]
+                        (-> (js/Promise.all #js [(js/Promise.all lookups) probe])
+                            (.then (fn [[rows _]] rows))))
                       (.then (fn [rows]
                                (into #{}
                                      (map (fn [{:keys [e a v_edn]}]
@@ -968,7 +1009,9 @@
   recomputed through the contract, every linear transaction is checked
   against the schema, and the physical state read at CID must equal the
   contract's logical state there. When CID reads a merge snapshot, that
-  snapshot (marker, quads, views, stored schema) is verified too. Resolves
+  snapshot (marker, quads, views, stored schema, all four covering indexes
+  and their blinded keys) is verified too. Pending transactions on CID are
+  covered by the projection's physical comparison. Resolves
   to `{:cid :logical-root :logical-commit :epoch :datoms}`."
   ([database cid] (verify-at database cid {}))
   ([database cid opts]
@@ -983,8 +1026,9 @@
             (let [summary (logical/verify-physical projection cid quads)]
               (if-not origin
                 summary
-                (-> (verify-snapshot* conn settings cid)
-                    (.then (fn [[origin _]]
-                             (when (= (merge-opts conn opts) (:merge-settings conn))
+                (-> (verify-snapshot* conn settings origin)
+                    (.then (fn [_]
+                             (when (and (:trust-scope conn)
+                                        (= (merge-opts conn opts) (:merge-settings conn)))
                                (trust! conn origin))
                              summary)))))))))))

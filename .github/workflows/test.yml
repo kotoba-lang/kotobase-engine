@@ -41,7 +41,7 @@ jobs:
           set -o pipefail
           kbb -M:test -n kotobase.engine.merge-test \
             -n kotobase.engine.merge-r2-test -n kotobase.engine.merge-perf-test \
-            -n kotobase.engine.merge-adversarial-test -n kotobase.engine.merge-r3-test 2>&1 | tee kbb-test.log
+            -n kotobase.engine.merge-adversarial-test -n kotobase.engine.merge-r3-test -n kotobase.engine.merge-r4-test 2>&1 | tee kbb-test.log
           grep -E '^kbb test: [1-9][0-9]* test\(s\), [0-9]+ pass, 0 fail, 0 error' kbb-test.log
       - name: cljs facade smoke
         run: kbb test/run.cljk

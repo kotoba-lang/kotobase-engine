@@ -25,7 +25,7 @@
                         :decrypt-fn #(js/Promise.resolve %)
                         :blind-fn #(js/Promise.resolve (pr-str %))
                         :visible? (constantly true)}
-                 merge-settings (assoc :merge merge-settings))))
+                 merge-settings (assoc :merge merge-settings :trust-scope "perf"))))
 
 (defn- fresh-read [inner merge-settings]
   (let [calls (atom 0)

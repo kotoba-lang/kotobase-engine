@@ -36,7 +36,7 @@
                          :decrypt-fn #(js/Promise.resolve %)
                          :blind-fn #(js/Promise.resolve (pr-str %))
                          :visible? (constantly true)}
-                  merge-settings (assoc :merge merge-settings)))))
+                  merge-settings (assoc :merge merge-settings :trust-scope "r3")))))
 
 (defn- ref-cid [store] (get-in @(:state store) [:refs "main" :cid]))
 (defn- set-ref! [store cid] (swap! (:state store) assoc-in [:refs "main"] {:cid cid :version 99}))
@@ -188,7 +188,8 @@
                                           :decrypt-fn (fn [x] (js/Promise.resolve x))
                                           :blind-fn #(js/Promise.resolve (pr-str %))
                                           :visible? (constantly true)
-                                          :merge settings}))]
+                                          :merge settings
+                                          :trust-scope "r3-fresh-reader"}))]
       (-> (js/Promise.all #js [(post-merge-store) (control-store)])
           (.then (fn [[sa sb]]
                    (let [w (wrap sa) wb (wrap sb) reader (fresh w)]
@@ -290,42 +291,43 @@
                    (done)))
           (.catch (fail! done))))))
 
-;; m3: verification is scoped per key material (`:trust-scope`, default the
-;; decrypt-fn object): a connection sharing it reuses the verification, one
-;; with other keys verifies for itself.
-(deftest trust-is-scoped-per-key-material
+;; m3 + round 4: verification is scoped by the required :trust-scope. Fresh
+;; per-request closures with one scope share it; another scope verifies for
+;; itself; :merge without :trust-scope is refused at open.
+(deftest trust-is-scoped-by-trust-scope
   (async done
     (-> (post-merge-store)
         (.then (fn [sa]
                  (let [w (wrap sa)
-                       dec1 (fn [x] (js/Promise.resolve x))
-                       conn (fn [extra] (engine/open (merge {:storage w
-                                                             :encrypt-fn #(js/Promise.resolve %)
-                                                             :decrypt-fn dec1
-                                                             :blind-fn #(js/Promise.resolve (pr-str %))
-                                                             :visible? (constantly true)
-                                                             :merge settings}
-                                                            extra)))
-                       q #(engine/q % [nil nil nil])]
-                   (-> (calls-of w #(q (conn {})))
-                       (.then (fn [first]
-                                (-> (calls-of w #(q (conn {})))
-                                    (.then (fn [same]
-                                             (-> (calls-of w #(q (conn {:decrypt-fn (fn [x] (js/Promise.resolve x))})))
-                                                 (.then (fn [other]
-                                                          (-> (calls-of w #(q (conn {:decrypt-fn (fn [x] (js/Promise.resolve x))
-                                                                                      :trust-scope "tenant-key-1"})))
-                                                              (.then (fn [scoped1]
-                                                                       (-> (calls-of w #(q (conn {:decrypt-fn (fn [x] (js/Promise.resolve x))
-                                                                                                   :trust-scope "tenant-key-1"})))
-                                                                           (.then (fn [scoped2]
-                                                                                    [first same other scoped1 scoped2]))))))))))))))))))
-        (.then (fn [[first same other scoped1 scoped2]]
-                 (println "R3 m3 first" (:calls first) "same keys" (:calls same) "other keys" (:calls other)
-                          "named scope" (:calls scoped1) (:calls scoped2))
-                 (is (< (:calls same) (:calls first)))
-                 (is (= (:calls first) (:calls other)) "other keys verify for themselves")
-                 (is (= (:calls same) (:calls scoped2)) "a named :trust-scope is shared")
+                       conn (fn [scope]
+                              ;; a fresh decrypt-fn closure per "request"
+                              (engine/open {:storage w
+                                            :encrypt-fn #(js/Promise.resolve %)
+                                            :decrypt-fn (fn [x] (js/Promise.resolve x))
+                                            :blind-fn #(js/Promise.resolve (pr-str %))
+                                            :visible? (constantly true)
+                                            :merge settings
+                                            :trust-scope scope}))
+                       q #(engine/q % [nil nil nil])
+                       steps [#(q (conn "m3-k1")) #(q (conn "m3-k1")) #(q (conn "m3-k1"))
+                              #(q (conn "m3-k2"))]]
+                   (-> (reduce (fn [p f] (.then p (fn [acc] (.then (calls-of w f) #(conj acc %)))))
+                               (js/Promise.resolve []) steps)
+                       (.then (fn [rs]
+                                (-> (outcome (.then (js/Promise.resolve nil)
+                                                    (fn [_] (engine/open {:storage w
+                                                                          :encrypt-fn identity :decrypt-fn identity
+                                                                          :blind-fn identity :visible? identity
+                                                                          :merge settings}))))
+                                    (.then (fn [no-scope] [rs no-scope])))))))))
+        (.then (fn [[[r1 r2 r3 other] no-scope]]
+                 (println "R3/R4 scope: first" (:calls r1) "per-request same scope" (:calls r2) (:calls r3)
+                          "other scope" (:calls other))
+                 (is (< (:calls r2) (:calls r1)))
+                 (is (= (:calls r2) (:calls r3)) "per-request closures do not re-verify")
+                 (is (= (:calls r1) (:calls other)) "another scope verifies for itself")
+                 (is (= :err (first no-scope)))
+                 (is (re-find #"trust-scope" (str (second no-scope))))
                  (done)))
         (.catch (fail! done)))))
 

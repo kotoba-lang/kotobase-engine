@@ -17,7 +17,7 @@
 (declare opts)
 
 (defn- open
-  ([store] (open store {:merge opts}))
+  ([store] (open store {:merge opts :trust-scope "merge-test"}))
   ([store extra]
    (engine/open (merge {:storage store
                         :encrypt-fn #(js/Promise.resolve %)

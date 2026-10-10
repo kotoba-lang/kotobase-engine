@@ -66,7 +66,8 @@ commits. After exchanging blocks, either writer runs
 
 ```clojure
 (def conn (engine/open {... :merge {:database-id "tenant/db"
-                                    :schema {":doc/status" {:db/cardinality :db.cardinality/one}}}}))
+                                    :schema {":doc/status" {:db/cardinality :db.cardinality/one}}}
+                           :trust-scope "tenant-key-1"}))
 (engine/merge-at! conn [left right])
 ```
 
@@ -127,20 +128,32 @@ databases on the Promise facade.
     - If the head has neither `causes` nor the marker, the read is the same
       as on `main`: no extra fetch, no closure bound.
     - Otherwise the head names its merge snapshot (`{parents indexed views}`).
-      The snapshot is verified once: the contract merge of the parents, the
-      snapshot's quads, its views re-derived from the merged state, and the
-      stored schema. The result is cached by snapshot, not by head, so
-      every later head on that snapshot costs nothing extra and no history
-      is walked. Measured with 150 transactions after a merge:
+      The snapshot is verified once:
+      - the contract merge of the parents;
+      - the snapshot's quads;
+      - **all four covering indexes** (`spo`/`pso`/`pos`/`ocp`), each leaf
+        key re-derived from its decrypted value with the connection's
+        `blind-fn`;
+      - the views re-derived from the merged state;
+      - the stored schema.
+
+      The result is cached by snapshot, not by head, so every later head on
+      that snapshot costs nothing extra and no history is walked. Measured
+      with 150 transactions after a merge:
       | read | block requests |
       |---|---|
       | merge-free control | 163 |
-      | first read through the merge | 176 |
+      | first read through the merge | 180 |
       | next head | 164 |
-      | `transact!` | 3 (control: 2) |
-  - The cache is process-wide and bounded. It is scoped by key material:
-    `open`'s `:trust-scope` (for example a key id, so per-request
-    connections share it), defaulting to the `decrypt-fn` object.
+  - **`:trust-scope` is required with `:merge`.** It is a string or keyword
+    naming the key material (for example a key id). Verified snapshots are
+    cached process-wide per scope, so per-request connections with fresh
+    closures share one verification, and connections with other keys verify
+    for themselves. Without it, `open` throws: a default tied to the
+    `decrypt-fn` object would re-verify on every request. Only strings are
+    held, never closures. Both levels (64 scopes, 4096 snapshots per scope)
+    are LRU, so evicting one scope never clears the others. Concurrent cold
+    reads in one scope share a single in-flight verification.
   - Without `:merge` settings, reading or writing through a merge is
     refused (`:unverified-merge`).
   - Writers enforce the same rule. `transact!`, `commit-at!` and `fold!`
@@ -148,11 +161,16 @@ databases on the Promise facade.
     returned by kotobase-peer's internal CAS retry in `fold!`. So honest
     writers never launder a forged merge into an unmarked (linear-trust)
     snapshot.
+  - A merge commit that carries pending transactions is refused even when
+    its snapshot is trusted, because `merge-at` never writes any.
   - **Residual.** A commit with neither `causes` nor the marker is read on
     the linear trust model kotobase-peer always had: its CID-verified
     snapshot is trusted. That covers a forged linear commit, a forged
     `fold!`, and a child that an older, unguarded writer put on a forged
-    merge without a valid marker; each equals forging the child directly. A
+    merge without a valid marker; each equals forging the child directly.
+    Pending transactions on a linear descendant of an honest merge are
+    novelty, read like any linear commit's; `verify-at` recomputes the
+    head's logical state and catches them. A
     fast-forward returned by the immutable `merge-at!` is checked for quads
     but not for views. kotobase-peer's `rebase-fold!` over a merge snapshot
     keeps the marker but changes the snapshot, so reads of it fail closed.
@@ -161,12 +179,14 @@ databases on the Promise facade.
   schema (`:schema-violation`). The check uses point lookups only
   (`[e a]`, `[a v]`, and the schema entity of any schema datom touched)
   through kotobase-peer's range-pruned snapshot index plus its novelty
-  backlog, never a full hydrate. Writing one cardinality-one datom to a
-  folded 300-datom database takes 7 block requests against 1 without
-  `:merge`. With an unfolded backlog of 300 it takes 325, which is the
-  backlog scan a read also pays: the pinned kotobase-peer cannot prune
-  novelty. Those writes are no longer byte-identical to a connection
-  without `:merge`, because the check can refuse them. Schema datoms that
+  backlog, never a full hydrate. A one-leaf probe first checks that the
+  connection's `blind-fn` produces the snapshot's keys; otherwise every lookup
+  would silently come back empty (`:blinding-mismatch`). Writing one
+  cardinality-one datom to a folded 300-datom database takes 9 block requests
+  against 1 without `:merge`. With an unfolded backlog of 300 it takes 327,
+  which is the backlog scan a read also pays: the pinned kotobase-peer cannot
+  prune novelty. Committed bytes are identical with or without `:merge`; a
+  `:merge` connection only adds the refusal. Schema datoms that
   contradict the settings are refused (`:schema-mismatch`), including an
   ident and its cardinality written in separate transactions. Merging and
   merge verification cross-check the settings against the schema datoms

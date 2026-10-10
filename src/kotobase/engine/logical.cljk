@@ -64,6 +64,7 @@
             [chain.core :as chain]
             [ipld.core :as ipld]
             [kotobase-peer.core :as peer]
+            [prolly-tree.core :as pt]
             [kotobase.engine.canonical :as canonical]
             [kotobase.engine.identity :as identity]
             [kotobase.engine.merge :as merge]))
@@ -214,6 +215,8 @@
   "State key every merge commit writes and its linear descendants inherit."
   "merge")
 
+(declare novelty-count)
+
 (defn origin
   "The merge a commit's snapshot comes from, read from INFO (its own chain
   block) alone: nil for a merge-free snapshot, else
@@ -231,7 +234,12 @@
        :indexed (some-> (get state "indexed") ipld/link-cid)
        :views (some-> (get state "views") ipld/link-cid)
        :marker marker
-       :merge? merge?})))
+       :merge? merge?
+       ;; merge-at writes a merge commit with empty novelty; pending
+       ;; transactions on a merge commit itself are never honest.
+       :novelty? (boolean (or (pos? (novelty-count state))
+                              (get state "novelty-back")
+                              (get state "novelty-front")))})))
 
 (defn merge-origin?
   "Whether the snapshot read at chain commit INFO can come from a merge."
@@ -914,3 +922,94 @@
                        :heads parents
                        :logical-heads (:heads result)
                        :work work))))))))))
+
+;; ---------------------------------------------------------------------------
+;; Index verification (ClojureScript; the engine facade that uses it is too)
+
+(def ^:private index-roots
+  ;; arrangement's four covering indexes: leaf key = pr-str of the blinded
+  ;; components in index order, leaf value = encrypted [k1 k2 v] in that order.
+  {"spo" (fn [[s p o]] [s p o])
+   "pso" (fn [[p s o]] [s p o])
+   "pos" (fn [[p o s]] [s p o])
+   "ocp" (fn [[o p s]] [s p o])})
+
+#?(:cljs
+   (defn- leaf-check
+     "Decrypt one leaf [k ct] of ROOT and require K to be the blinded key of
+     its own triple. Resolves to the triple in [s p o] order."
+     [root decode blind-fn decrypt-fn [k ct]]
+     (-> (decrypt-fn ct)
+         (.then decode)
+         (.then (fn [triple]
+                  (-> (js/Promise.all
+                       (into-array (map #(js/Promise.resolve (blind-fn (qs/link->edn %)))
+                                        triple)))
+                      (.then (fn [blinded]
+                               (when-not (= k (pr-str (vec blinded)))
+                                 (reject! :physical-mismatch
+                                          "snapshot index key is not the blinded key of its value"
+                                          {:index root}))
+                               ((get index-roots root) triple)))))))))
+
+#?(:cljs
+   (defn verify-snapshot-indexes
+     "Require every covering index of SNAPSHOT-CID to hold exactly DATOMS
+     (the reverse-reference index `ocp` exactly the datoms whose value is a
+     link), with every leaf key the connection's blinded key of its
+     decrypted value. Detects a forged secondary index (e.g. a `pos` tree
+     that hides a unique holder) and a connection whose `blind-fn` differs
+     from the snapshot's. Reads every leaf of the four trees; paid once per
+     verified snapshot. FETCH: (fn [cid]) -> Promise<bytes>."
+     [fetch snapshot-cid datoms blind-fn decrypt-fn]
+     (-> (fetch snapshot-cid)
+         (.then ipld/decode)
+         (.then
+          (fn [snap]
+            (let [decode (#'peer/leaf-decoder snap)
+                  expected (set (map #(select-keys % [:e :a :v]) datoms))
+                  refs (set (filter #(and (map? (:v %)) (contains? (:v %) "/")) expected))]
+              (all
+               (for [[root _] (sort index-roots)]
+                 (let [root-cid (some-> (get-in snap ["index-roots" root]) ipld/link-cid)
+                       want (if (= "ocp" root) refs expected)]
+                   (-> (if root-cid
+                         (pt/scan-prefix-async fetch root-cid "")
+                         (js/Promise.resolve []))
+                       (.then (fn [entries]
+                                (all (map #(leaf-check root decode blind-fn decrypt-fn %)
+                                          entries))))
+                       (.then (fn [triples]
+                                (let [actual (set (map (fn [[e a v]] (quad->datom {:s e :p a :o v}))
+                                                       triples))]
+                                  (when-not (= want actual)
+                                    (reject! :physical-mismatch
+                                             "snapshot index differs from the verified state"
+                                             {:index root
+                                              :missing (count (remove actual want))
+                                              :unexpected (count (remove want actual))}))
+                                  root)))))))))))))
+
+#?(:cljs
+   (defn check-blinding
+     "Fail closed (`:blinding-mismatch`) when the connection's BLIND-FN does
+     not produce SNAPSHOT-CID's leaf keys: point lookups would silently find
+     nothing. Reads the first `spo` leaf only."
+     [fetch snapshot-cid blind-fn decrypt-fn]
+     (if (nil? snapshot-cid)
+       (js/Promise.resolve nil)
+       (-> (fetch snapshot-cid)
+           (.then ipld/decode)
+           (.then
+            (fn [snap]
+              (if-let [root-cid (some-> (get-in snap ["index-roots" "spo"]) ipld/link-cid)]
+                (-> (pt/scan-prefix-async fetch root-cid "" 1)
+                    (.then (fn [entries]
+                             (when-let [entry (first entries)]
+                               (-> (leaf-check "spo" (#'peer/leaf-decoder snap)
+                                               blind-fn decrypt-fn entry)
+                                   (.catch (fn [_]
+                                             (reject! :blinding-mismatch
+                                                      "the connection's blind-fn does not match the snapshot's keys"
+                                                      {}))))))))
+                nil)))))))
