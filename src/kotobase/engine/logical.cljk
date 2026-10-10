@@ -36,10 +36,18 @@
   state is a fresh indexed snapshot of the merged visible datoms plus the
   union of the parents' materialized views, re-derived over it.
 
-  **Trust.** A physical snapshot is only as good as its verification:
-  `verify-physical` compares what kotobase-peer reads at a commit with the
-  projected logical state there. The engine facade runs it before reading
-  through an unverified merge and before publishing a fast-forward.
+  **Trust (read side).** A merge commit carries the state marker
+  `merge-marker` (`\"merge\"`). kotobase-peer's `commit!` copies unknown state
+  keys, so every linear descendant of a merge carries it too, until a
+  `fold!` (which rebuilds state) drops it. A reader therefore knows from the
+  one state block it fetches anyway whether the snapshot it reads can come
+  from a merge (`merge-origin?`): a commit with `causes` or with the marker.
+  Only then does it look further, walking `prev` to the nearest merge commit
+  and verifying that merge once (`verify-merge-commit`: contract recompute,
+  physical quads, materialized views, stored schema). A merge-free history
+  is read exactly as before, at no extra cost. The facade refuses to write
+  on top of, or fold, an unverified merge, so honest descendants never
+  launder one.
 
   **Budget.** `:max-closure` bounds commits walked; `:max-work` is one budget
   for the whole call: projection (charged before each transaction block is
@@ -199,14 +207,41 @@
                       (assoc seen cid info))))))
        seen))))
 
-(defn merge-commits
-  "Physical merge commits reachable from CID, not looking below VERIFIED.
-  Returns `{:walked #{cid ..} :merges [cid ..]}`."
-  [get-fn cid verified max-closure]
-  (let [infos (walk-physical get-fn [cid] max-closure verified)]
-    {:walked (set (keys infos))
-     :merges (vec (sort (keep (fn [[c info]] (when (seq (:causes info)) c))
-                              infos)))}))
+(def merge-marker
+  "State key every merge commit writes and its linear descendants inherit."
+  "merge")
+
+(defn merge-origin?
+  "Whether the snapshot read at chain commit INFO can come from a merge:
+  INFO is a merge, or a linear descendant of one (inherited marker)."
+  [info]
+  (boolean (or (seq (:causes info))
+               (contains? (normalize-state (:state info)) merge-marker))))
+
+(defn nearest-merge
+  "The merge commit whose snapshot CID's state descends from: CID itself if
+  it has `causes`, else the first one on its `prev` lineage while the marker
+  is inherited. nil when the marker lineage ends without one (the snapshot
+  then comes from a fold and is read on the linear trust model). Bounded by
+  MAX-CLOSURE; only ever walked for merge-origin commits."
+  [get-fn cid max-closure]
+  (loop [cid cid n 0]
+    (when cid
+      (when (<= max-closure n)
+        (reject! :closure-too-large "merge lineage exceeds max-closure"
+                 {:max-closure max-closure}))
+      (let [info (chain/commit-info get-fn cid)]
+        (cond
+          (seq (:causes info)) cid
+          (merge-origin? info) (recur (:prev info) (inc n))
+          :else nil)))))
+
+(defn settings-key
+  "Identity of the settings a verification was done under."
+  [s]
+  (digest (canonical/canonical-string
+           (select-keys s [:database-id :schema-root :model-contract-root
+                           :admission-policy-root]))))
 
 (defn first-parent-merge
   "The first commit with `causes` on the `prev` lineage of CID, or nil. Log
@@ -502,18 +537,98 @@
         {:graph {} :logical {} :infos infos :work work}
         order)))))
 
+;; ---------------------------------------------------------------------------
+;; Schema checks
+
+(def max-branch-heads
+  "Bound on the CIDs `reduce-physical-heads` accepts in one call."
+  256)
+
 (defn reduce-physical-heads
   "Discover the sibling heads among CIDS: drop duplicates and every commit
   that another one already contains (over `prev` and `causes`). This is
   what a writer does with the commit CIDs `commit-at!`/`merge-at!` returned
   to itself and to other writers: the survivors are the branches a merge
-  must name."
+  must name. At most `max-branch-heads` CIDs; one MAX-CLOSURE walk budget
+  shared by all of them."
   [get-fn cids max-closure]
-  (let [cids (vec (sort (distinct (map cid-arg! cids))))
-        closures (into {} (map (fn [c] [c (set (keys (walk-physical get-fn [c] max-closure)))]))
-                       cids)]
-    (vec (remove (fn [c] (some #(and (not= c %) (contains? (get closures %) c)) cids))
-                 cids))))
+  (let [cids (vec (sort (distinct (map cid-arg! cids))))]
+    (when (< max-branch-heads (count cids))
+      (reject! :too-many-heads "branch-heads accepts at most max-branch-heads CIDs"
+               {:count (count cids) :max max-branch-heads}))
+    (let [closures (loop [[c & more] cids acc {} budget max-closure]
+                     (if-not c
+                       acc
+                       (let [walked (set (keys (walk-physical get-fn [c] budget)))]
+                         (recur more (assoc acc c walked)
+                                (max 1 (- budget (count walked)))))))]
+      (vec (remove (fn [c] (some #(and (not= c %) (contains? (get closures %) c)) cids))
+                   cids)))))
+
+(defn- stored-schema
+  "{ident {:cardinality v :unique v}} from schema datoms (as the
+  `kotobase.datomic` layer installs them: `[e \":db/ident\" ident]`,
+  `[e \":db/cardinality\" \":db.cardinality/one\"]`, ...)."
+  [datoms]
+  (let [by-e (group-by :e datoms)]
+    (into {}
+          (keep (fn [[_ ds]]
+                  (let [get-a (fn [a] (some #(when (= a (:a %)) (:v %)) ds))]
+                    (when-let [ident (get-a ":db/ident")]
+                      [ident {:cardinality (get-a ":db/cardinality")
+                              :unique (get-a ":db/unique")}]))))
+          by-e)))
+
+(defn check-stored-schema!
+  "The merge settings' schema must agree with schema datoms stored in the
+  database: an attribute stored as cardinality-one or unique must be
+  declared so, and vice versa for attributes stored with a declaration."
+  [schema datoms]
+  (doseq [[ident {:keys [cardinality unique]}] (stored-schema datoms)
+          :when (or cardinality unique)]
+    (let [decl (get schema ident)
+          stored-one? (= (str :db.cardinality/one) cardinality)
+          stored-unique? (some? unique)]
+      (when-not (and (= stored-one? (cardinality-one? schema ident))
+                     (= stored-unique? (some? (:db/unique decl))))
+        (reject! :schema-mismatch
+                 "merge :schema disagrees with the schema stored in the database"
+                 {:attribute ident :stored {:cardinality cardinality :unique unique}
+                  :declared decl})))))
+
+(defn serial-patterns
+  "The `[s p o]` read patterns (nil = wildcard) whose visible datoms at the
+  basis decide whether QUADS are serial-valid: the current values of every
+  asserted cardinality-one `[e a]`, the holders of every asserted unique
+  `[a v]`, and the entities a retractEntity removes. Empty when the
+  transaction asserts no cardinality-one or unique attribute."
+  [schema quads]
+  (let [relevant (filter (fn [{:keys [p op]}]
+                           (and (nil? op)
+                                (or (cardinality-one? schema p) (unique? schema p))))
+                         quads)]
+    (if (empty? relevant)
+      []
+      (vec (distinct
+            (concat
+             (mapcat (fn [{:keys [s p o]}]
+                       (cond-> []
+                         (cardinality-one? schema p) (conj [s p nil])
+                         (unique? schema p) (conj [nil p o])))
+                     relevant)
+             (for [{:keys [s op]} quads :when (= :retract-entity op)]
+               [s nil nil])))))))
+
+(defn check-serial!
+  "Reject QUADS (one transaction, kotobase-peer quad form) unless it is valid
+  for a serial executor over DATOMS, the relevant visible datoms at its
+  basis. This is the rule every v1 commit of a mergeable history must meet."
+  [schema datoms quads]
+  (check-stored-schema! schema (concat datoms (map quad->datom
+                                                   (remove :op quads))))
+  (logical-tx schema nil (datoms->visible datoms) quads 0
+              #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER))
+  nil)
 
 ;; ---------------------------------------------------------------------------
 ;; Verification
@@ -537,58 +652,6 @@
      :epoch epoch
      :datoms (vec (sort-by canonical/logical-datom-key expected))}))
 
-;; ---------------------------------------------------------------------------
-;; Merge
-
-(defn- ancestors-of [infos cid]
-  (loop [pending [cid] seen #{}]
-    (if-let [c (peek pending)]
-      (if (or (contains? seen c) (not (contains? infos c)))
-        (recur (pop pending) seen)
-        (recur (into (pop pending) (chain/causal-parents (get infos c)))
-               (conj seen c)))
-      seen)))
-
-(defn- fast-forward-target
-  "Choose and verify the physical commit a fast-forward lands on.
-
-  - If PREFER (the caller's current ref head) already has the result's
-    logical root, it is the answer: a fast-forward never moves to a
-    logically equal sibling (which could be a forged or older physical
-    commit, e.g. the pre-`fold!` commit).
-  - Otherwise candidates are the heads with that logical root, those whose
-    physical closure contains PREFER first, then ascending CID. The first
-    whose physical state equals its logical state wins; if none does, the
-    fast-forward is refused (`:physical-mismatch`)."
-  [{:keys [logical infos] :as projection} heads root prefer read-quads]
-  (if (and prefer (= root (get-in logical [prefer :root])))
-    prefer
-    (let [candidates (->> heads
-                          (filter #(= root (get-in logical [% :root])))
-                          (sort-by (fn [c] [(if (and prefer (contains? (ancestors-of infos c) prefer)) 0 1) c])))]
-      (letfn [(try-next [[c & more]]
-                (if-not c
-                  (reject! :physical-mismatch
-                           "no fast-forward candidate's physical state matches its logical state"
-                           {:logical-root root})
-                  (-> (read-quads c)
-                      (then (fn [quads]
-                              (try
-                                (verify-physical projection c quads)
-                                c
-                                (catch #?(:clj Exception :cljs :default) e
-                                  (if (= :physical-mismatch (:problem (ex-data e)))
-                                    (try-next more)
-                                    (throw e)))))))))]
-        (try-next candidates)))))
-
-(defn- physical-for
-  "The physical head carrying logical ROOT: PREFER when it does, else the
-  lowest CID."
-  [projection heads root prefer]
-  (let [hs (filter #(= root (get-in projection [:logical % :root])) heads)]
-    (if (some #{prefer} hs) prefer (first (sort hs)))))
-
 (defn- views-of
   "{name spec} of the materialized views declared at CID (Promise on cljs)."
   [get-fn decrypt-fn infos cid]
@@ -597,61 +660,157 @@
           (fn [views] (into {} (map (fn [[k v]] [k (get v "spec")])) views)))
     {}))
 
-(defn- merged-views
-  "Re-derive the parents' materialized views over the merged DB.
+(defn- union-views
+  "Deterministic union of declared view specs; one name with two specs is
+  refused (`:incompatible-views`)."
+  [cids specs]
+  (reduce (fn [acc m]
+            (reduce-kv (fn [acc k v]
+                         (when (and (contains? acc k) (not= v (get acc k)))
+                           (reject! :incompatible-views
+                                    "commits declare one view with different specs"
+                                    {:commits cids :view k}))
+                         (assoc acc k v))
+                       acc m))
+          {} specs))
 
-  Views are derived read projections, not data: their rows are recomputed
-  here from the merged datoms, so carrying them cannot change what the
-  database contains. The declared view set is the deterministic union of
-  the parents' declarations (a branch that predates a `fold! :views`
-  declaration must still merge). The same view name declared with different
-  specs is refused (`:incompatible-views`). A view removed on one branch
-  only is kept if another branch still declares it. Returns a views Link
-  or nil (Promise on cljs)."
-  [get-fn put! database infos parents db]
-  (then
-   (all (map #(views-of get-fn (:decrypt-fn database) infos %) parents))
-   (fn [specs]
-     (let [union (reduce
-                  (fn [acc m]
-                    (reduce-kv
-                     (fn [acc k v]
-                       (when (and (contains? acc k) (not= v (get acc k)))
-                         (reject! :incompatible-views
-                                  "merge parents declare one view with different specs"
-                                  {:parents parents :view k}))
-                       (assoc acc k v))
-                     acc m))
-                  {} specs)]
-       (when (seq union)
-         (#'peer/materialize-views! put! get-fn {} db union
-                                    (:encrypt-fn database)
-                                    (:decrypt-fn database)))))))
+(defn- materialize
+  "Write a views block re-deriving UNION over DB; nil when empty. Charges
+  one unit per visible datom per view against WORK (returns [link work])."
+  [get-fn put! database union db n work max-work]
+  (let [work (charge work (* n (count union)) max-work)]
+    (if (seq union)
+      (then (#'peer/materialize-views! put! get-fn {} db union
+                                       (:encrypt-fn database)
+                                       (:decrypt-fn database))
+            (fn [link] [link work]))
+      [nil work])))
+
+(defn verify-merge-commit
+  "Verify merge commit CID as written by `merge-at`: recompute it through the
+  contract (PROJECTION of its closure), and require its physical quads
+  (QUADS), its merge marker, the union of its parents' views re-derived over
+  the merged state, and the schema stored in the merged state to match.
+  Returns the logical summary (Promise on cljs)."
+  [get-fn database settings projection cid quads]
+  (let [summary (verify-physical projection cid quads)
+        info (get-in projection [:infos cid])
+        state (normalize-state (:state info))
+        parents (chain/causal-parents info)
+        datoms (:datoms summary)]
+    (when-not (contains? state merge-marker)
+      (reject! :physical-mismatch "merge commit lacks the merge marker"
+               {:cid cid}))
+    (check-stored-schema! (:schema settings) datoms)
+    (then
+     (all (map #(views-of get-fn (:decrypt-fn database) (:infos projection) %)
+               parents))
+     (fn [specs]
+       (let [union (union-views parents specs)
+             db (peer/transact (peer/empty-db) (map datom->quad datoms))
+             _ (charge (:work projection) (* (count datoms) (count union))
+                       (:max-work settings))
+             expected (into {} (map (fn [[k spec]]
+                                      [k {"spec" spec
+                                          "rows" (#'peer/derive-view-rows db spec)}]))
+                            union)]
+         (then
+          (if-let [link (get state "views")]
+            (read-views-block get-fn (ipld/link-cid link) (:decrypt-fn database))
+            {})
+          (fn [actual]
+            (when-not (= expected (or actual {}))
+              (reject! :physical-mismatch
+                       "merge commit's materialized views differ from its merged state"
+                       {:cid cid}))
+            summary)))))))
+
+;; ---------------------------------------------------------------------------
+;; Merge
+
+(defn- physical-for
+  "The physical head carrying logical ROOT: PREFER when it does, else the
+  lowest CID."
+  [projection heads root prefer]
+  (let [hs (filter #(= root (get-in projection [:logical % :root])) heads)]
+    (if (some #{prefer} hs) prefer (first (sort hs)))))
+
+(defn- write-snapshot!
+  "Write a chain commit over PARENTS (first = prev) whose state is a fresh
+  indexed snapshot of DATOMS plus the union of the views declared at
+  VIEW-SOURCES, re-derived over it. EXTRA is merged into the state.
+  Returns [cid work] (Promise on cljs)."
+  [get-fn put! database infos parents view-sources datoms extra work max-work]
+  (let [db (peer/transact (peer/empty-db) (map datom->quad datoms))]
+    (then
+     (all (cons (qs/commit! put! db nil qs/current-schema-version
+                            (:blind-fn database) (:encrypt-fn database))
+                (map #(views-of get-fn (:decrypt-fn database) infos %)
+                     view-sources)))
+     (fn [[snapshot-cid & specs]]
+       (then
+        (materialize get-fn put! database (union-views view-sources specs)
+                     db (count datoms) work max-work)
+        (fn [[views work]]
+          [(chain/commit!
+            put! get-fn
+            (cond-> (merge {"indexed" (ipld/link snapshot-cid)
+                            "novelty-front" nil "novelty-back" nil
+                            "novelty-count" 0}
+                           extra)
+              views (assoc "views" views))
+            (first parents)
+            (when (seq (rest parents)) {:causes (vec (rest parents))}))
+           work]))))))
+
+(defn- verify-target
+  "For the immutable `merge-at!` fast-forward: the first candidate (ascending
+  CID) whose physical quads equal its logical state."
+  [projection candidates read-quads max-work]
+  (letfn [(try-next [[c & more] work]
+            (if-not c
+              (reject! :physical-mismatch
+                       "no fast-forward candidate's physical state matches its logical state"
+                       {})
+              (then (read-quads c)
+                    (fn [quads]
+                      (let [work (charge work (count quads) max-work)]
+                        (if (= (set (visible-datoms (get-in projection [:logical c :visible])))
+                               (set (map quad->datom quads)))
+                          [c work]
+                          (try-next more work)))))))]
+    (try-next (sort candidates) (:work projection))))
 
 (defn merge-at
   "Deterministically merge the physical commits HEADS of DATABASE.
 
   Writes immutable blocks only (no mutable ref). OPTS are `settings` plus
-  - `:prefer`     the caller's current ref head, if any (see
-                  `fast-forward-target`);
-  - `:read-quads` (fn [cid]) -> physical quads at cid (Promise on cljs), used
-                  to verify a fast-forward target.
+  - `:prefer`     the caller's current ref head (`merge!`), if any;
+  - `:read-quads` (fn [cid]) -> physical quads at cid (Promise on cljs).
 
-  Returns (a Promise on cljs of) either
-  `{:status :fast-forward :cid c :logical-root r ...}` (nothing written; `c`
-  verified) or `{:status :merged :cid c :logical-root r :logical-commit v2
-  :tx resolution :conflicts .. :bases .. :heads [physical ..]
-  :logical-heads .. :work n}`.
+  Results (a Promise on cljs):
+  - `{:status :merged :cid c ...}` a new merge commit (marker, merged
+    snapshot, union of the parents' views).
+  - `{:status :fast-forward :cid c :target t ...}` one head contains the
+    others (T has the merged logical root):
+    - with PREFER whose logical root is T's: `c` = PREFER, nothing written;
+    - with another PREFER: `c` is a new carry commit over T whose state is
+      a fresh snapshot of T's *verified logical* state plus the union of
+      PREFER's and T's views. The ref never moves onto a snapshot this call
+      did not build, so pre-`fold!` branches keep the fold's views and
+      compaction, and forged snapshots or views on T are never published;
+    - without PREFER (`merge-at!`): `c` = the lowest-CID head with that root
+      whose physical quads match its logical state; nothing is written.
 
-  The result depends only on the set of heads (and PREFER for which of
-  several logically equal physical commits is returned): argument order and
-  duplicates cannot change `:logical-root`, nor `:cid` when `encrypt-fn` and
-  `blind-fn` are deterministic, as content addressing requires."
+  The result depends only on the set of heads (and PREFER): argument order
+  and duplicates cannot change `:logical-root`, nor `:cid` when `encrypt-fn`
+  and `blind-fn` are deterministic, as content addressing requires."
   [get-fn put! database heads {:keys [prefer read-quads] :as opts}]
   (when-not (and (sequential? heads) (seq heads))
     (reject! :invalid-heads "merge requires at least one head" {:heads heads}))
   (let [heads (vec (sort (distinct (map cid-arg! heads))))
-        settings (settings opts)]
+        settings (settings opts)
+        max-work (:max-work settings)]
     (when (< identity/max-merge-parents (count heads))
       (reject! :too-many-parents "merge exceeds max-merge-parents"
                {:count (count heads) :max identity/max-merge-parents}))
@@ -662,42 +821,52 @@
              _ (when (some nil? roots)
                  (reject! :unsupported-history "a head has no logical history"
                           {:heads heads}))
-             result (contract-merge settings graph roots (:work projection))]
+             _ (doseq [h heads]
+                 (check-stored-schema! (:schema settings)
+                                       (visible-datoms (get-in logical [h :visible]))))
+             result (contract-merge settings graph roots (:work projection))
+             root (:root result)
+             base {:logical-root root :heads heads}]
          (if (= :fast-forward (:status result))
-           (then (fast-forward-target projection heads (:root result) prefer
-                                      read-quads)
-                 (fn [cid]
-                   {:status :fast-forward
-                    :cid cid
-                    :logical-root (:root result)
-                    :heads heads
-                    :work (:work result)}))
+           (let [candidates (filter #(= root (get-in logical [% :root])) heads)]
+             (cond
+               (and prefer (= root (get-in logical [prefer :root])))
+               (assoc base :status :fast-forward :cid prefer :target prefer
+                      :work (:work result))
+
+               prefer
+               (let [target (first (sort candidates))]
+                 (then (write-snapshot! get-fn put! database infos [target]
+                                        [prefer target]
+                                        (visible-datoms (get-in logical [target :visible]))
+                                        {} (:work result) max-work)
+                       (fn [[cid work]]
+                         (assoc base :status :fast-forward :cid cid
+                                :target target :work work))))
+
+               :else
+               (then (verify-target (assoc projection :work (:work result))
+                                    candidates read-quads max-work)
+                     (fn [[cid work]]
+                       (assoc base :status :fast-forward :cid cid :target cid
+                              :work work)))))
            (let [parents (physical-parent-order
                           infos (map #(physical-for projection heads % prefer)
-                                     (:heads result)))
-                 db (peer/transact (peer/empty-db)
-                                   (map datom->quad (:datoms result)))]
+                                     (:heads result)))]
              (then
-              (all [(qs/commit! put! db nil qs/current-schema-version
-                                (:blind-fn database) (:encrypt-fn database))
-                    (merged-views get-fn put! database infos parents db)])
-              (fn [[snapshot-cid views]]
-                (let [cid (chain/commit!
-                           put! get-fn
-                           (cond-> {"indexed" (ipld/link snapshot-cid)
-                                    "novelty-front" nil "novelty-back" nil
-                                    "novelty-count" 0}
-                             views (assoc "views" views))
-                           (first parents)
-                           {:causes (vec (rest parents))})]
-                  {:status :merged
-                   :cid cid
-                   :logical-root (:root result)
-                   :logical-commit (:commit result)
-                   :tx (:tx result)
-                   :datoms (:datoms result)
-                   :conflicts (:conflicts result)
-                   :bases (:bases result)
-                   :heads parents
-                   :logical-heads (:heads result)
-                   :work (:work result)}))))))))))
+              (write-snapshot! get-fn put! database infos parents parents
+                               (:datoms result)
+                               {merge-marker {"policy" identity/merge-policy}}
+                               (:work result) max-work)
+              (fn [[cid work]]
+                (assoc base
+                       :status :merged
+                       :cid cid
+                       :logical-commit (:commit result)
+                       :tx (:tx result)
+                       :datoms (:datoms result)
+                       :conflicts (:conflicts result)
+                       :bases (:bases result)
+                       :heads parents
+                       :logical-heads (:heads result)
+                       :work work))))))))))

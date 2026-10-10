@@ -18,7 +18,8 @@
 (defn open
   [{:keys [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
            tx-functions]
-    :or {ref-name "main" tx-functions {}}}]
+    :or {ref-name "main" tx-functions {}}
+    :as opts}]
   (storage/validate-backend! storage)
   (doseq [[control value]
           [[:encrypt-fn encrypt-fn] [:decrypt-fn decrypt-fn]
@@ -30,6 +31,11 @@
   (when-not (every? ifn? (vals tx-functions))
     (throw (ex-info "Every transaction function must be callable"
                     {:type :kotobase.datomic/invalid-tx-functions})))
+  (when (contains? opts :merge)
+    ;; Merge commits are written and verified on the Promise facade only; a
+    ;; JVM connection configured for them would read merges unverified.
+    (throw (ex-info ":merge is not supported on the JVM facade"
+                    {:type :kotobase.engine/unsupported-platform})))
   (let [max-retries (if (nil? max-retries) 16 max-retries)]
     (when-not (and (integer? max-retries) (not (neg? max-retries)))
       (throw (ex-info ":max-retries must be a non-negative integer"

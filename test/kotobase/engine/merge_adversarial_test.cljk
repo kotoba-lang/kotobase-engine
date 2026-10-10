@@ -70,16 +70,26 @@
                                 prev
                                 (when (seq causes) {:causes (vec causes)})))))))
 
+(defn- raw-commit!
+  "kotobase-peer's own commit!, bypassing the engine's guards."
+  [store prev tx]
+  (let [get-fn (fn [cid] (get (:blocks @(:state store)) cid))
+        put! (fn [cid bytes] (swap! (:state store) assoc-in [:blocks cid] bytes) cid)]
+    (peer/commit! put! get-fn tx prev #(js/Promise.resolve %))))
+
 (defn- fork
   "G on A, shipped to B; A and B commit A-TX / B-TX offline on G; blocks
-  exchanged."
+  exchanged. Commits go through writers without `:merge` settings (which do
+  not check serial validity), as an older or foreign writer would; the
+  returned :a/:b connections carry the settings."
   [g-tx a-tx b-tx]
-  (let [sa (memory/memory-store) sb (memory/memory-store) a (open sa) b (open sb)]
-    (-> (engine/commit-at! a nil g-tx)
+  (let [sa (memory/memory-store) sb (memory/memory-store)
+        a (open sa) b (open sb) raw-a (open sa nil) raw-b (open sb nil)]
+    (-> (engine/commit-at! raw-a nil g-tx)
         (.then (fn [g]
                  (exchange! sa sb)
-                 (-> (js/Promise.all #js [(engine/commit-at! a g a-tx)
-                                          (engine/commit-at! b g b-tx)])
+                 (-> (js/Promise.all #js [(engine/commit-at! raw-a g a-tx)
+                                          (engine/commit-at! raw-b g b-tx)])
                      (.then (fn [[a1 b1]]
                               (exchange! sa sb)
                               {:sa sa :a a :b b :g g :a1 a1 :b1 b1}))))))))
@@ -89,9 +99,14 @@
 ;; instead of verifying something reads disagree with.
 (deftest card-one-linear-history-without-retract-is-refused
   (async done
-    (let [conn (open (memory/memory-store))]
-      (-> (engine/commit-at! conn nil [["doc" ":doc/status" "open"]])
-          (.then (fn [g] (engine/commit-at! conn g [["doc" ":doc/status" "closed"]])))
+    (let [store (memory/memory-store) conn (open store) raw (open store nil)]
+      (-> (engine/commit-at! raw nil [["doc" ":doc/status" "open"]])
+          (.then (fn [g]
+                   (-> (outcome (engine/commit-at! conn g [["doc" ":doc/status" "closed"]]))
+                       (.then (fn [refused]
+                                (is (= [:err :schema-violation] refused)
+                                    "a writer with :merge settings refuses it up front")
+                                (engine/commit-at! raw g [["doc" ":doc/status" "closed"]]))))))
           (.then (fn [c]
                    (js/Promise.all
                     #js [(outcome (engine/verify-at conn c))
@@ -120,10 +135,15 @@
 ;; MAJOR 4c: unique applies to linear history too, matching contract state.
 (deftest unique-violation-in-linear-history-is-refused
   (async done
-    (let [conn (open (memory/memory-store))]
-      (-> (engine/commit-at! conn nil [["u1" ":user/email" "x"]])
-          (.then (fn [g] (engine/commit-at! conn g [["u2" ":user/email" "x"]])))
-          (.then (fn [c] (outcome (engine/verify-at conn c))))
+    (let [store (memory/memory-store) conn (open store) raw (open store nil)]
+      (-> (engine/commit-at! raw nil [["u1" ":user/email" "x"]])
+          (.then (fn [g]
+                   (js/Promise.all
+                    #js [(outcome (engine/commit-at! conn g [["u2" ":user/email" "x"]]))
+                         (engine/commit-at! raw g [["u2" ":user/email" "x"]])])))
+          (.then (fn [[refused c]]
+                   (is (= [:err :schema-violation] refused))
+                   (outcome (engine/verify-at conn c))))
           (.then (fn [result]
                    (is (= [:err :schema-violation] result))
                    (done)))
@@ -203,19 +223,28 @@
            (let [[p c] (reverse (sort [a1 b1]))]
              (-> (forge! sa p [c] [["evil" ":admin" "true"]])
                  (.then (fn [f]
-                          (-> (engine/commit-at! a f [["doc" ":doc/tag" "child"]])
+                          ;; A child an unguarded (older) writer put on it.
+                          (-> (raw-commit! sa f [["doc" ":doc/tag" "child"]])
                               (.then (fn [child]
                                        (let [reader (open sa)]
                                          (js/Promise.all
-                                          #js [(outcome (all-datoms reader f))
+                                          #js [(outcome (engine/commit-at! a f [["doc" ":doc/tag" "x"]]))
+                                               (outcome (all-datoms reader f))
                                                (outcome (all-datoms reader child))
                                                (outcome (engine/merge-at! a [f a1]))
                                                (outcome (all-datoms (open sa nil) f))
                                                (outcome (engine/merge-at! a [a1 b1]))])))))))))))
         (.then
-         (fn [[at-forged at-child ff no-settings honest]]
+         (fn [[write-on at-forged at-child ff no-settings honest]]
+           (is (= [:err :physical-mismatch] write-on)
+               "writers refuse to build on an unverified merge")
            (is (= [:err :physical-mismatch] at-forged))
-           (is (= [:err :physical-mismatch] at-child))
+           ;; Residual trust model (README): the forged merge carries no
+           ;; merge marker, so a child an *unguarded* writer put on it is a
+           ;; merge-free snapshot, read like any linear commit -- exactly as
+           ;; if the attacker had forged the child directly. Guarded writers
+           ;; refuse to create it (write-on above).
+           (is (= :ok (first at-child)))
            (is (= [:err :physical-mismatch] ff)
                "a fast-forward never lands on an unverified snapshot")
            (is (= [:err :unverified-merge] no-settings)
