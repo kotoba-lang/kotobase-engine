@@ -5,19 +5,20 @@
             [cljs.reader :as reader]
             [kotobase-peer.core :as peer]
             [kotobase.engine.logical :as logical]
+            [kotobase.engine.merge :as contract]
             [kotobase.storage.core :as storage]))
 
 (defrecord Database
   [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
-   tx-functions listeners])
+   tx-functions listeners merge-settings verified])
 
 (defrecord Db
   [connection basis-cid mode since-t value])
 
 (defn open
   [{:keys [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
-           tx-functions]
-    :or {ref-name "main" max-retries 16 tx-functions {}}}]
+           tx-functions merge]
+    :or {ref-name "main" tx-functions {}}}]
   (storage/validate-backend! storage)
   (doseq [[control value]
           [[:encrypt-fn encrypt-fn] [:decrypt-fn decrypt-fn]
@@ -29,8 +30,18 @@
   (when-not (every? ifn? (vals tx-functions))
     (throw (ex-info "Every transaction function must be callable"
                     {:type :kotobase.datomic/invalid-tx-functions})))
-  (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
-              max-retries tx-functions (atom {})))
+  ;; nil (absent or explicit) means the default; anything else must be a
+  ;; non-negative integer, so a retry loop can never run unbounded.
+  (let [max-retries (if (nil? max-retries) 16 max-retries)]
+    (when-not (and (integer? max-retries) (not (neg? max-retries)))
+      (throw (ex-info ":max-retries must be a non-negative integer"
+                      {:type :kotobase.engine/invalid-option
+                       :max-retries max-retries})))
+    ;; `:merge` = the merge settings (`kotobase.engine.logical/settings`) this
+    ;; connection uses to merge and to verify reads through merge commits.
+    (when merge (logical/settings merge))
+    (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
+                max-retries tx-functions (atom {}) merge (atom #{}))))
 
 (defn head [database]
   (if (instance? Db database)
@@ -256,6 +267,19 @@
   (let [backend (:storage database)]
     (with-blocks backend (fn [get-fn _put! _cas!] (f get-fn)))))
 
+(defn- ensure-linear!
+  "Log readers walk the `prev` lineage only. Across a merge that would drop
+  the other parents' transactions and number `t` by one parent's lineage, so
+  they refuse instead (kotobase ADR-2610101200: cross-branch history is the
+  logical graph, `logical-projection`)."
+  [get-fn basis-cid reader]
+  (when-let [merge-cid (logical/first-parent-merge get-fn basis-cid)]
+    (throw (ex-info (str reader " does not span merge commits; read the "
+                         "logical graph (logical-projection) instead")
+                    {:type :kotobase.merge/rejected
+                     :problem :history-spans-merge
+                     :reader reader :merge merge-cid}))))
+
 (defn as-of
   "Return a Promise of an immutable database value at-or-before sequence T."
   [database t]
@@ -263,7 +287,10 @@
       (.then
        (fn [{:keys [basis-cid] :as snapshot}]
          (let [database (:connection snapshot)]
-           (-> (at-basis database #(peer/as-of % basis-cid t))
+           (-> (at-basis database
+                         (fn [get-fn]
+                           (ensure-linear! get-fn basis-cid "as-of")
+                           (peer/as-of get-fn basis-cid t)))
                (.then
                 (fn [cid]
                   (assoc snapshot :basis-cid cid
@@ -298,10 +325,16 @@
           (let [database (:connection snapshot)]
             (at-basis
              database
-             #(peer/tx-range % basis-cid start end
-                             (:decrypt-fn database)))))))))
+             (fn [get-fn]
+               (ensure-linear! get-fn basis-cid "tx-range")
+               (peer/tx-range get-fn basis-cid start end
+                              (:decrypt-fn database))))))))))
 
-(defn- db-value [database]
+(declare ensure-verified!)
+
+(defn- raw-db-value
+  "The peer value at the snapshot's basis, without merge verification."
+  [database]
   (-> (resolve-db database)
       (.then
        (fn [{:keys [basis-cid mode since-t] :as snapshot}]
@@ -313,6 +346,8 @@
              (with-blocks
                backend
                (fn [get-fn _put! _cas!]
+                 (when (#{:since :history} mode)
+                   (ensure-linear! get-fn basis-cid (name mode)))
                  (case mode
                    :since
                    (peer/since get-fn basis-cid since-t
@@ -327,6 +362,18 @@
                    (peer/hydrate-chain-cached
                     get-fn basis-cid (:blind-fn database)
                     (:decrypt-fn database) nil nil fetch1))))))))))
+
+(defn- db-value
+  "The peer value at the snapshot's basis. A basis whose ancestry contains a
+  merge commit this connection has not verified is verified first
+  (`ensure-verified!`): a merge snapshot is never read on trust."
+  [database]
+  (-> (resolve-db database)
+      (.then (fn [{:keys [basis-cid mode] :as snapshot}]
+               (if (or (:value snapshot) (not= :current mode))
+                 (raw-db-value snapshot)
+                 (-> (ensure-verified! (:connection snapshot) basis-cid)
+                     (.then (fn [_] (raw-db-value snapshot)))))))))
 
 (defn with
   "Speculatively apply normalized TX-DATA to an immutable database value."
@@ -366,9 +413,11 @@
                              (first (:components options)))]
                 (-> (at-basis
                      database
-                     #(peer/history-datoms
-                       % basis-cid entity (:visible? database)
-                       (:decrypt-fn database)))
+                     (fn [get-fn]
+                       (ensure-linear! get-fn basis-cid "history")
+                       (peer/history-datoms
+                        get-fn basis-cid entity (:visible? database)
+                        (:decrypt-fn database))))
                     (.then
                      (fn [rows]
                        (cond->> rows
@@ -470,6 +519,13 @@
                (:blind-fn database) (:encrypt-fn database) (:decrypt-fn database)
                opts))))))))
 
+(defn- view-rows* [database current view-name]
+  (with-blocks
+    (:storage database)
+    (fn [get-fn _put! _cas!]
+      (peer/view-rows get-fn current view-name
+                      (:visible? database) (:decrypt-fn database)))))
+
 (defn view
   "Rows of a fold-materialized view, always fresh (the fold-time view rows
   with unfolded novelty merged on top). nil when the graph has no head yet
@@ -491,11 +547,8 @@
        (fn [current]
          (if-not current
            (js/Promise.resolve nil)
-           (with-blocks
-             (:storage database)
-             (fn [get-fn _put! _cas!]
-               (peer/view-rows get-fn current view-name
-                               (:visible? database) (:decrypt-fn database)))))))))
+           (-> (ensure-verified! database current)
+               (.then (fn [_] (view-rows* database current view-name)))))))))
 
 (defn pull-many [database pattern entities]
   (-> (db-value database)
@@ -522,6 +575,79 @@
   (js/Promise.reject
    (ex-info message {:type :kotobase.datomic/immutable-db})))
 
+(defn- merge-opts
+  "The connection's `:merge` settings, overridden per call by OPTS."
+  [conn opts]
+  (merge (:merge-settings conn) opts))
+
+(defn- physical-quads
+  "Every quad kotobase-peer reads at CID (no merge verification)."
+  [conn cid]
+  (-> (raw-db-value (->Db conn cid :current nil nil))
+      (.then #(peer/q % [nil nil nil] (constantly true)))))
+
+(defn- verify*
+  [conn cid opts]
+  (-> (with-blocks
+        (:storage conn)
+        (fn [get-fn _put! _cas!]
+          (logical/project get-fn (:decrypt-fn conn)
+                           (logical/settings (merge-opts conn opts)) [cid])))
+      (.then (fn [projection]
+               (-> (physical-quads conn cid)
+                   (.then #(logical/verify-physical projection cid %)))))))
+
+(defn- mark-verified!
+  "Cache CID as merge-checked, but only when it was checked under the
+  connection's own `:merge` settings (the ones reads verify with)."
+  ([conn cid] (mark-verified! conn cid {}))
+  ([conn cid opts]
+   (when (and cid (:merge-settings conn)
+              (= (merge-opts conn opts) (:merge-settings conn)))
+     (swap! (:verified conn) conj cid))
+   cid))
+
+(defn- ensure-verified!
+  "Resolve once no unverified merge commit can influence a read at CID.
+
+  The connection caches CIDs whose ancestry is merge-checked. The walk stops
+  at cached CIDs, so after one verification a new head costs one step. When
+  the uncached part of the ancestry contains a merge commit, the whole
+  closure is projected (every merge recomputed through the contract) and the
+  physical state at CID must equal the logical state there; that needs the
+  connection's `:merge` settings, and without them the read is refused
+  (`:unverified-merge`) rather than trusted.
+
+  Linear (merge-free) ancestry is not re-verified: those commits are read
+  exactly as before this change, on the trust kotobase-peer always gave
+  CID-verified blocks."
+  [database cid]
+  (let [conn (connection database)]
+    (if (or (nil? cid) (contains? @(:verified conn) cid))
+      (js/Promise.resolve nil)
+      (-> (at-basis conn
+                    (fn [get-fn]
+                      (logical/merge-commits
+                       get-fn cid @(:verified conn)
+                       (get (:merge-settings conn) :max-closure
+                            contract/default-max-closure))))
+          (.then
+           (fn [{:keys [walked merges]}]
+             (cond
+               (empty? merges)
+               (do (swap! (:verified conn) into walked) nil)
+
+               (nil? (:merge-settings conn))
+               (js/Promise.reject
+                (ex-info "reading through a merge commit requires the connection's :merge settings"
+                         {:type :kotobase.merge/rejected
+                          :problem :unverified-merge
+                          :cid cid :merges merges}))
+
+               :else
+               (-> (verify* conn cid {})
+                   (.then (fn [_] (mark-verified! conn cid) nil))))))))))
+
 (defn merge-at!
   "Deterministically merge the branch commits HEADS (CIDs returned by
   `commit-at!`/`merge-at!`, in any order) into one multi-parent commit.
@@ -531,30 +657,40 @@
   compute the same merge independently. Resolves to
   `kotobase.engine.logical/merge-at`'s result: `:status` is `:merged` (a new
   commit, `:cid`) or `:fast-forward` (one head already contains the others;
-  nothing is written). Rejects with `:type :kotobase.merge/rejected` and a
-  `:problem` (e.g. `:closure-too-large`, `:work-budget-exceeded`,
-  `:unrelated-histories`) when the contract refuses the merge.
+  nothing is written, and the returned commit's physical state has been
+  verified). Rejects with `:type :kotobase.merge/rejected` and a `:problem`
+  (e.g. `:closure-too-large`, `:work-budget-exceeded`,
+  `:unrelated-histories`, `:schema-violation`) when the merge is refused.
 
-  `opts`: see `kotobase.engine.logical/settings` (`:schema`, `:database-id`,
-  `:max-closure`, `:max-work`, ...)."
+  OPTS override the connection's `:merge` settings
+  (`kotobase.engine.logical/settings`: `:database-id`, `:schema` are
+  required, `:max-closure`, `:max-work`, ...)."
   ([database heads] (merge-at! database heads {}))
   ([database heads opts]
    (if (instance? Db database)
      (reject-db "Cannot merge through an immutable database value")
-     (with-blocks
-       (:storage database)
-       (fn [get-fn put! _cas!]
-         (logical/merge-at get-fn put! database heads opts))
-       true))))
+     (-> (with-blocks
+           (:storage database)
+           (fn [get-fn put! _cas!]
+             (logical/merge-at get-fn put! database heads
+                               (assoc (merge-opts database opts)
+                                      :read-quads #(physical-quads database %))))
+           true)
+         (.then (fn [result] (mark-verified! database (:cid result) opts) result))))))
 
 (defn merge!
   "Merge HEADS into the database's mutable ref and advance it through the
   provider's compare-and-set (the same IRefStore path `transact!` uses).
 
-  The current ref head is always one of the merged heads. On a lost CAS the
-  merge is recomputed with the winner's head, up to `:max-retries`. Resolves
-  to the `merge-at!` result plus `:ref-advanced?` (false when the merge
-  fast-forwards to the current head)."
+  The current ref head is always one of the merged heads, so the ref only
+  ever moves to a commit that logically contains it:
+  - a merge that is logically the current head (an ancestor, a pre-`fold!`
+    commit, a forged look-alike) leaves the ref where it is;
+  - a fast-forward lands on a verified commit, preferring one that
+    physically descends from the current head;
+  - otherwise a new merge commit is written.
+  On a lost CAS the merge is recomputed with the winner's head, up to
+  `:max-retries`. Resolves to the `merge-at!` result plus `:ref-advanced?`."
   ([database heads] (merge! database heads {}))
   ([database heads opts]
    (if (instance? Db database)
@@ -575,7 +711,9 @@
                             (-> (logical/merge-at
                                  get-fn put! database
                                  (cond-> (vec heads) current (conj current))
-                                 opts)
+                                 (assoc (merge-opts database opts)
+                                        :prefer current
+                                        :read-quads #(physical-quads database %)))
                                 js/Promise.resolve
                                 (.then
                                  (fn [{:keys [cid] :as result}]
@@ -585,7 +723,8 @@
                                          (.then
                                           (fn [actual]
                                             (if (= actual cid)
-                                              (assoc result :ref-advanced? true)
+                                              (do (mark-verified! database cid opts)
+                                                  (assoc result :ref-advanced? true))
                                               (attempt actual (inc attempts))))))))))))]
                   (attempt current 0))))))))))
 
@@ -594,7 +733,8 @@
   `commit-at!`) to the sibling heads a merge must name: duplicates and
   commits contained in another listed commit (over every parent) drop out."
   ([database cids] (branch-heads database cids {}))
-  ([database cids {:keys [max-closure] :or {max-closure 100000}}]
+  ([database cids {:keys [max-closure]
+                   :or {max-closure contract/default-max-closure}}]
    (with-blocks
      (:storage (connection database))
      (fn [get-fn _put! _cas!]
@@ -604,7 +744,8 @@
   "The logical (contract) view of the physical closure of HEADS:
   `{:graph {logical-root {:commit :tx}} :logical {physical-cid {:root ..}}}`.
   `:graph` is what `kotobase.engine.merge/state`/`verify-merge` and frontier
-  proofs consume."
+  proofs consume. Also the cross-branch history that the `prev`-only log
+  readers refuse to span."
   ([database heads] (logical-projection database heads {}))
   ([database heads opts]
    (let [conn (connection database)]
@@ -612,24 +753,16 @@
        (:storage conn)
        (fn [get-fn _put! _cas!]
          (logical/project get-fn (:decrypt-fn conn)
-                          (logical/settings conn opts) heads))))))
+                          (logical/settings (merge-opts conn opts)) heads))))))
 
 (defn verify-at
-  "Verify the commit at CID before trusting reads through a merge
-  (ADR-2610101200 requires a reader to recompute every merge in the
-  closure). Every merge in its ancestry is recomputed through the contract,
-  and the physical state `q`/`pull` read at CID must equal the contract's
-  logical state there. Resolves to `{:cid :logical-root :logical-commit
-  :epoch :datoms}`."
+  "Verify the commit at CID: every merge in its ancestry is recomputed
+  through the contract, every linear transaction is checked against the
+  schema, and the physical state `q`/`pull` read at CID must equal the
+  contract's logical state there. Resolves to `{:cid :logical-root
+  :logical-commit :epoch :datoms}`."
   ([database cid] (verify-at database cid {}))
   ([database cid opts]
    (let [conn (connection database)]
-     (-> (logical-projection conn [cid] opts)
-         (.then
-          (fn [projection]
-            (-> (db-value (->Db conn cid :current nil nil))
-                (.then
-                 (fn [value]
-                   (logical/verify-physical
-                    projection cid
-                    (peer/q value [nil nil nil] (constantly true))))))))))))
+     (-> (verify* conn cid opts)
+         (.then (fn [result] (mark-verified! conn cid opts) result))))))

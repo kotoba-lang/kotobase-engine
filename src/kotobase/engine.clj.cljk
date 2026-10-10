@@ -6,7 +6,6 @@
   (:require [arrangement.core :as qs]
             [arrangement.query :as kqe]
             [kotobase-peer.core :as peer]
-            [kotobase.engine.logical :as logical]
             [kotobase.storage.core :as storage]))
 
 (defrecord Database
@@ -19,7 +18,7 @@
 (defn open
   [{:keys [storage ref-name encrypt-fn decrypt-fn blind-fn visible? max-retries
            tx-functions]
-    :or {ref-name "main" max-retries 16 tx-functions {}}}]
+    :or {ref-name "main" tx-functions {}}}]
   (storage/validate-backend! storage)
   (doseq [[control value]
           [[:encrypt-fn encrypt-fn] [:decrypt-fn decrypt-fn]
@@ -31,8 +30,13 @@
   (when-not (every? ifn? (vals tx-functions))
     (throw (ex-info "Every transaction function must be callable"
                     {:type :kotobase.datomic/invalid-tx-functions})))
-  (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
-              max-retries tx-functions (atom {})))
+  (let [max-retries (if (nil? max-retries) 16 max-retries)]
+    (when-not (and (integer? max-retries) (not (neg? max-retries)))
+      (throw (ex-info ":max-retries must be a non-negative integer"
+                      {:type :kotobase.engine/invalid-option
+                       :max-retries max-retries})))
+    (->Database storage ref-name encrypt-fn decrypt-fn blind-fn visible?
+                max-retries tx-functions (atom {}))))
 
 (defn head [^Database database]
   (if (instance? Db database)
@@ -310,75 +314,21 @@
         (peer/view-rows get-fn current view-name (:visible? conn) (:decrypt-fn conn))))))
 
 ;; ---------------------------------------------------------------------------
-;; Multi-parent merge (kotobase ADR-2610101200, kotobase.engine.logical).
-;; JVM sibling of the Promise facade in engine.cljs.cljk; see its docstrings.
+;; Multi-parent merge (kotobase ADR-2610101200) is implemented and tested on
+;; the Promise facade only (engine.cljs.cljk, run by kbb). These JVM entry
+;; points exist for API symmetry and refuse: the kotoba dependency tree no
+;; longer loads on the JVM, so an implementation here could not be tested.
+;; JVM reads do not verify merge commits either; read through merges on the
+;; Promise facade.
 
-(defn- mutable-connection! [database]
-  (when (instance? Db database)
-    (throw (ex-info "Cannot merge through an immutable database value"
-                    {:type :kotobase.datomic/immutable-db}))))
+(defn- unsupported [fn-name]
+  (throw (ex-info (str fn-name " is not supported on the JVM facade; "
+                       "use the Promise facade (kotobase.engine on cljs)")
+                  {:type :kotobase.engine/unsupported-platform
+                   :fn fn-name})))
 
-(defn merge-at!
-  "Deterministically merge the branch commits HEADS into one multi-parent
-  commit. Writes immutable blocks only; never reads or publishes the ref.
-  Returns `kotobase.engine.logical/merge-at`'s result (`:status` `:merged`
-  or `:fast-forward`). Throws `:type :kotobase.merge/rejected` with a
-  `:problem` when the contract refuses the merge."
-  ([database heads] (merge-at! database heads {}))
-  ([^Database database heads opts]
-   (mutable-connection! database)
-   (let [{:keys [put! get-fn]} (storage/ports (:storage database))]
-     (logical/merge-at get-fn put! database heads opts))))
-
-(defn merge!
-  "Merge HEADS together with the current ref head and advance the ref through
-  the provider's compare-and-set, recomputing on a lost race up to
-  `:max-retries`. Adds `:ref-advanced?` to the `merge-at!` result."
-  ([database heads] (merge! database heads {}))
-  ([^Database database heads opts]
-   (mutable-connection! database)
-   (let [{:keys [put! get-fn cas!]} (storage/ports (:storage database))]
-     (loop [current (head database) attempts 0]
-       (when (> attempts (:max-retries database))
-         (throw (ex-info "merge! exceeded max-retries on the ref CAS"
-                         {:type :kotobase.engine/cas-contention
-                          :ref-name (:ref-name database)
-                          :attempts attempts})))
-       (let [{:keys [cid] :as result}
-             (logical/merge-at get-fn put! database
-                               (cond-> (vec heads) current (conj current))
-                               opts)]
-         (if (= cid current)
-           (assoc result :ref-advanced? false)
-           (let [actual (cas! (:ref-name database) current cid)]
-             (if (= actual cid)
-               (assoc result :ref-advanced? true)
-               (recur actual (inc attempts))))))))))
-
-(defn branch-heads
-  "Reduce known commit CIDS to the sibling heads a merge must name."
-  ([database cids] (branch-heads database cids {}))
-  ([database cids {:keys [max-closure] :or {max-closure 100000}}]
-   (let [{:keys [get-fn]} (storage/ports (:storage (connection database)))]
-     (logical/reduce-physical-heads get-fn cids max-closure))))
-
-(defn logical-projection
-  "The logical (contract) view of the physical closure of HEADS."
-  ([database heads] (logical-projection database heads {}))
-  ([database heads opts]
-   (let [conn (connection database)
-         {:keys [get-fn]} (storage/ports (:storage conn))]
-     (logical/project get-fn (:decrypt-fn conn)
-                      (logical/settings conn opts) heads))))
-
-(defn verify-at
-  "Recompute every merge in CID's ancestry and require the physical state
-  read at CID to equal the contract's logical state there."
-  ([database cid] (verify-at database cid {}))
-  ([database cid opts]
-   (let [conn (connection database)
-         projection (logical-projection conn [cid] opts)]
-     (logical/verify-physical
-      projection cid
-      (peer/q (db-value (->Db conn cid :current nil nil))
-              [nil nil nil] (constantly true))))))
+(defn merge-at! [& _] (unsupported "merge-at!"))
+(defn merge! [& _] (unsupported "merge!"))
+(defn branch-heads [& _] (unsupported "branch-heads"))
+(defn logical-projection [& _] (unsupported "logical-projection"))
+(defn verify-at [& _] (unsupported "verify-at"))

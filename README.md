@@ -65,33 +65,83 @@ Two writers that `commit-at!` on the same basis offline produce sibling
 commits. After exchanging blocks, either writer runs
 
 ```clojure
-(engine/merge-at! conn [left right] {:schema {":doc/status" {:db/cardinality :db.cardinality/one}}
-                                     :database-id "tenant/db"})
+(def conn (engine/open {... :merge {:database-id "tenant/db"
+                                    :schema {":doc/status" {:db/cardinality :db.cardinality/one}}}}))
+(engine/merge-at! conn [left right])
 ```
 
 and both get the same merge commit (argument order and duplicates do not
 matter). `branch-heads` reduces a set of known commit CIDs to the siblings a
-merge must name; `merge!` merges them with the ref head and publishes through
-CAS.
+merge must name. `merge!` merges them with the ref head and publishes through
+CAS. Merging is implemented on the Promise facade only; the JVM entry points
+throw `:kotobase.engine/unsupported-platform`.
 
-- **Logical identity.** Each physical chain commit is projected, without new
-  bytes, onto a `kotobase.logical-commit/v1` commit (one transaction over its
-  `prev`); a `fold!` commit is logically its `prev`. The merge itself is the
-  contract's `kotobase.logical-commit/v2` commit, recomputed (never trusted)
-  whenever it is read. `logical-projection` returns the contract graph for
-  `kotobase.engine.merge/state`/`verify-merge` and frontier proofs.
-- **Physical commit.** chain `prev` = first canonical parent, chain `causes` =
-  the others; the state is a fresh indexed snapshot of the merged Datoms, so
-  `q`/`pull`/`datoms`/`entity` read through the unchanged peer path. Commits
-  without `causes` keep byte-identical CIDs.
-- **Reading through a merge.** `verify-at` recomputes every merge in the
-  ancestry and checks the physical state against the contract state; call it
-  before trusting a merge you did not compute.
-- **Settings are identity.** `:schema` (keyed by stored attribute strings),
-  `:database-id`, `:model-contract-root` and `:admission-policy-root` are part
-  of every logical commit; converging writers must agree on them.
-  `:max-closure`/`:max-work` bound the walk and replay and fail closed.
-- **Limits.** `tx-range`/`since`/`history`/`as-of` follow the `prev`
-  (first-parent) lineage; the full cross-branch history is the logical graph.
-  The physical merge CID equals across writers only with deterministic
-  `encrypt-fn`/`blind-fn`; the logical root always does.
+- **Settings are identity and have no defaults.** `:database-id` and
+  `:schema` are written into every logical commit, so converging writers
+  must agree on them. Configure them once at `open` under `:merge` (reads
+  need them too) or pass them per call. Schema keys are the *stored*
+  attribute strings (`":doc/status"`). Only `:db/cardinality`
+  (`:db.cardinality/one|many`) and `:db/unique` (`:db.unique/value|identity`)
+  are accepted, and keyword keys or other keys are rejected (`:invalid-schema`).
+  `:database-id` is a label: the contract's single-genesis rule, not the
+  label, is what stops unrelated histories from merging.
+- **One semantics for storage and merge.** kotobase-peer stores raw quads, so
+  every attribute behaves as cardinality-many and non-unique. The merge
+  contract applies the schema. These agree only when every linear
+  transaction is valid for a serial executor:
+  - a cardinality-one value is replaced by an explicit retract plus an
+    assert;
+  - a `:db/unique` value is never asserted while another entity holds it.
+
+  The `kotobase.datomic` layer writes exactly this. Any history that breaks
+  either rule is rejected with `:schema-violation` by merging, verification
+  and reads through merges. This was chosen over re-interpreting raw quads,
+  which would make `q` and the merge disagree about the same commit.
+- **Logical identity.** Each physical chain commit maps to one logical
+  commit, with no new bytes:
+  - a commit that adds a transaction is a `kotobase.logical-commit/v1`
+    commit over its `prev`;
+  - a `fold!` commit is logically its `prev`;
+  - a merge is the contract's `kotobase.logical-commit/v2` commit,
+    recomputed every time the merge is projected.
+
+  `logical-projection` returns the contract graph.
+- **Physical merge commit.**
+  - Parents: chain `prev` is the parent with the greatest `[seq cid]`, so
+    `t` never goes backwards; chain `causes` are the other parents in CID
+    order. Commits without `causes` keep byte-identical CIDs.
+  - State: a fresh indexed snapshot of the merged datoms.
+  - Views: the union of the parents' materialized views, re-derived over
+    the merged state. Views are derived projections, so the union cannot
+    change data. One view name with different specs is refused
+    (`:incompatible-views`). A view removed on one branch only is kept.
+- **Reads verify merges.**
+  - Each connection caches CIDs whose ancestry has been checked. A read at a
+    CID whose uncached ancestry contains a merge (`q`, `pull`, `datoms`,
+    `entity`, `view`, ...) first recomputes every merge through the
+    contract. It then requires the physical state to equal the logical
+    state (`:physical-mismatch` otherwise). After that, a new head costs
+    one step.
+  - Without `:merge` settings such a read is refused (`:unverified-merge`).
+  - Merge-free ancestry is read on the same trust as before. A forged
+    `fold!` snapshot on a linear chain is outside this change.
+- **The ref only moves forward.** `merge!` keeps the current head when the
+  merge is logically that head (an ancestor, a pre-`fold!` commit, a forged
+  look-alike). A fast-forward lands only on a commit whose physical state
+  has been verified, preferring a physical descendant of the current head.
+  It may land on a logical descendant that is not a physical one, for
+  example a branch from before a `fold!`: folds are logically transparent,
+  so requiring physical ancestry would make such a branch unmergeable.
+- **Log readers do not span merges.** `tx-range`, `since`, `history` and
+  `as-of` follow `prev` only. Through a merge they reject with
+  `:history-spans-merge` instead of dropping the other parents'
+  transactions. Cross-branch history is the logical graph.
+- **One budget.** `:max-closure` bounds commits walked. `:max-work` is one
+  budget for the whole call. It covers the projection (charged before
+  transaction blocks are fetched), retractEntity expansion, checkpoints and
+  every contract call, each of which gets only the budget still unspent.
+  Merge cost is O(commits × state) because of the reference replay; the
+  ADR's open gates (incremental checkpoint root, trusted snapshot start)
+  are the fix.
+- **Convergence.** The physical merge CID is equal across writers only with
+  deterministic `encrypt-fn`/`blind-fn`. The logical root is always equal.

@@ -36,10 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: kotoba-lang/setup-kbb@19f38b03b81ad038ff3c0393a2c55ebef8889901
-      - name: multi-parent merge (kbb -M:test -n kotobase.engine.merge-test)
+      - name: multi-parent merge (kbb -M:test -n merge namespaces)
         run: |
           set -o pipefail
-          kbb -M:test -n kotobase.engine.merge-test 2>&1 | tee kbb-test.log
+          kbb -M:test -n kotobase.engine.merge-test \
+            -n kotobase.engine.merge-adversarial-test 2>&1 | tee kbb-test.log
           grep -E '^kbb test: [1-9][0-9]* test\(s\), [0-9]+ pass, 0 fail, 0 error' kbb-test.log
       - name: cljs facade smoke
         run: kbb test/run.cljk

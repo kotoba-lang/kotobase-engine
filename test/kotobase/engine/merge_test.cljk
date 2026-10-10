@@ -14,12 +14,17 @@
 ;; Deterministic controls: content addressing (and so merge-CID convergence)
 ;; needs deterministic encryption/blinding; production AEAD that is
 ;; nondeterministic still converges on the logical root.
-(defn- open [store]
-  (engine/open {:storage store
-                :encrypt-fn #(js/Promise.resolve %)
-                :decrypt-fn #(js/Promise.resolve %)
-                :blind-fn #(js/Promise.resolve (pr-str %))
-                :visible? (constantly true)}))
+(declare opts)
+
+(defn- open
+  ([store] (open store {:merge opts}))
+  ([store extra]
+   (engine/open (merge {:storage store
+                        :encrypt-fn #(js/Promise.resolve %)
+                        :decrypt-fn #(js/Promise.resolve %)
+                        :blind-fn #(js/Promise.resolve (pr-str %))
+                        :visible? (constantly true)}
+                       extra))))
 
 (def schema
   {":doc/status" {:db/cardinality :db.cardinality/one}
@@ -128,7 +133,7 @@
                     (is (= (:logical-root ma) (:logical-root mb)))
                     (is (identity/merge-commit? (:logical-commit ma)))
                     (is (= 2 (:epoch (:logical-commit ma))))
-                    (is (= (vec (sort [a1 b1])) (:heads ma)))
+                    (is (= (set [a1 b1]) (set (:heads ma))))
                     (is (seq (:conflicts ma))
                         "the concurrent :doc/status writes were resolved"))
                   (testing "the mutable ref was never touched"

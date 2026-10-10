@@ -29,17 +29,11 @@
         ;; Multi-parent merge commits (kotobase ADR-2610101200). The contract
         ;; owns the pure merge/state/verify-merge rule and the v1/v2 logical
         ;; identities; pinned to the merge of kotobase-engine-contract#9.
+        ;; Physical merge commits use chain `causes`, which kotobase-peer's own
+        ;; chain pin (fa099efd) already has; no chain override is needed.
         io.github.kotoba-lang/kotobase-engine-contract
         {:git/url "https://github.com/kotoba-lang/kotobase-engine-contract.git"
-         :git/sha "c13d517dbcfd0944c09695e7161d70a525ff35bb"}
-        ;; A physical merge commit names its other parents in chain's
-        ;; `causes` (prev stays the first canonical parent). kotobase-peer's
-        ;; own chain pin (fa099efd) predates `causes`; this explicit floor wins.
-        ;; Commits written without `causes` keep byte-identical CIDs (chain's
-        ;; own golden test, and merge_test's pinned commit-at! CID).
-        io.github.kotoba-lang/chain
-        {:git/url "https://github.com/kotoba-lang/chain.git"
-         :git/sha "6d0349418c4dc12a75c1983e51e51b8118c23384"}}
+         :git/sha "c13d517dbcfd0944c09695e7161d70a525ff35bb"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
